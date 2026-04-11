@@ -1,28 +1,45 @@
 # TSUNAMI
 
-> 基于 TLS over TCP 的高性能抗审查代理协议
+> A high-performance proxy protocol built on TLS 1.3 over TCP
 
-TSUNAMI 是一个面向高审查环境（主要针对 GFW）的代理协议，使用 Go 语言实现，目标融入 [mihomo](https://github.com/MetaCubeX/mihomo) 内核生态。
+TSUNAMI is a multiplexed proxy protocol implemented in Go, designed for high throughput, low overhead, and resistance to traffic analysis. It uses standard TLS 1.3 as its transport layer, making traffic indistinguishable from regular HTTPS.
 
-## 特性
+## Features
 
-- **TLS 1.3 / TCP** — 纯 TCP 传输, 伪装为标准 HTTPS 流量
-- **可编程 Padding** — 服务端动态下发包长分布策略，无需客户端升级即可更换流量特征
-- **强制多路复用** — Session-Stream 架构，多个代理连接共享 TLS 连接
-- **Surge 分层拥塞控制** — 默认单连接 + 自动多连接分流，单端口 443，无包乱序
-- **Fallback** — 认证失败透明回落到正常 Web 服务，抗主动探测
-- **UDP-over-TCP** — 通过 sing-box UoT v2 协议支持 UDP 代理
-- **简单部署** — 最少 3 行配置即可启动
+- **TLS 1.3 Transport** — Pure TCP transport encrypted with TLS 1.3 (forward secrecy, ALPN `h2` negotiation)
+- **Programmable Padding** — Server-pushed packet padding schemes with per-packet size distribution rules; updated dynamically without client upgrades
+- **Mandatory Multiplexing** — Session–Stream architecture: multiple proxy connections share a single TLS connection
+- **Surge Congestion Control** — Layered connection management: single connection by default, automatic multi-connection when concurrent streams exceed a threshold; no packet reordering
+- **Fallback** — Failed authentication transparently falls back to a standard HTTP backend, making the server resistant to active probing
+- **UDP-over-TCP** — UDP relay via UoT v2 framing within multiplexed streams
+- **Self-Signed TLS** — Automatic self-signed certificate generation when no certificate is provided
+- **Zero Dependencies** — Pure Go implementation with only `golang.org/x` standard extensions
 
-## 快速开始
+## Quick Start
 
-### 服务端
+### Build
 
 ```bash
-# 编译
+# Build server
 go build -o tsunami-server ./cmd/tsunami-server/
 
-# 运行
+# Build client
+go build -o tsunami-client ./cmd/tsunami-client/
+
+# Cross-compile for Linux
+GOOS=linux GOARCH=amd64 go build -o tsunami-server ./cmd/tsunami-server/
+```
+
+### Server
+
+```bash
+# Minimal — auto-generates self-signed certificate
+./tsunami-server \
+  --listen :443 \
+  --password "your-strong-password" \
+  --fallback 127.0.0.1:8080
+
+# With TLS certificate
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
@@ -31,89 +48,118 @@ go build -o tsunami-server ./cmd/tsunami-server/
   --fallback 127.0.0.1:8080
 ```
 
-### 客户端 (mihomo 配置)
+| Flag | Default | Description |
+|:-----|:--------|:------------|
+| `--listen` | `:443` | Server listen address |
+| `--cert` | *(none)* | TLS certificate file (PEM) |
+| `--key` | *(none)* | TLS private key file (PEM) |
+| `--password` | *(required)* | Authentication password |
+| `--fallback` | *(none)* | Fallback HTTP backend address |
 
-```yaml
-proxies:
-  - name: "tsunami-hk"
-    type: tsunami
-    server: your-server.example.com
-    port: 443
-    password: "your-strong-password"
-    sni: your-server.example.com
-    udp: true
-    surge:
-      max-connections: 4
-      threshold: 8
+### Client
+
+```bash
+./tsunami-client \
+  --server your-server.example.com:443 \
+  --password "your-strong-password" \
+  --skip-verify \
+  --socks 127.0.0.1:1080 \
+  --http 127.0.0.1:8080
 ```
 
-## 架构
+| Flag | Default | Description |
+|:-----|:--------|:------------|
+| `--server` | *(required)* | TSUNAMI server address (host:port) |
+| `--password` | *(required)* | Authentication password |
+| `--sni` | *(server hostname)* | TLS SNI field |
+| `--skip-verify` | `false` | Skip TLS certificate verification |
+| `--socks` | `127.0.0.1:1080` | Local SOCKS5 proxy listen address |
+| `--http` | `127.0.0.1:8080` | Local HTTP proxy listen address |
+| `--max-connections` | `4` | Maximum TLS connections (Surge Layer 2) |
+| `--threshold` | `8` | Concurrent stream threshold for Surge upgrade |
 
-```
-TCP Proxy ─→ Stream ─→ Session ─→ TLS 1.3 ─→ TCP
-                         │
-                  ┌──────┴──────┐
-                  │ Session Pool │ ← Surge Controller
-                  └─────────────┘
-```
+### Verify
 
-### 协议栈
+```bash
+# Test SOCKS5 proxy
+curl -x socks5h://127.0.0.1:1080 https://httpbin.org/ip
 
-| 层 | 职责 |
-|:---|:---|
-| TLS 1.3 | 加密、前向安全、ALPN 伪装 |
-| Session | 帧格式 (7B 帧头)、命令调度、Padding |
-| Stream | 多路复用、代理连接生命周期 |
-| Surge | 自适应连接管理 (Layer 1/2) |
-
-### Surge 分层设计
-
-```
-Layer 1 (默认): 所有 Stream → 1 个 TLS 连接
-Layer 2 (自动):  并发 Stream > 8 → 自动开启多连接分流
-                每个 Stream 不拆分，无包乱序
-                最多 4 个 TLS 连接（可配置）
+# Test HTTP proxy
+curl -x http://127.0.0.1:8080 https://httpbin.org/ip
 ```
 
-## 项目结构
+## Architecture
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │               TSUNAMI Client                │
+                    │                                             │
+  SOCKS5/HTTP ─────►  Stream  ──►  Session  ──►  TLS 1.3  ──►  TCP
+                    │              │       │                      │
+                    │        ┌─────┴───────┴─────┐               │
+                    │        │   Session Pool     │               │
+                    │        │  (Surge Controller)│               │
+                    │        └───────────────────┘               │
+                    └─────────────────────────────────────────────┘
+```
+
+### Protocol Stack
+
+| Layer | Responsibility |
+|:------|:---------------|
+| **TLS 1.3** | Encryption, forward secrecy, ALPN negotiation |
+| **Session** | Frame encoding (7-byte header), command dispatch, padding |
+| **Stream** | Multiplexing, per-connection proxy lifecycle |
+| **Surge** | Adaptive connection scaling (Layer 1 / Layer 2) |
+
+### Surge Layered Design
+
+```
+Layer 1 (default):  All streams → 1 TLS connection
+Layer 2 (auto):     Concurrent streams > threshold → auto multi-connection
+                    Each stream stays on a single connection (no reordering)
+                    Up to 4 TLS connections (configurable)
+```
+
+## Project Structure
 
 ```
 tsunami/
-├── cmd/tsunami-server/        # 服务端可执行文件
+├── cmd/
+│   ├── tsunami-server/       # Server binary
+│   └── tsunami-client/       # Client binary (SOCKS5 + HTTP proxy)
 ├── pkg/
-│   ├── protocol/              # 协议核心 (帧、命令、认证、设置)
-│   ├── padding/               # 可编程 Padding 系统
-│   ├── mux/                   # 连接多路复用池
-│   ├── surge/                 # Surge 分层控制器
-│   ├── fallback/              # Fallback 回落处理
-│   ├── uot/                   # UDP-over-TCP (UoT v2)
-│   ├── transport/             # TLS/TCP 配置与调优
-│   ├── client/                # 客户端 API
-│   ├── server/                # 服务端实现
-│   └── config/                # 配置文件加载
+│   ├── protocol/             # Wire format: frames, commands, auth, sessions, streams
+│   ├── padding/              # Programmable padding scheme engine
+│   ├── mux/                  # Session pool and connection multiplexing
+│   ├── surge/                # Surge layered congestion controller
+│   ├── fallback/             # Authentication failure fallback handler
+│   ├── uot/                  # UDP-over-TCP relay (UoT v2)
+│   ├── transport/            # TLS/TCP configuration and tuning
+│   ├── proxy/                # SOCKS5 and HTTP proxy servers
+│   ├── client/               # Client-side API
+│   ├── server/               # Server-side implementation
+│   └── config/               # Configuration file loading
+├── tests/                    # Integration and proxy tests
+├── docs/                     # Protocol specification and design documents
 └── go.mod
 ```
 
-## 测试
+## Documentation
+
+- [Protocol Specification](docs/protocol.md) — Wire format, frame structure, and command reference
+- [Padding Scheme](docs/padding.md) — Programmable padding system syntax and configuration
+- [Surge Design](docs/surge.md) — Layered congestion control architecture
+
+## Testing
 
 ```bash
+# Run all tests
 go test ./...
+
+# Run integration tests only
+go test ./tests/...
 ```
-
-## 协议规范
-
-完整协议规范见项目文档。
-
-## 与其他协议的对比
-
-| | TSUNAMI | AnyTLS | Trojan | Hysteria 2 |
-|:---|:---:|:---:|:---:|:---:|
-| 传输层 | TLS/TCP | TLS/TCP | TLS/TCP | QUIC/UDP |
-| 多路复用 | ✅ 强制 | ✅ 强制 | ❌ | ✅ QUIC |
-| 可编程 Padding | ✅ | ✅ | ❌ | ❌ |
-| 自动多连接分流 | ✅ Surge | ❌ | ❌ | ❌ |
-| Fallback | ✅ | ✅ | ✅ | ⚠️ |
-| UDP 支持 | UoT v2 | UoT v2 | ❌ | ✅ 原生 |
 
 ## License
 

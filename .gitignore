@@ -1,3 +1,15 @@
-/bin
-/build
+
+/bin/
+/build/
 *.exe
+*.exe~
+
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+
+.DS_Store
+Thumbs.db
