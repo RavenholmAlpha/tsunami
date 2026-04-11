@@ -1,0 +1,26 @@
+# golangci-lint configuration
+# See: https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+
+linters:
+  disable:
+    - errcheck  # Too noisy for network code where many SetDeadline/Write returns are intentionally ignored
+
+linters-settings:
+  staticcheck:
+    checks:
+      - "all"
+      - "-SA6002"  # sync.Pool with non-pointer values is fine for []byte
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - unused
+    # Ignore unused field warnings in protocol package (used for future extensibility)
+    - path: pkg/protocol/
+      linters:
+        - unused

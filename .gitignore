@@ -1,0 +1,26 @@
+
+/bin/
+
+# Build output (versioned release directories + platform binaries)
+/build/v*/
+/build/linux-*/
+/build/windows-*/
+/build/darwin-*/
+/build/vdev/
+
+# Binaries
+*.exe
+*.exe~
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+docs/TSUNAMI_project_technical_deck.pptx
