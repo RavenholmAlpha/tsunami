@@ -2,8 +2,10 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"runtime"
 	"time"
@@ -16,12 +18,12 @@ type TLSConfig struct {
 	KeyFile  string
 
 	// Client-side
-	ServerName     string
-	SkipVerify     bool
+	ServerName string
+	SkipVerify bool
 
 	// Shared
-	ALPN           []string
-	MinVersion     uint16
+	ALPN       []string
+	MinVersion uint16
 }
 
 // DefaultTLSConfig returns the default TSUNAMI TLS settings.
@@ -42,11 +44,25 @@ func (c *TLSConfig) BuildClientTLSConfig() *tls.Config {
 	}
 }
 
-// BuildServerTLSConfig creates a *tls.Config for the server using cert files.
+// BuildServerTLSConfig creates a *tls.Config for the server.
+// If CertFile and KeyFile are empty, a self-signed certificate is generated automatically.
 func (c *TLSConfig) BuildServerTLSConfig() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("tsunami: load TLS certificate: %w", err)
+	var cert tls.Certificate
+
+	if c.CertFile == "" && c.KeyFile == "" {
+		// Auto-generate self-signed certificate
+		log.Println("tsunami: no TLS certificate provided, generating self-signed certificate")
+		generated, err := GenerateSelfSignedCert()
+		if err != nil {
+			return nil, fmt.Errorf("tsunami: auto-generate TLS certificate: %w", err)
+		}
+		cert = generated
+	} else {
+		loaded, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tsunami: load TLS certificate: %w", err)
+		}
+		cert = loaded
 	}
 
 	return &tls.Config{
@@ -127,7 +143,7 @@ func Dial(addr string, tlsCfg *TLSConfig, tcpCfg *TCPConfig) (*tls.Conn, error) 
 
 	// TLS handshake
 	tlsConn := tls.Client(tcpConn, tlsCfg.BuildClientTLSConfig())
-	if err := tlsConn.HandshakeContext(nil); err != nil {
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("tsunami: TLS handshake: %w", err)
 	}

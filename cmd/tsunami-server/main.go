@@ -23,8 +23,8 @@ func main() {
 	)
 	flag.Parse()
 
-	if *cert == "" || *key == "" {
-		log.Fatal("tsunami-server: --cert and --key are required")
+	if (*cert == "") != (*key == "") {
+		log.Fatal("tsunami-server: --cert and --key must both be provided, or both omitted")
 	}
 	if *password == "" {
 		log.Fatal("tsunami-server: --password is required")
