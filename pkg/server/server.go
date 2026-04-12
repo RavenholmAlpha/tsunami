@@ -257,7 +257,8 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	// Stream → Target
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, stream)
+		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
+		io.CopyBuffer(targetConn, stream, buf)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -266,7 +267,8 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	// Target → Stream
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, targetConn)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(stream, targetConn, buf)
 	}()
 
 	wg.Wait()

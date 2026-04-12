@@ -112,13 +112,15 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, req *http.Request) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, conn)
+		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
+		io.CopyBuffer(stream, conn, buf)
 		stream.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(conn, stream, buf)
 	}()
 
 	wg.Wait()
@@ -149,12 +151,14 @@ func (h *HTTPProxyServer) handleHTTP(conn net.Conn, br *bufio.Reader, req *http.
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, br)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(stream, br, buf)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(conn, stream, buf)
 	}()
 
 	wg.Wait()

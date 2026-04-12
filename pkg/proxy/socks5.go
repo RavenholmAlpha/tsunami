@@ -194,13 +194,15 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, conn)
+		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
+		io.CopyBuffer(stream, conn, buf)
 		stream.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(conn, stream, buf)
 	}()
 
 	wg.Wait()

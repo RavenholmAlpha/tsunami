@@ -6,24 +6,35 @@
 
 TSUNAMI is a multiplexed proxy protocol that runs inside a TLS 1.3 connection. The protocol defines a lightweight binary framing layer for carrying multiple independent proxy streams over a single encrypted transport.
 
+### Design Goals
+
+| Goal | Approach |
+|:-----|:---------|
+| **Undetectable** | Pure TLS 1.3 with ALPN `h2` on port 443 — wire-identical to HTTPS |
+| **Low overhead** | 7-byte frame header; no duplicate encryption layer |
+| **Active-probe resistant** | Auth failure falls back to real HTTP backend transparently |
+| **Adaptable traffic shape** | Server-pushed padding schemes control packet sizes without client updates |
+| **High throughput** | BBR congestion control, 4 MB buffers, adaptive multi-connection scaling |
+
 ## Connection Lifecycle
 
 ```
 Client                                     Server
   │                                          │
-  │──────── TLS 1.3 Handshake ──────────────►│
-  │◄─────── (ALPN: h2) ────────────────────  │
+  │──────── TLS 1.3 Handshake ──────────────►│  ← ALPN: h2, min TLS 1.3
+  │◄─────── (ServerHello, Certificate) ─────│
   │                                          │
-  │──────── Auth: SHA-256(password) + pad ──►│
-  │                                          │  ← Verify hash
-  │◄─────── cmdSettings (padding scheme) ────│     (fallback on failure)
-  │◄─────── cmdServerSettings ───────────────│
+  │──────── Auth: SHA-256(pwd) + pad ──────►│  ← constant-time verify
+  │                                          │     ┌─ success: continue
+  │                                          │     └─ failure: fallback to HTTP backend
+  │◄─────── SETTINGS (padding scheme) ──────│
+  │◄─────── SERVER_SETTINGS ────────────────│
   │                                          │
-  │──────── cmdSYN (stream 1) ──────────────►│
-  │◄─────── cmdSYNACK (stream 1) ────────────│
-  │──────── cmdPSH (proxy data) ────────────►│
-  │◄─────── cmdPSH (proxy data) ─────────────│
-  │──────── cmdFIN (stream 1) ──────────────►│
+  │──────── SYN (stream N) ────────────────►│  ← monotonically increasing streamId
+  │◄─────── SYNACK (stream N) ─────────────│
+  │──────── PSH: ATYP|addr|port ──────────►│  ← first PSH = target address
+  │◄──────► PSH (bidirectional data) ───────►│
+  │──────── FIN (stream N) ────────────────►│  ← no FIN-ACK required
   │                                          │
 ```
 
@@ -45,11 +56,17 @@ Authentication is performed immediately after the TLS handshake, before any sess
 - **padding length**: Length of the following random padding (0–65535)
 - **padding**: Random bytes to prevent fixed-size auth fingerprinting
 
-The password hash is verified using constant-time comparison to prevent timing attacks.
+The password hash is verified using **constant-time comparison** (`crypto/subtle.ConstantTimeCompare`) to prevent timing attacks.
 
-### Auth Failure
+### Auth Failure — Fallback
 
-On authentication failure, the server transparently proxies the connection (including the bytes already read) to the configured fallback HTTP backend. This ensures the server behaves identically to a normal HTTPS server from the perspective of an active prober.
+On authentication failure, the server does **not** send any error response. Instead, it transparently proxies the entire connection (including the bytes already read during the auth attempt) to a configured fallback HTTP backend.
+
+This ensures:
+- An active prober cannot distinguish the server from a normal HTTPS server
+- No protocol-specific error messages are ever exposed
+- The backend's response (including TLS certificate and HTTP behavior) matches a real website
+- If no fallback backend is configured, the server responds with a minimal "It works!" HTML page and drains the connection
 
 ## Frame Format
 
@@ -121,7 +138,7 @@ surge-bandwidth=100
 |:----|:-----|:------------|
 | `v` | int | Protocol version |
 | `client` | string | Client identifier |
-| `padding-md5` | string | MD5 of the client's current padding scheme |
+| `padding-md5` | string | MD5 hash of the client's current padding scheme |
 | `surge-bandwidth` | int | Client bandwidth in Mbps (0 = disabled) |
 
 ### Server Settings (`SERVER_SETTINGS`, `0x0A`)
@@ -142,12 +159,20 @@ threshold=8
 | `max-connections` | int | Maximum TLS connections allowed (Surge Layer 2) |
 | `threshold` | int | Concurrent stream threshold for Layer 2 upgrade |
 
+### Settings Negotiation Flow
+
+1. Client sends `SETTINGS` with its protocol version and current padding scheme hash
+2. Server responds with `SERVER_SETTINGS` containing Surge parameters
+3. If the client's `padding-md5` differs from the server's scheme, the server sends `UPDATE_PADDING` with the full new scheme
+4. The client applies the new padding scheme immediately
+
 ## Stream Lifecycle
 
 1. **Open**: Client sends `SYN` with a new monotonically increasing `streamId`
-2. **Confirm**: Server responds with `SYNACK` (empty data = success, non-empty = error)
-3. **Data**: Both sides exchange `PSH` frames carrying proxy payload
-4. **Close**: Either side sends `FIN`; no acknowledgment required
+2. **Confirm**: Server responds with `SYNACK` (empty data = success, non-empty = error message)
+3. **Target**: Client sends the first `PSH` containing the SOCKS5-style target address
+4. **Data**: Both sides exchange `PSH` frames carrying proxy payload
+5. **Close**: Either side sends `FIN`; no acknowledgment required
 
 Streams implement `io.ReadWriteCloser`. Data exceeding the maximum frame size (65535 bytes) is automatically split across multiple `PSH` frames.
 
@@ -155,7 +180,7 @@ Streams implement `io.ReadWriteCloser`. Data exceeding the maximum frame size (6
 
 ### TCP Proxy
 
-When a new stream is opened, the first `PSH` frame from the client contains the SOCKS5-style target address:
+The first `PSH` frame on a new stream contains the SOCKS5-style target address:
 
 ```
 +------+----------+-------+
@@ -171,6 +196,8 @@ When a new stream is opened, the first `PSH` frame from the client contains the 
 | Domain | `0x03` | 1-byte length + domain string |
 | IPv6 | `0x04` | 16 bytes |
 
+After the target address frame, all subsequent `PSH` frames carry raw TCP payload in both directions.
+
 ### UDP-over-TCP (UoT v2)
 
 UDP traffic is carried over TCP streams using the UoT v2 framing. A stream targeting the magic domain `sp.v2.udp-over-tcp.arpa` signals UDP relay mode.
@@ -185,25 +212,30 @@ Each UDP packet is independently framed within the stream:
 +------+----------+-------+--------+------+
 ```
 
+The ATYP/address/port fields specify the UDP destination for each individual packet, allowing multiplexed UDP traffic over a single stream.
+
 ## Transport
 
 ### TLS Configuration
 
-| Parameter | Value |
-|:----------|:------|
-| Minimum version | TLS 1.3 |
-| ALPN | `h2` |
-| Certificate | User-provided or auto-generated self-signed |
+| Parameter | Value | Rationale |
+|:----------|:------|:----------|
+| Minimum version | TLS 1.3 | Forward secrecy, no downgrade attacks |
+| ALPN | `h2` | Mimics HTTP/2 traffic pattern |
+| Cipher suites | TLS 1.3 defaults | AES-GCM / ChaCha20-Poly1305 |
+| Certificate | User-provided or auto self-signed | ECDSA P-256 for auto-generated |
 
 ### TCP Tuning
 
 | Parameter | Default | Description |
 |:----------|:--------|:------------|
-| `TCP_NODELAY` | enabled | Disable Nagle's algorithm |
-| `SO_SNDBUF` | 4 MB | Send buffer size |
-| `SO_RCVBUF` | 4 MB | Receive buffer size |
-| `TCP_KEEPALIVE` | 30s | Keep-alive interval |
-| Congestion control | BBR | Linux only; set via `TCP_CONGESTION` |
+| `TCP_NODELAY` | enabled | Disable Nagle's algorithm for lower latency |
+| `SO_SNDBUF` | 4 MB | Large send buffer for high throughput |
+| `SO_RCVBUF` | 4 MB | Large receive buffer for high throughput |
+| `TCP_KEEPALIVE` | 30s | Detect dead connections |
+| Congestion control | BBR | Linux only; set via `TCP_CONGESTION` setsockopt |
+
+> **Note**: BBR is set with best-effort. If the kernel doesn't have BBR loaded (`modprobe tcp_bbr`), the system default congestion control is used silently.
 
 ## Surge Control Actions
 
@@ -213,3 +245,14 @@ Each UDP packet is independently framed within the stream:
 | `0x02` | `RequestMoreConn` | Request additional TLS connections |
 | `0x03` | `ReduceConn` | Signal to reduce connection count |
 | `0x04` | `BandwidthLimit` | Set a bandwidth cap |
+
+## Security Considerations
+
+| Attack Vector | Mitigation |
+|:--------------|:-----------|
+| **Password brute force** | SHA-256 hash + constant-time comparison; fallback makes bruteforce indistinguishable from normal traffic |
+| **Active probing** | Transparent fallback to HTTP backend; no protocol-specific error responses |
+| **Traffic fingerprinting** | Programmable padding; randomized auth padding length |
+| **Timing analysis** | Constant-time auth; random keepalive intervals |
+| **Connection correlation** | Single connection by default; multi-connection only on demand |
+| **Replay attacks** | TLS 1.3 provides built-in replay protection via unique per-session keys |

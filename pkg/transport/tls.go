@@ -114,7 +114,19 @@ func (c *TCPConfig) ApplyTCPOptions(conn *net.TCPConn) error {
 		}
 	}
 
-	// Platform-specific: set buffer sizes and BBR
+	// Set TCP buffer sizes (cross-platform via Go net API)
+	if c.SendBufferSize > 0 {
+		if err := conn.SetWriteBuffer(c.SendBufferSize); err != nil {
+			fmt.Printf("tsunami: set write buffer warning: %v\n", err)
+		}
+	}
+	if c.RecvBufferSize > 0 {
+		if err := conn.SetReadBuffer(c.RecvBufferSize); err != nil {
+			fmt.Printf("tsunami: set read buffer warning: %v\n", err)
+		}
+	}
+
+	// Platform-specific: BBR congestion control (Linux only)
 	if runtime.GOOS == "linux" {
 		if err := applyLinuxTCPOptions(conn, c); err != nil {
 			// Non-fatal: log and continue

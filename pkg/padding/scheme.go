@@ -8,9 +8,8 @@ package padding
 
 import (
 	"crypto/md5"
-	"crypto/rand"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 )
@@ -177,17 +176,13 @@ func (s *Scheme) GetSegments(packetIdx int) []Segment {
 	return s.Rules[packetIdx]
 }
 
-// RandomInRange returns a cryptographically random integer in [min, max].
+// RandomInRange returns a random integer in [min, max].
+// Uses math/rand/v2 which is automatically seeded from a secure source in Go 1.22+.
 func RandomInRange(min, max int) int {
 	if min >= max {
 		return min
 	}
-	diff := max - min + 1
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(diff)))
-	if err != nil {
-		return min // fallback
-	}
-	return min + int(n.Int64())
+	return min + rand.IntN(max-min+1)
 }
 
 // Encode serializes the scheme back to text format.

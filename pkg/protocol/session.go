@@ -31,9 +31,9 @@ type Session struct {
 	localVersion  int
 	remoteVersion int
 
-	// Idle tracking
-	idleSince time.Time
-	lastActive time.Time
+	// Idle tracking (atomic to avoid data races between event loop and write goroutines)
+	idleSince  atomic.Int64 // stores UnixNano; 0 = not idle
+	lastActive atomic.Int64 // stores UnixNano
 
 	// Callbacks
 	onStreamOpen        func(s *Stream)      // Called when server receives a new stream
@@ -57,9 +57,9 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 		reader:       NewFrameReader(conn),
 		streams:      make(map[uint32]*Stream),
 		localVersion: CurrentVersion,
-		lastActive:   time.Now(),
 		errCh:        make(chan error, 1),
 	}
+	s.lastActive.Store(time.Now().UnixNano())
 	return s
 }
 
@@ -90,7 +90,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 		return nil, fmt.Errorf("tsunami: send SYN: %w", err)
 	}
 
-	s.lastActive = time.Now()
+	s.lastActive.Store(time.Now().UnixNano())
 	return stream, nil
 }
 
@@ -108,17 +108,29 @@ func (s *Session) IsIdle() bool {
 
 // IdleSince returns when the session became idle. Zero value if not idle.
 func (s *Session) IdleSince() time.Time {
-	return s.idleSince
+	ns := s.idleSince.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // SetIdleSince sets the idle start time.
 func (s *Session) SetIdleSince(t time.Time) {
-	s.idleSince = t
+	if t.IsZero() {
+		s.idleSince.Store(0)
+	} else {
+		s.idleSince.Store(t.UnixNano())
+	}
 }
 
 // LastActive returns the time of last activity.
 func (s *Session) LastActive() time.Time {
-	return s.lastActive
+	ns := s.lastActive.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // writeFrame writes a frame to the underlying TLS connection.
@@ -129,12 +141,36 @@ func (s *Session) writeFrame(f *Frame) error {
 		return ErrSessionClosed
 	}
 	s.writeMu.Lock()
-	s.lastActive = time.Now()
+	s.lastActive.Store(time.Now().UnixNano())
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn(f)
 	} else {
 		err = s.writer.WriteFrame(f)
+	}
+	s.writeMu.Unlock()
+	return err
+}
+
+// writeFrames writes multiple frames under a single lock acquisition.
+// This reduces lock contention when a stream needs to send large payloads
+// that span multiple frames.
+func (s *Session) writeFrames(frames []*Frame) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	s.writeMu.Lock()
+	s.lastActive.Store(time.Now().UnixNano())
+	var err error
+	for _, f := range frames {
+		if s.paddingWriteFn != nil {
+			err = s.paddingWriteFn(f)
+		} else {
+			err = s.writer.WriteFrame(f)
+		}
+		if err != nil {
+			break
+		}
 	}
 	s.writeMu.Unlock()
 	return err
@@ -150,7 +186,7 @@ func (s *Session) removeStream(id uint32) {
 	s.notifyStreamCountChange(count)
 
 	if count == 0 {
-		s.idleSince = time.Now()
+		s.idleSince.Store(time.Now().UnixNano())
 	}
 }
 
@@ -206,7 +242,7 @@ func (s *Session) RunEventLoop() error {
 			return fmt.Errorf("tsunami: read frame: %w", err)
 		}
 
-		s.lastActive = time.Now()
+		s.lastActive.Store(time.Now().UnixNano())
 
 		if err := s.handleFrame(frame); err != nil {
 			return err

@@ -4,6 +4,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Stream represents a single multiplexed proxy connection within a Session.
@@ -34,7 +35,7 @@ func newStream(id uint32, session *Session) *Stream {
 		id:       id,
 		session:  session,
 		priority: DefaultStreamPriority,
-		readBuf:  make(chan []byte, 64), // buffered channel for incoming data
+		readBuf:  make(chan []byte, 1024), // large buffer to prevent event loop stalls
 		doneCh:   make(chan struct{}),
 	}
 }
@@ -82,29 +83,32 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // Write writes data to the stream by sending cmdPSH frames, implementing io.Writer.
+// Frames are batched and written under a single lock acquisition to reduce contention.
 func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, ErrStreamClosed
 	}
-
-	total := 0
-	for len(p) > 0 {
-		chunkLen := len(p)
-		if chunkLen > MaxFrameDataLen {
-			chunkLen = MaxFrameDataLen
-		}
-
-		frame := NewFrame(CmdPSH, s.id, p[:chunkLen])
-		if err := s.session.writeFrame(frame); err != nil {
-			return total, err
-		}
-
-		total += chunkLen
-		p = p[chunkLen:]
+	if len(p) == 0 {
+		return 0, nil
 	}
 
-	s.bytesWritten.Add(int64(total))
-	return total, nil
+	// Build all frames first, then write under a single lock
+	var frames []*Frame
+	for off := 0; off < len(p); {
+		n := len(p) - off
+		if n > MaxFrameDataLen {
+			n = MaxFrameDataLen
+		}
+		frames = append(frames, NewFrame(CmdPSH, s.id, p[off:off+n]))
+		off += n
+	}
+
+	if err := s.session.writeFrames(frames); err != nil {
+		return 0, err
+	}
+
+	s.bytesWritten.Add(int64(len(p)))
+	return len(p), nil
 }
 
 // Close closes the stream by sending cmdFIN.
@@ -131,13 +135,28 @@ func (s *Stream) Close() error {
 
 // deliverData pushes incoming data into the stream's read buffer.
 // Called by the session event loop when a cmdPSH frame is received.
-// It blocks until the data is accepted or the stream is closed,
-// providing backpressure to the session event loop.
+// Uses a fast non-blocking path with a bounded timeout fallback to
+// prevent a single slow stream from stalling the entire session event loop.
 func (s *Stream) deliverData(data []byte) error {
+	// Fast path: non-blocking send
 	select {
 	case s.readBuf <- data:
 		return nil
 	case <-s.doneCh:
+		return ErrStreamClosed
+	default:
+	}
+
+	// Slow path: buffer full, wait with timeout to protect other streams
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case s.readBuf <- data:
+		return nil
+	case <-s.doneCh:
+		return ErrStreamClosed
+	case <-timer.C:
+		// Consumer too slow — drop data to unblock the event loop
 		return ErrStreamClosed
 	}
 }

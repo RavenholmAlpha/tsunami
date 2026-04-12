@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Frame represents a single session-layer frame.
@@ -32,6 +33,14 @@ var (
 	ErrVersionMismatch = errors.New("tsunami: version mismatch")
 )
 
+// frameBufPool reuses frame encode buffers to reduce GC pressure under high throughput.
+var frameBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, MaxFrameDataLen+FrameHeaderLen)
+		return buf
+	},
+}
+
 // EncodeFrame writes a frame to the writer in TSUNAMI wire format.
 // The data length MUST NOT exceed MaxFrameDataLen (65535).
 func EncodeFrame(w io.Writer, f *Frame) error {
@@ -40,22 +49,27 @@ func EncodeFrame(w io.Writer, f *Frame) error {
 		return ErrFrameTooLarge
 	}
 
-	// Build the 7-byte header
-	var header [FrameHeaderLen]byte
-	header[0] = byte(f.Command)
-	binary.BigEndian.PutUint32(header[1:5], f.StreamID)
-	binary.BigEndian.PutUint16(header[5:7], uint16(dataLen))
-
-	// Write header + data in one call if possible to reduce syscalls
-	if dataLen > 0 {
-		buf := make([]byte, FrameHeaderLen+dataLen)
-		copy(buf[:FrameHeaderLen], header[:])
-		copy(buf[FrameHeaderLen:], f.Data)
-		_, err := w.Write(buf)
+	if dataLen == 0 {
+		// Header-only frame — use stack-allocated buffer, no pool needed
+		var header [FrameHeaderLen]byte
+		header[0] = byte(f.Command)
+		binary.BigEndian.PutUint32(header[1:5], f.StreamID)
+		binary.BigEndian.PutUint16(header[5:7], 0)
+		_, err := w.Write(header[:])
 		return err
 	}
 
-	_, err := w.Write(header[:])
+	// Data frame — use pooled buffer to avoid per-frame allocation
+	poolBuf := frameBufPool.Get().([]byte)
+	buf := poolBuf[:FrameHeaderLen+dataLen]
+
+	buf[0] = byte(f.Command)
+	binary.BigEndian.PutUint32(buf[1:5], f.StreamID)
+	binary.BigEndian.PutUint16(buf[5:7], uint16(dataLen))
+	copy(buf[FrameHeaderLen:], f.Data)
+
+	_, err := w.Write(buf)
+	frameBufPool.Put(poolBuf)
 	return err
 }
 

@@ -63,6 +63,10 @@ type Controller struct {
 	// State tracking
 	currentLayer atomic.Int32 // 1 or 2
 
+	// Cooldown tracking to prevent rapid layer oscillation
+	lastUpgrade   time.Time
+	lastDowngrade time.Time
+
 	// Monitoring
 	stopCh chan struct{}
 	once   sync.Once
@@ -131,10 +135,14 @@ func (c *Controller) monitor() {
 	}
 }
 
+// surgeCooldown is the minimum interval between layer transitions to prevent oscillation.
+const surgeCooldown = 30 * time.Second
+
 // evaluate checks stream counts and decides on layer transitions.
 // On upgrade to Layer 2, it proactively expands by creating additional sessions
 // (asynchronously) up to MaxConnections.
 // On downgrade to Layer 1, it closes idle sessions to reduce resource usage.
+// A 30-second cooldown prevents rapid oscillation between layers.
 func (c *Controller) evaluate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -142,13 +150,19 @@ func (c *Controller) evaluate() {
 	totalStreams := c.pool.ActiveStreamCount()
 	sessionCount := c.pool.SessionCount()
 	currentLayer := c.currentLayer.Load()
+	now := time.Now()
 
 	// --- Upgrade: Layer 1 → Layer 2 ---
 	if currentLayer == 1 && totalStreams > c.config.Threshold {
+		// Cooldown: skip if recently downgraded
+		if !c.lastDowngrade.IsZero() && now.Sub(c.lastDowngrade) < surgeCooldown {
+			return
+		}
 		if sessionCount < c.config.MaxConnections {
 			log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d > threshold=%d)",
 				totalStreams, c.config.Threshold)
 			c.currentLayer.Store(2)
+			c.lastUpgrade = now
 
 			// Proactively expand: create sessions up to MaxConnections
 			needed := c.config.MaxConnections - sessionCount
@@ -163,7 +177,12 @@ func (c *Controller) evaluate() {
 	}
 
 	// --- Downgrade: Layer 2 → Layer 1 ---
-	if currentLayer == 2 && totalStreams <= c.config.Threshold/2 {
+	// Use threshold/4 (wider hysteresis) to prevent rapid oscillation
+	if currentLayer == 2 && totalStreams <= c.config.Threshold/4 {
+		// Cooldown: skip if recently upgraded
+		if !c.lastUpgrade.IsZero() && now.Sub(c.lastUpgrade) < surgeCooldown {
+			return
+		}
 		// Close idle sessions (keep at least 1)
 		c.pool.CloseIdleSessions(c.config.IdleDowngradeTime, 1)
 
@@ -171,6 +190,7 @@ func (c *Controller) evaluate() {
 		if c.pool.SessionCount() <= 1 {
 			log.Printf("tsunami surge: downgrading to Layer 1 (streams=%d)", totalStreams)
 			c.currentLayer.Store(1)
+			c.lastDowngrade = now
 		}
 	}
 }
