@@ -3,6 +3,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -13,15 +14,28 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 )
 
+// Populated at build time via -ldflags
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
 	var (
-		listen   = flag.String("listen", ":443", "Listen address")
-		cert     = flag.String("cert", "", "TLS certificate file")
-		key      = flag.String("key", "", "TLS private key file")
-		password = flag.String("password", "", "User password")
-		fallback = flag.String("fallback", "", "Fallback backend address (e.g., 127.0.0.1:8080)")
+		listen      = flag.String("listen", ":443", "Listen address")
+		cert        = flag.String("cert", "", "TLS certificate file")
+		key         = flag.String("key", "", "TLS private key file")
+		password    = flag.String("password", "", "User password")
+		fallback    = flag.String("fallback", "", "Fallback backend address (e.g., 127.0.0.1:8080)")
+		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("tsunami-server %s (commit=%s, built=%s)\n", version, commit, buildTime)
+		os.Exit(0)
+	}
 
 	if (*cert == "") != (*key == "") {
 		log.Fatal("tsunami-server: --cert and --key must both be provided, or both omitted")
@@ -63,7 +77,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Println("tsunami-server: starting...")
+	log.Printf("tsunami-server %s (commit=%s) starting...", version, commit)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("tsunami-server: %v", err)
 	}

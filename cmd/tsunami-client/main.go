@@ -4,6 +4,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -16,18 +17,31 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 )
 
+// Populated at build time via -ldflags
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
 	var (
-		server     = flag.String("server", "", "TSUNAMI server address (host:port)")
-		password   = flag.String("password", "", "Authentication password")
-		sni        = flag.String("sni", "", "TLS SNI (defaults to server hostname)")
-		skipVerify = flag.Bool("skip-verify", false, "Skip TLS certificate verification")
-		socksAddr  = flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 proxy address")
-		httpAddr   = flag.String("http", "127.0.0.1:8080", "Local HTTP proxy address")
-		maxConn    = flag.Int("max-connections", 4, "Surge max connections")
-		threshold  = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
+		server      = flag.String("server", "", "TSUNAMI server address (host:port)")
+		password    = flag.String("password", "", "Authentication password")
+		sni         = flag.String("sni", "", "TLS SNI (defaults to server hostname)")
+		skipVerify  = flag.Bool("skip-verify", false, "Skip TLS certificate verification")
+		socksAddr   = flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 proxy address")
+		httpAddr    = flag.String("http", "127.0.0.1:8080", "Local HTTP proxy address")
+		maxConn     = flag.Int("max-connections", 4, "Surge max connections")
+		threshold   = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
+		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("tsunami-client %s (commit=%s, built=%s)\n", version, commit, buildTime)
+		os.Exit(0)
+	}
 
 	if *server == "" || *password == "" {
 		log.Fatal("tsunami-client: --server and --password are required")

@@ -7,17 +7,18 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+permissions:
+  contents: read
+
 jobs:
-  test-and-build:
-    name: Build & Test
+  # ── Stage 1: Lint + Test ─────────────────────────────────────────────
+  test:
+    name: Test
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
+    - uses: actions/setup-go@v5
       with:
         go-version: '1.25.x'
         cache: true
@@ -25,89 +26,97 @@ jobs:
     - name: Download Dependencies
       run: go mod download
 
-    - name: Run Tests
-      # Ensure tests are run, continue-on-error could be considered if the baseline is currently failing,
-      # but we'll run standard go test here
-      run: go test -v ./... || true
+    - name: Vet
+      run: go vet ./...
 
-    - name: Verify Build (Server)
-      run: go build -v -o build/tsunami-server ./cmd/tsunami-server/
+    - name: Unit Tests
+      run: go test -v -count=1 -race -timeout 5m ./pkg/...
 
-    - name: Verify Build (Client)
-      run: go build -v -o build/tsunami-client ./cmd/tsunami-client/
+    - name: Integration Tests
+      run: go test -v -count=1 -timeout 5m ./tests/...
+      continue-on-error: true   # TODO: remove once all integration tests pass
 
+    - name: Verify Build
+      run: |
+        go build -o /dev/null ./cmd/tsunami-server/
+        go build -o /dev/null ./cmd/tsunami-client/
+
+  # ── Stage 2: Cross-compile + Release ─────────────────────────────────
   release:
-    name: Create Release
-    needs: test-and-build
+    name: Release
+    needs: test
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
-
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.25.x'
-        cache: true
-
-    - name: Build Binaries
-      env:
-        GOOS: ${{ matrix.goos }}
-        GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 0
-      run: |
-        mkdir -p dist
-
-        EXT=""
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          EXT=".exe"
-        fi
-
-        go build -trimpath -ldflags="-s -w" -o dist/tsunami-server-${{ matrix.goos }}-${{ matrix.goarch }}$EXT ./cmd/tsunami-server/
-        go build -trimpath -ldflags="-s -w" -o dist/tsunami-client-${{ matrix.goos }}-${{ matrix.goarch }}$EXT ./cmd/tsunami-client/
-
-    - name: Archive Binaries
-      run: |
-        cd dist
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          zip -r tsunami-${{ matrix.goos }}-${{ matrix.goarch }}.zip ./*
-        else
-          tar -czvf tsunami-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz ./*
-        fi
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-        path: dist/tsunami-*.*
-
-  publish-release:
-    name: Publish Release
-    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # needed for git describe
 
-      - name: Display downloaded files
-        run: ls -R artifacts/
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.25.x'
+        cache: true
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/*.zip
-            artifacts/**/*.tar.gz
-          generate_release_notes: true
+    - name: Build All Platforms
+      run: |
+        VERSION="${GITHUB_REF_NAME}"
+        COMMIT="${GITHUB_SHA::8}"
+        BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}"
+
+        TARGETS="linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64"
+
+        for target in $TARGETS; do
+          GOOS="${target%/*}"
+          GOARCH="${target#*/}"
+          EXT=""; [ "$GOOS" = "windows" ] && EXT=".exe"
+          DIR="dist/${VERSION}"
+
+          mkdir -p "$DIR"
+
+          echo "::group::Building ${GOOS}/${GOARCH}"
+          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+            go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "$DIR/tsunami-server-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-server/
+
+          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+            go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "$DIR/tsunami-client-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-client/
+          echo "::endgroup::"
+        done
+
+    - name: Package Archives
+      run: |
+        VERSION="${GITHUB_REF_NAME}"
+        DIR="dist/${VERSION}"
+        cd "$DIR"
+
+        for pair in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+          ARCHIVE="tsunami-${VERSION}-${pair}.tar.gz"
+          tar -czvf "$ARCHIVE" tsunami-*-${pair}
+          echo "Packaged: $ARCHIVE"
+        done
+
+        ARCHIVE="tsunami-${VERSION}-windows-amd64.zip"
+        zip "$ARCHIVE" tsunami-*-windows-amd64.exe
+        echo "Packaged: $ARCHIVE"
+
+    - name: Generate Checksums
+      run: |
+        VERSION="${GITHUB_REF_NAME}"
+        DIR="dist/${VERSION}"
+        cd "$DIR"
+        sha256sum *.tar.gz *.zip > checksums.sha256
+        cat checksums.sha256
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          dist/${{ github.ref_name }}/*.tar.gz
+          dist/${{ github.ref_name }}/*.zip
+          dist/${{ github.ref_name }}/checksums.sha256
+        generate_release_notes: true
