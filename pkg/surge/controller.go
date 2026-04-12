@@ -86,8 +86,9 @@ func NewController(config Config, pool *mux.Pool) *Controller {
 }
 
 // GetSession returns the best session for a new stream.
-// In Layer 1, returns the single session.
-// In Layer 2, returns the least-loaded session.
+// In Layer 1, returns the single session (multiplexed).
+// In Layer 2, returns the least-loaded session across the pool.
+// Session expansion is handled by the background evaluate() loop, not here.
 func (c *Controller) GetSession() (*protocol.Session, error) {
 	if c.config.Mode == ModeNone {
 		return c.pool.GetOrCreateSession()
@@ -96,16 +97,17 @@ func (c *Controller) GetSession() (*protocol.Session, error) {
 	layer := c.currentLayer.Load()
 
 	if layer == 1 {
-		// Layer 1: single connection — use the standard pool logic
+		// Layer 1: single connection — all streams multiplexed on it
 		return c.pool.GetOrCreateSession()
 	}
 
 	// Layer 2: distribute to least-loaded session
 	session, err := c.pool.GetLeastLoadedSession()
 	if err != nil {
-		// Fallback: create a new session
+		// No sessions yet — create the first one
 		return c.pool.GetOrCreateSession()
 	}
+
 	return session, nil
 }
 
@@ -130,6 +132,9 @@ func (c *Controller) monitor() {
 }
 
 // evaluate checks stream counts and decides on layer transitions.
+// On upgrade to Layer 2, it proactively expands by creating additional sessions
+// (asynchronously) up to MaxConnections.
+// On downgrade to Layer 1, it closes idle sessions to reduce resource usage.
 func (c *Controller) evaluate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -144,16 +149,53 @@ func (c *Controller) evaluate() {
 			log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d > threshold=%d)",
 				totalStreams, c.config.Threshold)
 			c.currentLayer.Store(2)
-			// The pool will create new sessions on demand via GetOrCreateSession
+
+			// Proactively expand: create sessions up to MaxConnections
+			needed := c.config.MaxConnections - sessionCount
+			go c.expandPool(needed)
 		}
 	}
 
+	// --- Layer 2 active expansion: keep scaling if still under pressure ---
+	if currentLayer == 2 && sessionCount < c.config.MaxConnections && totalStreams > c.config.Threshold {
+		needed := c.config.MaxConnections - sessionCount
+		go c.expandPool(needed)
+	}
+
 	// --- Downgrade: Layer 2 → Layer 1 ---
-	if currentLayer == 2 {
-		if totalStreams <= c.config.Threshold/2 && sessionCount <= 1 {
+	if currentLayer == 2 && totalStreams <= c.config.Threshold/2 {
+		// Close idle sessions (keep at least 1)
+		c.pool.CloseIdleSessions(c.config.IdleDowngradeTime, 1)
+
+		// If we've reduced to a single session, downgrade to Layer 1
+		if c.pool.SessionCount() <= 1 {
 			log.Printf("tsunami surge: downgrading to Layer 1 (streams=%d)", totalStreams)
 			c.currentLayer.Store(1)
 		}
+	}
+}
+
+// expandPool asynchronously creates additional sessions up to MaxConnections.
+func (c *Controller) expandPool(needed int) {
+	for i := 0; i < needed; i++ {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+
+		// Re-check pool size before each creation to avoid overshooting
+		if c.pool.SessionCount() >= c.config.MaxConnections {
+			return
+		}
+
+		_, err := c.pool.CreateNewSession()
+		if err != nil {
+			log.Printf("tsunami surge: expand pool failed: %v", err)
+			return
+		}
+		log.Printf("tsunami surge: expanded pool (%d/%d connections)",
+			c.pool.SessionCount(), c.config.MaxConnections)
 	}
 }
 

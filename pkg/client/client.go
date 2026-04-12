@@ -180,6 +180,12 @@ func (c *Client) dialSession() (*protocol.Session, error) {
 	seq := c.pool.NextSeq()
 	session := protocol.NewSession(tlsConn, seq)
 
+	// Wire padding system into session write path
+	pw := padding.NewWriter(tlsConn, c.paddingScheme)
+	session.SetPaddingWriteFn(func(f *protocol.Frame) error {
+		return pw.WriteFramesWithPadding([]*protocol.Frame{f})
+	})
+
 	// Send client settings
 	settings := &protocol.ClientSettings{
 		Version:    protocol.CurrentVersion,
@@ -189,6 +195,27 @@ func (c *Client) dialSession() (*protocol.Session, error) {
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()
 		return nil, fmt.Errorf("send settings: %w", err)
+	}
+
+	// Wait for auth confirmation: server sends CmdServerSettings on success.
+	// If auth failed, server does fallback/close → we get EOF or non-frame data.
+	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	frame, err := protocol.DecodeFrame(tlsConn)
+	tlsConn.SetReadDeadline(time.Time{})
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+	if frame.Command != protocol.CmdServerSettings {
+		session.Close()
+		return nil, protocol.ErrAuthFailed
+	}
+
+	// Process server settings
+	if frame.Data != nil {
+		if ss, err := protocol.DecodeServerSettings(frame.Data); err == nil {
+			log.Printf("tsunami: server version=%d surge-mode=%s", ss.Version, ss.SurgeMode)
+		}
 	}
 
 	// Start session event loop in background

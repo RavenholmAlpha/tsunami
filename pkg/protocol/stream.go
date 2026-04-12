@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -14,8 +13,10 @@ type Stream struct {
 	priority uint8
 
 	// Read side: incoming data from remote
-	readBuf  chan []byte
-	readLeft []byte // leftover from partial reads
+	readBuf     chan []byte
+	readBufOnce sync.Once   // ensures readBuf is closed exactly once
+	doneCh      chan struct{} // closed when stream is done, unblocks deliverData
+	readLeft    []byte        // leftover from partial reads
 
 	// State
 	closed   atomic.Bool
@@ -34,7 +35,17 @@ func newStream(id uint32, session *Session) *Stream {
 		session:  session,
 		priority: DefaultStreamPriority,
 		readBuf:  make(chan []byte, 64), // buffered channel for incoming data
+		doneCh:   make(chan struct{}),
 	}
+}
+
+// closeReadBuf safely closes the readBuf channel exactly once.
+// It may be called concurrently from Stream.Close, closeByRemote, or Session.Close.
+func (s *Stream) closeReadBuf() {
+	s.readBufOnce.Do(func() {
+		close(s.doneCh)
+		close(s.readBuf)
+	})
 }
 
 // ID returns the stream identifier.
@@ -110,7 +121,7 @@ func (s *Stream) Close() error {
 	_ = s.session.writeFrame(NewFrame(CmdFIN, s.id, nil))
 
 	// Close the read channel
-	close(s.readBuf)
+	s.closeReadBuf()
 
 	// Unregister from session
 	s.session.removeStream(s.id)
@@ -120,16 +131,14 @@ func (s *Stream) Close() error {
 
 // deliverData pushes incoming data into the stream's read buffer.
 // Called by the session event loop when a cmdPSH frame is received.
+// It blocks until the data is accepted or the stream is closed,
+// providing backpressure to the session event loop.
 func (s *Stream) deliverData(data []byte) error {
-	if s.closed.Load() {
-		return ErrStreamClosed
-	}
-
 	select {
 	case s.readBuf <- data:
 		return nil
-	default:
-		return errors.New("tsunami: stream read buffer full")
+	case <-s.doneCh:
+		return ErrStreamClosed
 	}
 }
 
@@ -142,7 +151,7 @@ func (s *Stream) closeByRemote() {
 		return
 	}
 	s.closed.Store(true)
-	close(s.readBuf)
+	s.closeReadBuf()
 	s.session.removeStream(s.id)
 }
 

@@ -53,30 +53,41 @@ func NewPool(config PoolConfig, dialFn func() (*protocol.Session, error)) *Pool 
 	return p
 }
 
-// GetOrCreateSession returns an idle session or creates a new one.
-// Strategy: prefer the session with the highest Seq (newest).
+// GetOrCreateSession returns an existing session or creates a new one.
+// Strategy: prefer idle sessions (newest first), fall back to any non-closed
+// session for multiplexing, create new only if no sessions exist at all.
 func (p *Pool) GetOrCreateSession() (*protocol.Session, error) {
 	p.mu.Lock()
 
-	// Find the newest idle session
-	var best *protocol.Session
+	var bestIdle *protocol.Session
+	var bestAny *protocol.Session
+
 	for _, s := range p.sessions {
 		if s.IsClosed() {
 			continue
 		}
-		if s.IsIdle() && (best == nil || s.Seq() > best.Seq()) {
-			best = s
+		// Track any non-closed session (prefer newest)
+		if bestAny == nil || s.Seq() > bestAny.Seq() {
+			bestAny = s
 		}
-	}
-
-	if best != nil {
-		p.mu.Unlock()
-		return best, nil
+		// Prefer idle sessions
+		if s.IsIdle() && (bestIdle == nil || s.Seq() > bestIdle.Seq()) {
+			bestIdle = s
+		}
 	}
 
 	p.mu.Unlock()
 
-	// No idle session available — create a new one
+	// Prefer idle session for clean reuse
+	if bestIdle != nil {
+		return bestIdle, nil
+	}
+	// Fall back to any existing session — this is multiplexing
+	if bestAny != nil {
+		return bestAny, nil
+	}
+
+	// No sessions at all — create the first one
 	return p.createSession()
 }
 
@@ -119,6 +130,13 @@ func (p *Pool) createSession() (*protocol.Session, error) {
 	p.mu.Unlock()
 
 	return session, nil
+}
+
+// CreateNewSession forces creation of a new TLS connection and adds it to the pool.
+// Unlike GetOrCreateSession which reuses existing sessions, this always dials.
+// Used by Surge controller for intentional pool expansion.
+func (p *Pool) CreateNewSession() (*protocol.Session, error) {
+	return p.createSession()
 }
 
 // AddSession adds an externally created session to the pool.
@@ -205,6 +223,45 @@ func (p *Pool) cleanupIdle() {
 			if !idleSince.IsZero() && now.Sub(idleSince) > p.config.IdleTimeout {
 				s.Close()
 				closeable--
+				continue
+			}
+		}
+
+		remaining = append(remaining, s)
+	}
+
+	p.sessions = remaining
+}
+
+// CloseIdleSessions closes sessions idle longer than the given duration,
+// keeping at least minKeep sessions alive. Used by Surge controller for
+// proactive downgrade.
+func (p *Pool) CloseIdleSessions(idleDuration time.Duration, minKeep int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	activeCount := 0
+
+	// Count non-closed sessions
+	for _, s := range p.sessions {
+		if !s.IsClosed() {
+			activeCount++
+		}
+	}
+
+	remaining := make([]*protocol.Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		if s.IsClosed() {
+			continue
+		}
+
+		// Close idle sessions if we have more than minKeep
+		if s.IsIdle() && activeCount > minKeep {
+			idleSince := s.IdleSince()
+			if !idleSince.IsZero() && now.Sub(idleSince) > idleDuration {
+				s.Close()
+				activeCount--
 				continue
 			}
 		}

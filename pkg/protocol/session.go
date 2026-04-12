@@ -15,6 +15,7 @@ type Session struct {
 	conn      io.ReadWriteCloser
 	writer    *FrameWriter
 	reader    *FrameReader
+	writeMu   sync.Mutex   // protects writer from concurrent writes
 
 	// Stream management
 	streams   map[uint32]*Stream
@@ -35,7 +36,13 @@ type Session struct {
 	lastActive time.Time
 
 	// Callbacks
-	onStreamOpen func(s *Stream) // Called when server receives a new stream
+	onStreamOpen        func(s *Stream)      // Called when server receives a new stream
+	onStreamCountChange func(activeCount int) // Called when active stream count changes
+
+	// Optional padding-aware write function.
+	// When set, writeFrame routes through this instead of the raw FrameWriter.
+	// Signature: func(frame) error. Caller is responsible for serialization.
+	paddingWriteFn func(f *Frame) error
 
 	// Error channel
 	errCh chan error
@@ -72,7 +79,10 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	s.streamMu.Lock()
 	s.streams[id] = stream
+	count := len(s.streams)
 	s.streamMu.Unlock()
+
+	s.notifyStreamCountChange(count)
 
 	// Send SYN
 	if err := s.writeFrame(NewFrame(CmdSYN, id, nil)); err != nil {
@@ -112,22 +122,34 @@ func (s *Session) LastActive() time.Time {
 }
 
 // writeFrame writes a frame to the underlying TLS connection.
+// It is safe for concurrent use by multiple goroutines.
+// If a paddingWriteFn is set, frames are routed through it for padding.
 func (s *Session) writeFrame(f *Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
+	s.writeMu.Lock()
 	s.lastActive = time.Now()
-	return s.writer.WriteFrame(f)
+	var err error
+	if s.paddingWriteFn != nil {
+		err = s.paddingWriteFn(f)
+	} else {
+		err = s.writer.WriteFrame(f)
+	}
+	s.writeMu.Unlock()
+	return err
 }
 
 // removeStream unregisters a stream from the session.
 func (s *Session) removeStream(id uint32) {
 	s.streamMu.Lock()
 	delete(s.streams, id)
-	idle := len(s.streams) == 0
+	count := len(s.streams)
 	s.streamMu.Unlock()
 
-	if idle {
+	s.notifyStreamCountChange(count)
+
+	if count == 0 {
 		s.idleSince = time.Now()
 	}
 }
@@ -142,6 +164,28 @@ func (s *Session) getStream(id uint32) *Stream {
 // SetOnStreamOpen sets the callback for new incoming streams (server side).
 func (s *Session) SetOnStreamOpen(fn func(*Stream)) {
 	s.onStreamOpen = fn
+}
+
+// SetOnStreamCountChange sets the callback invoked when active stream count changes.
+// This is used to drive keepalive active/idle state transitions.
+func (s *Session) SetOnStreamCountChange(fn func(activeCount int)) {
+	s.onStreamCountChange = fn
+}
+
+// SetPaddingWriteFn sets a custom write function that applies padding.
+// When set, all frame writes go through this function instead of the raw FrameWriter.
+// The function is called under the writeMu lock — it must not call writeFrame.
+func (s *Session) SetPaddingWriteFn(fn func(f *Frame) error) {
+	s.writeMu.Lock()
+	s.paddingWriteFn = fn
+	s.writeMu.Unlock()
+}
+
+// notifyStreamCountChange calls the stream count change callback if set.
+func (s *Session) notifyStreamCountChange(count int) {
+	if s.onStreamCountChange != nil {
+		s.onStreamCountChange(count)
+	}
 }
 
 // RunEventLoop runs the session event loop, reading and dispatching frames.
@@ -290,7 +334,7 @@ func (s *Session) Close() error {
 		s.streamMu.Lock()
 		for _, stream := range s.streams {
 			stream.closed.Store(true)
-			close(stream.readBuf)
+			stream.closeReadBuf()
 		}
 		s.streams = make(map[uint32]*Stream)
 		s.streamMu.Unlock()

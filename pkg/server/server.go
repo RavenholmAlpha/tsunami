@@ -174,13 +174,39 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleStream(stream, user)
 	})
 
-	// Start keepalive generator if configured
+	// Wire padding system into session write path
+	pw := padding.NewWriter(conn, s.scheme)
+	session.SetPaddingWriteFn(func(f *protocol.Frame) error {
+		return pw.WriteFramesWithPadding([]*protocol.Frame{f})
+	})
+
+	// Send server settings as auth-success confirmation.
+	// The client blocks waiting for this frame after sending auth+settings.
+	serverSettings := &protocol.ServerSettings{
+		Version:        protocol.CurrentVersion,
+		SurgeMode:      protocol.SurgeMode(s.config.SurgeMode),
+		MaxConnections: s.config.MaxConnections,
+		Threshold:      s.config.SurgeThreshold,
+	}
+	if err := session.SendServerSettings(serverSettings); err != nil {
+		log.Printf("tsunami server: send server settings: %v", err)
+		return
+	}
+
+	// Start keepalive generator if configured, and connect stream count tracking
+	var kg *padding.KeepaliveGenerator
 	if s.scheme.Keepalive != nil {
-		pw := padding.NewWriter(conn, s.scheme)
-		kg := padding.NewKeepaliveGenerator(pw, s.scheme.Keepalive)
+		kg = padding.NewKeepaliveGenerator(pw, s.scheme.Keepalive)
 		kg.Start()
 		defer kg.Stop()
 	}
+
+	// Track active/idle state for keepalive
+	session.SetOnStreamCountChange(func(activeCount int) {
+		if kg != nil {
+			kg.SetActive(activeCount > 0)
+		}
+	})
 
 	// Run session event loop (blocks until closed)
 	if err := session.RunEventLoop(); err != nil {

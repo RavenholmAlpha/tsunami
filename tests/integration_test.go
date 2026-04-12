@@ -146,6 +146,15 @@ func handleTestConn(conn net.Conn, auth *protocol.Authenticator) {
 	// Create session
 	session := protocol.NewSession(conn, 0)
 
+	// Send server settings as auth-success confirmation
+	serverSettings := &protocol.ServerSettings{
+		Version:   protocol.CurrentVersion,
+		SurgeMode: protocol.SurgeModeAuto,
+	}
+	if err := session.SendServerSettings(serverSettings); err != nil {
+		return
+	}
+
 	session.SetOnStreamOpen(func(stream *protocol.Stream) {
 		go handleTestStream(stream)
 	})
