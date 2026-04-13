@@ -152,6 +152,12 @@ func (s *Session) writeFrame(f *Frame) error {
 	return err
 }
 
+// WriteFrame writes a single frame through the session's write path.
+// It is safe for concurrent use by multiple goroutines.
+func (s *Session) WriteFrame(f *Frame) error {
+	return s.writeFrame(f)
+}
+
 // writeFrames writes multiple frames under a single lock acquisition.
 // This reduces lock contention when a stream needs to send large payloads
 // that span multiple frames.
@@ -262,7 +268,9 @@ func (s *Session) handleFrame(f *Frame) error {
 		stream := newStream(f.StreamID, s)
 		s.streamMu.Lock()
 		s.streams[f.StreamID] = stream
+		count := len(s.streams)
 		s.streamMu.Unlock()
+		s.notifyStreamCountChange(count)
 		if s.onStreamOpen != nil {
 			go s.onStreamOpen(stream)
 		}

@@ -49,14 +49,9 @@ go build -o tsunami-client ./cmd/tsunami-client/
 
 # Cross-compile for Linux
 GOOS=linux GOARCH=amd64 go build -o tsunami-server ./cmd/tsunami-server/
-
-# Or use the build system (versioned, multi-platform)
-cd build
-./build.sh -v 1.0.0                                   # Linux/macOS
-powershell -File build.ps1 -Version 1.0.0              # Windows
 ```
 
-See [build/README.md](build/README.md) for full build system documentation.
+
 
 ### Server
 

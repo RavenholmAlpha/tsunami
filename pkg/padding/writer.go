@@ -89,7 +89,11 @@ func (pw *Writer) applySplitting(userData []byte, segments []Segment) error {
 			remaining -= targetLen
 		} else if remaining > 0 {
 			// Not enough user data — send remaining user data + waste padding
-			wasteSize := targetLen - remaining
+			// Subtract FrameHeaderLen because the waste frame wire format adds its own header
+			wasteSize := targetLen - remaining - protocol.FrameHeaderLen
+			if wasteSize < 0 {
+				wasteSize = 0
+			}
 			wasteFrame := protocol.NewWasteFrame(wasteSize)
 			wasteBytes := serializeFrames([]*protocol.Frame{wasteFrame})
 
@@ -165,19 +169,20 @@ func serializeFrames(frames []*protocol.Frame) []byte {
 // Behaves like a TLS heartbeat: 30-60s intervals, 4-8 byte packets.
 // Only active when all Streams in the Session are idle.
 type KeepaliveGenerator struct {
-	writer   *Writer
 	config   *KeepaliveConfig
 	stopCh   chan struct{}
 	once     sync.Once
 	isActive atomic.Bool // tracks whether streams are active
+	writeFn  func(f *protocol.Frame) error // session-safe write function
 }
 
 // NewKeepaliveGenerator creates a keepalive generator from the scheme's config.
-func NewKeepaliveGenerator(writer *Writer, config *KeepaliveConfig) *KeepaliveGenerator {
+// writeFn should route writes through the session's write path for thread safety.
+func NewKeepaliveGenerator(config *KeepaliveConfig, writeFn func(f *protocol.Frame) error) *KeepaliveGenerator {
 	return &KeepaliveGenerator{
-		writer: writer,
-		config: config,
-		stopCh: make(chan struct{}),
+		config:  config,
+		stopCh:  make(chan struct{}),
+		writeFn: writeFn,
 	}
 }
 
@@ -216,7 +221,7 @@ func (kg *KeepaliveGenerator) run() {
 			}
 			size := RandomInRange(kg.config.SizeMin, kg.config.SizeMax)
 			wasteFrame := protocol.NewWasteFrame(size)
-			_ = kg.writer.WriteRaw(serializeFrames([]*protocol.Frame{wasteFrame}))
+			_ = kg.writeFn(wasteFrame)
 		}
 	}
 }

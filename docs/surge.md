@@ -58,12 +58,12 @@ Stream F ─┘
          streams > threshold
 Layer 1 ─────────────────────────► Layer 2
          ◄─────────────────────────
-         streams ≤ threshold/2
+         streams ≤ threshold/4
          AND sessions reduced to 1
 ```
 
 - **Upgrade** (1 → 2): Triggered when active stream count exceeds the threshold. The controller proactively creates additional sessions up to `max-connections` asynchronously.
-- **Downgrade** (2 → 1): Triggered when active streams drop to `threshold/2` or below. Idle sessions (idle longer than `idle-downgrade-time`) are closed, keeping at least 1. Layer 1 is restored only after the session count reaches 1.
+- **Downgrade** (2 → 1): Triggered when active streams drop to `threshold/4` or below (wider hysteresis to prevent rapid oscillation). Idle sessions (idle longer than `idle-downgrade-time`) are closed, keeping at least 1. Layer 1 is restored only after the session count reaches 1.
 
 The controller evaluates layer transitions every **2 seconds**.
 

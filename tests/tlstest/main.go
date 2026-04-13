@@ -9,9 +9,13 @@ import (
 )
 
 func main() {
-	addr := "38.55.133.80:28766"
+	addr := ""
 	if len(os.Args) > 1 {
 		addr = os.Args[1]
+	}
+	if addr == "" {
+		fmt.Println("Usage: tlstest <host:port>")
+		os.Exit(1)
 	}
 
 	fmt.Printf("Testing TLS to %s ...\n", addr)

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -105,8 +106,8 @@ func (s *Server) Start() error {
 		return fmt.Errorf("tsunami server: build TLS config: %w", err)
 	}
 
-	// Listen
-	ln, err := tls.Listen("tcp", s.config.Listen, tlsCfg)
+	// Listen on raw TCP so we can access *net.TCPConn for tuning before TLS wrap
+	ln, err := net.Listen("tcp", s.config.Listen)
 	if err != nil {
 		return fmt.Errorf("tsunami server: listen %s: %w", s.config.Listen, err)
 	}
@@ -128,13 +129,29 @@ func (s *Server) Start() error {
 			continue
 		}
 
-		// Apply TCP tuning
+		// Apply TCP tuning on the raw TCPConn BEFORE TLS handshake
 		if tc, ok := conn.(*net.TCPConn); ok {
 			s.config.TCP.ApplyTCPOptions(tc)
 		}
 
-		go s.handleConn(conn)
+		// Wrap with TLS and handle
+		tlsConn := tls.Server(conn, tlsCfg)
+		go s.handleTLSConn(tlsConn)
 	}
+}
+
+// handleTLSConn performs the TLS handshake and delegates to handleConn.
+func (s *Server) handleTLSConn(tlsConn *tls.Conn) {
+	// TLS handshake with timeout
+	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("tsunami server: TLS handshake error: %v", err)
+		tlsConn.Close()
+		return
+	}
+	tlsConn.SetDeadline(time.Time{})
+
+	s.handleConn(tlsConn)
 }
 
 // handleConn handles a single incoming TLS connection.
@@ -144,11 +161,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Set read deadline for auth phase
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
+	// Capture all bytes read during auth for potential fallback replay
+	var authBuf bytes.Buffer
+	teeReader := io.TeeReader(conn, &authBuf)
+
 	// Read authentication request
-	authReq, err := protocol.DecodeAuthRequest(conn)
+	authReq, err := protocol.DecodeAuthRequest(teeReader)
 	if err != nil {
 		log.Printf("tsunami server: auth decode error: %v", err)
-		s.doFallback(conn, nil)
+		s.doFallback(conn, authBuf.Bytes())
 		return
 	}
 
@@ -156,8 +177,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	user := s.auth.Authenticate(authReq.Hash)
 	if user == nil {
 		log.Printf("tsunami server: auth failed from %s", conn.RemoteAddr())
-		// Reconstruct the auth bytes for fallback forwarding
-		s.doFallback(conn, nil)
+		s.doFallback(conn, authBuf.Bytes())
 		return
 	}
 
@@ -165,6 +185,24 @@ func (s *Server) handleConn(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 
 	log.Printf("tsunami server: user '%s' authenticated from %s", user.Name, conn.RemoteAddr())
+
+	// Read client settings (first frame after auth, before session event loop)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	settingsFrame, err := protocol.DecodeFrame(conn)
+	conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		log.Printf("tsunami server: read client settings: %v", err)
+		return
+	}
+	var clientSettings *protocol.ClientSettings
+	if settingsFrame.Command == protocol.CmdSettings && settingsFrame.Data != nil {
+		clientSettings, err = protocol.DecodeClientSettings(settingsFrame.Data)
+		if err != nil {
+			log.Printf("tsunami server: decode client settings: %v", err)
+		} else {
+			log.Printf("tsunami server: client v=%d client=%s", clientSettings.Version, clientSettings.Client)
+		}
+	}
 
 	// Create session
 	session := protocol.NewSession(conn, 0)
@@ -193,10 +231,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	// Push padding scheme if client's version differs
+	if clientSettings != nil && clientSettings.PaddingMD5 != "" && clientSettings.PaddingMD5 != s.scheme.MD5() {
+		log.Printf("tsunami server: pushing updated padding scheme to client (client md5=%s, server md5=%s)",
+			clientSettings.PaddingMD5, s.scheme.MD5())
+		schemeData := []byte(s.scheme.Encode())
+		if err := session.WriteFrame(protocol.NewFrame(protocol.CmdUpdatePaddingScheme, 0, schemeData)); err != nil {
+			log.Printf("tsunami server: send padding scheme: %v", err)
+		}
+	}
+
 	// Start keepalive generator if configured, and connect stream count tracking
 	var kg *padding.KeepaliveGenerator
 	if s.scheme.Keepalive != nil {
-		kg = padding.NewKeepaliveGenerator(pw, s.scheme.Keepalive)
+		kg = padding.NewKeepaliveGenerator(s.scheme.Keepalive, func(f *protocol.Frame) error {
+			return session.WriteFrame(f)
+		})
 		kg.Start()
 		defer kg.Stop()
 	}
