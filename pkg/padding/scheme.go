@@ -7,7 +7,7 @@
 package padding
 
 import (
-	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
 	"math/rand/v2"
 	"strconv"
@@ -22,7 +22,7 @@ type Scheme struct {
 	Rules map[int][]Segment
 	// Keepalive configuration for idle-period background waste.
 	Keepalive *KeepaliveConfig
-	// Raw stores the original text for MD5 computation.
+	// Raw stores the original text for fingerprint computation.
 	Raw string
 }
 
@@ -162,9 +162,9 @@ func parseRange(s string) ([2]int, error) {
 	return [2]int{min, max}, nil
 }
 
-// MD5 returns the lowercase hex MD5 digest of the scheme's raw text.
-func (s *Scheme) MD5() string {
-	h := md5.Sum([]byte(s.Raw))
+// Fingerprint returns the lowercase hex SHA-256 digest of the scheme's raw text.
+func (s *Scheme) Fingerprint() string {
+	h := sha256.Sum256([]byte(s.Raw))
 	return fmt.Sprintf("%x", h)
 }
 

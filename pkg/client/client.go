@@ -188,9 +188,9 @@ func (c *Client) dialSession() (*protocol.Session, error) {
 
 	// Send client settings
 	settings := &protocol.ClientSettings{
-		Version:    protocol.CurrentVersion,
-		Client:     "tsunami/1.0.0",
-		PaddingMD5: c.paddingScheme.MD5(),
+		Version:            protocol.CurrentVersion,
+		Client:             "tsunami/1.0.0",
+		PaddingFingerprint: c.paddingScheme.Fingerprint(),
 	}
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()

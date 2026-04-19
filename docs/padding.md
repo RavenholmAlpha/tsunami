@@ -117,7 +117,7 @@ This scheme:
 
 ## Scheme Versioning
 
-Each scheme is identified by the **MD5 hash** of its raw text. The client includes its current `padding-md5` in the `SETTINGS` frame. If the server's scheme differs, it pushes the new scheme via `cmdUpdatePaddingScheme`.
+Each scheme is identified by the **SHA-256 fingerprint** of its raw text. The client includes its current `padding-fingerprint` in the `SETTINGS` frame. If the server's scheme differs, it pushes the new scheme via `cmdUpdatePaddingScheme`.
 
 This avoids unnecessary retransmission of unchanged schemes across reconnections.
 
@@ -135,7 +135,7 @@ Frame {
 }
 ```
 
-The client parses the scheme, computes its MD5, and applies it immediately to all future packets.
+The client parses the scheme, computes its SHA-256 fingerprint, and applies it immediately to all future packets.
 
 ### Padding Frames
 

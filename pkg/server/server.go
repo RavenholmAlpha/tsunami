@@ -232,9 +232,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	// Push padding scheme if client's version differs
-	if clientSettings != nil && clientSettings.PaddingMD5 != "" && clientSettings.PaddingMD5 != s.scheme.MD5() {
-		log.Printf("tsunami server: pushing updated padding scheme to client (client md5=%s, server md5=%s)",
-			clientSettings.PaddingMD5, s.scheme.MD5())
+	if clientSettings != nil && clientSettings.PaddingFingerprint != "" && clientSettings.PaddingFingerprint != s.scheme.Fingerprint() {
+		log.Printf("tsunami server: pushing updated padding scheme to client (client fingerprint=%s, server fingerprint=%s)",
+			clientSettings.PaddingFingerprint, s.scheme.Fingerprint())
 		schemeData := []byte(s.scheme.Encode())
 		if err := session.WriteFrame(protocol.NewFrame(protocol.CmdUpdatePaddingScheme, 0, schemeData)); err != nil {
 			log.Printf("tsunami server: send padding scheme: %v", err)

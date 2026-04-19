@@ -6,10 +6,10 @@ import (
 
 func TestClientSettingsEncodeDecode(t *testing.T) {
 	original := &ClientSettings{
-		Version:        3,
-		Client:         "tsunami/1.0.0",
-		PaddingMD5:     "abcdef0123456789",
-		SurgeBandwidth: 100,
+		Version:            3,
+		Client:             "tsunami/1.0.0",
+		PaddingFingerprint: "abcdef0123456789",
+		SurgeBandwidth:     100,
 	}
 
 	data := EncodeClientSettings(original)
@@ -24,8 +24,8 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 	if decoded.Client != original.Client {
 		t.Errorf("client = %q, want %q", decoded.Client, original.Client)
 	}
-	if decoded.PaddingMD5 != original.PaddingMD5 {
-		t.Errorf("paddingMD5 = %q, want %q", decoded.PaddingMD5, original.PaddingMD5)
+	if decoded.PaddingFingerprint != original.PaddingFingerprint {
+		t.Errorf("paddingFingerprint = %q, want %q", decoded.PaddingFingerprint, original.PaddingFingerprint)
 	}
 	if decoded.SurgeBandwidth != original.SurgeBandwidth {
 		t.Errorf("surgeBandwidth = %d, want %d", decoded.SurgeBandwidth, original.SurgeBandwidth)

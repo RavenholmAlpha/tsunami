@@ -110,15 +110,15 @@ func TestParseNoKeepalive(t *testing.T) {
 	}
 }
 
-func TestMD5Consistency(t *testing.T) {
+func TestFingerprintConsistency(t *testing.T) {
 	scheme := DefaultScheme()
-	md5a := scheme.MD5()
-	md5b := scheme.MD5()
-	if md5a != md5b {
-		t.Errorf("MD5 should be consistent: %q != %q", md5a, md5b)
+	h1 := scheme.Fingerprint()
+	h2 := scheme.Fingerprint()
+	if h1 != h2 {
+		t.Errorf("Fingerprint should be consistent: %q != %q", h1, h2)
 	}
-	if len(md5a) != 32 {
-		t.Errorf("MD5 length = %d, want 32", len(md5a))
+	if len(h1) != 64 {
+		t.Errorf("Fingerprint length = %d, want 64", len(h1))
 	}
 }
 

@@ -8,10 +8,10 @@ import (
 
 // ClientSettings represents the settings sent by the client in cmdSettings.
 type ClientSettings struct {
-	Version        int
-	Client         string
-	PaddingMD5     string
-	SurgeBandwidth int // Mbps, 0 = disabled
+	Version            int
+	Client             string
+	PaddingFingerprint string
+	SurgeBandwidth     int // Mbps, 0 = disabled
 }
 
 // EncodeClientSettings serializes client settings to the wire format.
@@ -19,8 +19,8 @@ func EncodeClientSettings(s *ClientSettings) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "v=%d\n", s.Version)
 	fmt.Fprintf(&b, "client=%s\n", s.Client)
-	if s.PaddingMD5 != "" {
-		fmt.Fprintf(&b, "padding-md5=%s\n", s.PaddingMD5)
+	if s.PaddingFingerprint != "" {
+		fmt.Fprintf(&b, "padding-fingerprint=%s\n", s.PaddingFingerprint)
 	}
 	if s.SurgeBandwidth > 0 {
 		fmt.Fprintf(&b, "surge-bandwidth=%d", s.SurgeBandwidth)
@@ -47,8 +47,8 @@ func DecodeClientSettings(data []byte) (*ClientSettings, error) {
 			s.Version = v
 		case "client":
 			s.Client = val
-		case "padding-md5":
-			s.PaddingMD5 = val
+		case "padding-fingerprint":
+			s.PaddingFingerprint = val
 		case "surge-bandwidth":
 			bw, err := strconv.Atoi(val)
 			if err != nil {

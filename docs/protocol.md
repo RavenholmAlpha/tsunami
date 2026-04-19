@@ -130,7 +130,7 @@ Sent as the first frame after authentication. Wire format is newline-delimited k
 ```
 v=3
 client=tsunami-client/1.0
-padding-md5=a1b2c3d4e5f6...
+padding-fingerprint=a1b2c3d4e5f6...
 surge-bandwidth=100
 ```
 
@@ -138,7 +138,7 @@ surge-bandwidth=100
 |:----|:-----|:------------|
 | `v` | int | Protocol version |
 | `client` | string | Client identifier |
-| `padding-md5` | string | MD5 hash of the client's current padding scheme |
+| `padding-fingerprint` | string | SHA-256 hash of the client's current padding scheme |
 | `surge-bandwidth` | int | Client bandwidth in Mbps (0 = disabled) |
 
 ### Server Settings (`SERVER_SETTINGS`, `0x0A`)
@@ -163,7 +163,7 @@ threshold=8
 
 1. Client sends `SETTINGS` with its protocol version and current padding scheme hash
 2. Server responds with `SERVER_SETTINGS` containing Surge parameters
-3. If the client's `padding-md5` differs from the server's scheme, the server sends `UPDATE_PADDING` with the full new scheme
+3. If the client's `padding-fingerprint` differs from the server's scheme, the server sends `UPDATE_PADDING` with the full new scheme
 4. The client applies the new padding scheme immediately
 
 ## Stream Lifecycle
