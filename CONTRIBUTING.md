@@ -1,5 +1,7 @@
 # Contributing to TSUNAMI
 
+> **English** | [中文](CONTRIBUTING.zh.md) | [日本語](CONTRIBUTING.ja.md)
+
 Thank you for your interest in contributing to TSUNAMI! This guide will help you get started.
 
 ## Development Setup

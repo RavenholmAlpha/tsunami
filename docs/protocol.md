@@ -1,5 +1,7 @@
 # TSUNAMI Protocol Specification
 
+> **English** | [中文](protocol.zh.md) | [日本語](protocol.ja.md)
+
 > Version 3 (Current)
 
 ## Overview
