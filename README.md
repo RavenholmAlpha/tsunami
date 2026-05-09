@@ -365,3 +365,7 @@ go test ./...
 ## License
 
 [MIT](LICENSE)
+
+## Acknowledgments
+
+Protocol design inspired by [anytls-go](https://github.com/anytls/anytls-go).

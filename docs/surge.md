@@ -1,5 +1,7 @@
 # Surge: Layered Congestion Control
 
+> **English** | [中文](surge.zh.md) | [日本語](surge.ja.md)
+
 ## Overview
 
 Surge is TSUNAMI's adaptive connection scaling system. It manages the number of underlying TLS connections based on real-time stream concurrency, balancing between single-connection efficiency and multi-connection throughput.

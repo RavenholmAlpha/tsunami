@@ -1,5 +1,7 @@
 # Programmable Padding System
 
+> **English** | [中文](padding.zh.md) | [日本語](padding.ja.md)
+
 ## Overview
 
 TSUNAMI's programmable padding system allows the server to dynamically control how the first N packets of a session are padded and split. The padding scheme is pushed from the server to all connected clients via `cmdUpdatePaddingScheme` (`0x06`), enabling traffic pattern changes without any client-side updates.

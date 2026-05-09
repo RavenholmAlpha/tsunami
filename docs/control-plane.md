@@ -1,5 +1,7 @@
 # Control Plane Adaptation
 
+> **English** | [中文](control-plane.zh.md) | [日本語](control-plane.ja.md)
+
 This document describes the extension points for connecting TSUNAMI nodes to
 panels, board systems, and future subscription/client adapters.
 

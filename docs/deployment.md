@@ -1,5 +1,7 @@
 # One-Click Deployment
 
+> **English** | [中文](deployment.zh.md) | [日本語](deployment.ja.md)
+
 This project includes a Linux installer at `scripts/install.sh`. It installs
 `tsunami-server`, writes `/etc/tsunami/config.json`, creates a systemd unit,
 starts the service, and prints a ready-to-use client command.

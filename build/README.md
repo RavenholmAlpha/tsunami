@@ -1,5 +1,7 @@
 # TSUNAMI Build System
 
+> **English** | [中文](README.zh.md) | [日本語](README.ja.md)
+
 Automated cross-platform build scripts for `tsunami-server` and `tsunami-client`.
 
 ## Output Structure
@@ -116,3 +118,7 @@ make VERSION=1.0.0 clean
 | `-l` | `""`                                                           | Extra ldflags               |
 | `-c` | off                                                            | Clean before build          |
 | `-s` | off                                                            | Skip checksum generation    |
+
+## Acknowledgments
+
+Protocol design inspired by [anytls-go](https://github.com/anytls/anytls-go).

@@ -314,3 +314,7 @@ go test ./...
 ## ライセンス
 
 [MIT](LICENSE)
+
+## 謝辞
+
+プロトコル設計は [anytls-go](https://github.com/anytls/anytls-go) にインスパイアされました。

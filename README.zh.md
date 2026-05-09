@@ -314,3 +314,7 @@ go test ./...
 ## 许可证
 
 [MIT](LICENSE)
+
+## 鸣谢
+
+协议设计灵感来源于 [anytls-go](https://github.com/anytls/anytls-go)。
