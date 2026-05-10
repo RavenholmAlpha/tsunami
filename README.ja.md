@@ -8,6 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/RavenholmAlpha/tsunami?style=flat-square&color=brightgreen)](https://github.com/RavenholmAlpha/tsunami/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/RavenholmAlpha/tsunami/ci-cd.yml?style=flat-square&label=CI)](https://github.com/RavenholmAlpha/tsunami/actions)
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-Community-blue?style=flat-square)](https://linux.do)
 
 *標準的な HTTPS とワイヤ上で完全に同一 — DPI からは通常の TLS 1.3 接続にしか見えません。*
 
