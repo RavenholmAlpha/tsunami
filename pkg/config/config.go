@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/server"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
@@ -79,7 +80,14 @@ type ServerConfig struct {
 			Threshold      int    `json:"threshold" yaml:"threshold"`
 		} `json:"surge" yaml:"surge"`
 
-		Fallback      string `json:"fallback" yaml:"fallback"`
+		Fallback string `json:"fallback" yaml:"fallback"`
+		Fronting struct {
+			Enabled      bool   `json:"enabled" yaml:"enabled"`
+			Path         string `json:"path" yaml:"path"`
+			Secret       string `json:"secret" yaml:"secret"`
+			ServerHeader string `json:"server_header" yaml:"server-header"`
+			SiteName     string `json:"site_name" yaml:"site-name"`
+		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 	} `json:"server" yaml:"server"`
 }
@@ -124,7 +132,14 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 		MaxConnections: c.Server.Surge.MaxConnections,
 		SurgeThreshold: c.Server.Surge.Threshold,
 		FallbackAddr:   c.Server.Fallback,
-		PaddingScheme:  strings.TrimSpace(c.Server.PaddingScheme),
+		Fronting: fronting.Config{
+			Enabled:      c.Server.Fronting.Enabled,
+			Path:         c.Server.Fronting.Path,
+			Secret:       c.Server.Fronting.Secret,
+			ServerHeader: c.Server.Fronting.ServerHeader,
+			SiteName:     c.Server.Fronting.SiteName,
+		},
+		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
 	}
 
 	// Apply defaults

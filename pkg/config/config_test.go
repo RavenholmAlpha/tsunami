@@ -25,6 +25,13 @@ func TestLoadFile(t *testing.T) {
       "max_connections": 6,
       "threshold": 10
     },
+    "fronting": {
+      "enabled": true,
+      "path": "/assets/update",
+      "secret": "front-secret",
+      "server_header": "Caddy",
+      "site_name": "Front Site"
+    },
     "fallback": "127.0.0.1:8080",
     "padding_scheme": "stop=4\n0=50-50"
   }
@@ -63,6 +70,9 @@ func TestLoadFile(t *testing.T) {
 	if cfg.Server.Fallback != "127.0.0.1:8080" {
 		t.Errorf("fallback = %q", cfg.Server.Fallback)
 	}
+	if !cfg.Server.Fronting.Enabled || cfg.Server.Fronting.Path != "/assets/update" {
+		t.Errorf("fronting = %+v", cfg.Server.Fronting)
+	}
 
 	// Verify ToServerConfig
 	scfg := cfg.ToServerConfig()
@@ -77,6 +87,9 @@ func TestLoadFile(t *testing.T) {
 	}
 	if scfg.FallbackAddr != "127.0.0.1:8080" {
 		t.Errorf("server config fallback = %q", scfg.FallbackAddr)
+	}
+	if !scfg.Fronting.Enabled || scfg.Fronting.Secret != "front-secret" || scfg.Fronting.SiteName != "Front Site" {
+		t.Errorf("server config fronting = %+v", scfg.Fronting)
 	}
 
 	t.Logf("✅ Config load test passed")

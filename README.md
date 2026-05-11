@@ -346,6 +346,7 @@ For non-interactive / automated deployment:
 | [Protocol Specification](docs/protocol.md) | Wire format, frames, commands, authentication |
 | [Padding Scheme](docs/padding.md) | Programmable padding system syntax & configuration |
 | [Surge Design](docs/surge.md) | Adaptive connection scaling architecture |
+| [Built-in Fronting](docs/fronting.md) | Caddy-like HTTPS/HTTP2/WebSocket fronting mode |
 | [Deployment Guide](docs/deployment.md) | One-click install, Let's Encrypt, environment variables |
 | [Control Plane](docs/control-plane.md) | Panel adapters, middleware, user store |
 | [Build System](build/README.md) | Cross-platform build scripts |

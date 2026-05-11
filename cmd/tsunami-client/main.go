@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/tsunami-protocol/tsunami/pkg/client"
+	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/proxy"
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
@@ -26,16 +27,21 @@ var (
 
 func main() {
 	var (
-		server      = flag.String("server", "", "TSUNAMI server address (host:port)")
-		password    = flag.String("password", "", "Authentication password")
-		sni         = flag.String("sni", "", "TLS SNI (defaults to server hostname)")
-		skipVerify  = flag.Bool("skip-verify", false, "Skip TLS certificate verification")
-		socksAddr   = flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 proxy address")
-		httpAddr    = flag.String("http", "127.0.0.1:8080", "Local HTTP proxy address")
-		maxConn     = flag.Int("max-connections", 4, "Surge max connections")
-		threshold   = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
-		fingerprint = flag.String("fingerprint", "chrome", "TLS fingerprint: chrome, firefox, safari, random, none")
-		showVersion = flag.Bool("version", false, "Print version and exit")
+		server         = flag.String("server", "", "TSUNAMI server address (host:port)")
+		password       = flag.String("password", "", "Authentication password")
+		sni            = flag.String("sni", "", "TLS SNI (defaults to server hostname)")
+		skipVerify     = flag.Bool("skip-verify", false, "Skip TLS certificate verification")
+		socksAddr      = flag.String("socks", "127.0.0.1:1080", "Local SOCKS5 proxy address")
+		httpAddr       = flag.String("http", "127.0.0.1:8080", "Local HTTP proxy address")
+		maxConn        = flag.Int("max-connections", 4, "Surge max connections")
+		threshold      = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
+		fingerprint    = flag.String("fingerprint", "chrome", "TLS fingerprint: chrome, firefox, safari, random, none")
+		useFronting    = flag.Bool("fronting", false, "Use HTTPS/HTTP2/WebSocket fronting transport")
+		frontPath      = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
+		frontHost      = flag.String("front-host", "", "Fronting Host header (defaults to SNI)")
+		frontSecret    = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
+		frontTransport = flag.String("front-transport", fronting.TransportH2, "Fronting transport: h2 or websocket")
+		showVersion    = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
 
@@ -72,6 +78,13 @@ func main() {
 			Threshold:      *threshold,
 		},
 		Mux: mux.DefaultPoolConfig(),
+		Fronting: fronting.Config{
+			Enabled:   *useFronting,
+			Path:      *frontPath,
+			Host:      *frontHost,
+			Secret:    *frontSecret,
+			Transport: *frontTransport,
+		},
 		UDP: true,
 	}
 

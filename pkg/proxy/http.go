@@ -143,7 +143,13 @@ func (h *HTTPProxyServer) handleHTTP(conn net.Conn, br *bufio.Reader, req *http.
 	defer stream.Close()
 
 	// Forward the original request
-	req.WriteProxy(stream)
+	outReq := req.Clone(req.Context())
+	outReq.RequestURI = ""
+	if outReq.URL != nil {
+		outReq.URL.Scheme = ""
+		outReq.URL.Host = ""
+	}
+	outReq.Write(stream)
 
 	// Relay response back
 	var wg sync.WaitGroup

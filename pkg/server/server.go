@@ -4,20 +4,24 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/tsunami-protocol/tsunami/pkg/control"
 	"github.com/tsunami-protocol/tsunami/pkg/fallback"
+	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/padding"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 	"github.com/tsunami-protocol/tsunami/pkg/uot"
+	"golang.org/x/net/http2"
 )
 
 // UserAuthenticator authenticates a TSUNAMI auth hash.
@@ -48,6 +52,9 @@ type Config struct {
 	// Fallback backend address (e.g., "127.0.0.1:8080")
 	FallbackAddr string
 
+	// Fronting enables the built-in Caddy-like HTTPS/HTTP2/WebSocket front.
+	Fronting fronting.Config
+
 	// Padding scheme text
 	PaddingScheme string
 
@@ -57,12 +64,14 @@ type Config struct {
 
 // Server is the TSUNAMI proxy server.
 type Server struct {
-	config   Config
-	auth     UserAuthenticator
-	fallback *fallback.Handler
-	scheme   *padding.Scheme
-	listener net.Listener
-	traffic  control.TrafficPolicy
+	config    Config
+	auth      UserAuthenticator
+	fallback  *fallback.Handler
+	scheme    *padding.Scheme
+	listener  net.Listener
+	httpSrv   *http.Server
+	traffic   control.TrafficPolicy
+	frontKeys [][32]byte
 
 	mu     sync.Mutex
 	closed bool
@@ -98,6 +107,12 @@ func New(config Config) (*Server, error) {
 		fb = fallback.NewHandler(config.FallbackAddr)
 	}
 
+	config.Fronting.Normalize()
+	frontKeys, err := buildFrontingKeys(config)
+	if err != nil {
+		return nil, err
+	}
+
 	// Set defaults
 	if config.MaxConnections == 0 {
 		config.MaxConnections = 4
@@ -113,16 +128,21 @@ func New(config Config) (*Server, error) {
 	}
 
 	return &Server{
-		config:   config,
-		auth:     auth,
-		fallback: fb,
-		scheme:   scheme,
-		traffic:  config.Traffic,
+		config:    config,
+		auth:      auth,
+		fallback:  fb,
+		scheme:    scheme,
+		traffic:   config.Traffic,
+		frontKeys: frontKeys,
 	}, nil
 }
 
 // Start starts the TSUNAMI server.
 func (s *Server) Start() error {
+	if s.config.Fronting.Enabled {
+		return s.startFronting()
+	}
+
 	// Build TLS config
 	tlsCfg, err := s.config.TLS.BuildServerTLSConfig()
 	if err != nil {
@@ -161,6 +181,44 @@ func (s *Server) Start() error {
 		tlsConn := tls.Server(conn, tlsCfg)
 		go s.handleTLSConn(tlsConn)
 	}
+}
+
+func (s *Server) startFronting() error {
+	baseTLSCfg, err := s.config.TLS.BuildServerTLSConfig()
+	if err != nil {
+		return fmt.Errorf("tsunami fronting: build TLS config: %w", err)
+	}
+	tlsCfg := fronting.CaddyLikeTLSConfig(baseTLSCfg.Certificates)
+
+	ln, err := net.Listen("tcp", s.config.Listen)
+	if err != nil {
+		return fmt.Errorf("tsunami fronting: listen %s: %w", s.config.Listen, err)
+	}
+	s.listener = ln
+
+	httpSrv := &http.Server{
+		Handler:           http.HandlerFunc(s.handleFrontingHTTP),
+		TLSConfig:         tlsCfg,
+		ReadHeaderTimeout: time.Minute,
+		IdleTimeout:       5 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	httpSrv.Protocols = new(http.Protocols)
+	httpSrv.Protocols.SetHTTP1(true)
+	httpSrv.Protocols.SetUnencryptedHTTP2(true)
+	if err := http2.ConfigureServer(httpSrv, new(http2.Server)); err != nil {
+		ln.Close()
+		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
+	}
+	s.httpSrv = httpSrv
+
+	log.Printf("tsunami fronting: listening on %s path=%s", s.config.Listen, s.config.Fronting.Path)
+	tuned := &tcpTuningListener{Listener: ln, tcp: &s.config.TCP}
+	err = httpSrv.Serve(tls.NewListener(tuned, tlsCfg))
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 // handleTLSConn performs the TLS handshake and delegates to handleConn.
@@ -378,12 +436,170 @@ func (s *Server) doFallback(conn net.Conn, reason string, preReadData []byte, ca
 	log.Printf("tsunami server: fallback relay finished remote=%s reason=%s backend=%s", conn.RemoteAddr(), reason, backend)
 }
 
+func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
+	cfg := s.config.Fronting
+	cfg.Normalize()
+
+	w.Header().Set("Server", cfg.ServerHeader)
+
+	if r.URL.Path == cfg.Path && fronting.VerifyRequest(r, s.frontKeys, time.Now(), fronting.ClockSkew) {
+		switch {
+		case r.Method == http.MethodPost:
+			s.handleFrontingHTTP2(w, r)
+			return
+		case r.Method == http.MethodGet && fronting.IsWebSocketUpgrade(r):
+			s.handleFrontingWebSocket(w, r)
+			return
+		}
+	}
+
+	s.serveFrontingDecoy(w, r)
+}
+
+func (s *Server) handleFrontingHTTP2(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor < 2 {
+		s.serveFrontingDecoy(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	conn := fronting.NewHTTPServerConn(w, r)
+	s.handleConn(conn)
+}
+
+func (s *Server) handleFrontingWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := fronting.UpgradeServer(w, r, s.config.Fronting.ServerHeader)
+	if err != nil {
+		log.Printf("tsunami fronting: websocket upgrade failed remote=%s err=%v", r.RemoteAddr, err)
+		s.serveFrontingDecoy(w, r)
+		return
+	}
+	s.handleConn(conn)
+}
+
+func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
+	cfg := s.config.Fronting
+	cfg.Normalize()
+	w.Header().Set("Server", cfg.ServerHeader)
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.URL.Path {
+	case "/", "/index.html":
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		body := fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+</head>
+<body>
+<main>
+<h1>%s</h1>
+<p>The site is running.</p>
+</main>
+</body>
+</html>
+`, cfg.SiteName, cfg.SiteName)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	case "/robots.txt":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = io.WriteString(w, "User-agent: *\nDisallow:\n")
+	case "/favicon.ico":
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func buildFrontingKeys(config Config) ([][32]byte, error) {
+	if !config.Fronting.Enabled {
+		return nil, nil
+	}
+	var keys [][32]byte
+	seen := make(map[[32]byte]struct{})
+	add := func(key [32]byte) {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	if config.Fronting.Secret != "" {
+		add(fronting.KeyFromSecret(config.Fronting.Secret))
+	}
+	for _, user := range config.Users {
+		if user == nil {
+			continue
+		}
+		if user.Password != "" {
+			add(fronting.KeyFromSecret(user.Password))
+			continue
+		}
+		if user.TokenHash != "" {
+			decoded, err := hex.DecodeString(strings.TrimSpace(user.TokenHash))
+			if err != nil {
+				return nil, fmt.Errorf("tsunami fronting: decode token hash for user %q: %w", user.Name, err)
+			}
+			if len(decoded) != protocol.AuthHashLen {
+				return nil, fmt.Errorf("tsunami fronting: token hash for user %q has length %d", user.Name, len(decoded))
+			}
+			var key [32]byte
+			copy(key[:], decoded)
+			add(key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("tsunami fronting: fronting_secret or static users are required")
+	}
+	return keys, nil
+}
+
+type tcpTuningListener struct {
+	net.Listener
+	tcp *transport.TCPConfig
+}
+
+func (l *tcpTuningListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok && l.tcp != nil {
+		_ = l.tcp.ApplyTCPOptions(tc)
+	}
+	return conn, nil
+}
+
 // Close shuts down the server.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.closed = true
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Close()
+	}
 	if s.listener != nil {
 		return s.listener.Close()
 	}

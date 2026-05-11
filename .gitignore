@@ -24,3 +24,6 @@ Thumbs.db
 
 # Project-specific
 docs/TSUNAMI_project_technical_deck.pptx
+
+# Local research/vendor checkouts
+.research/

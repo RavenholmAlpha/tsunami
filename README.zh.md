@@ -295,6 +295,7 @@ tsunami/
 | [协议规范](docs/protocol.zh.md) | 线路格式、帧、命令、认证 |
 | [填充方案](docs/padding.zh.md) | 可编程填充系统语法和配置 |
 | [Surge 设计](docs/surge.zh.md) | 自适应连接扩展架构 |
+| [内置前置层](docs/fronting.md) | 类 Caddy 的 HTTPS/HTTP2/WebSocket 前置模式 |
 | [部署指南](docs/deployment.zh.md) | 一键安装、Let's Encrypt、环境变量 |
 | [控制面板](docs/control-plane.zh.md) | 面板适配器、中间件、用户存储 |
 | [构建系统](build/README.zh.md) | 跨平台构建脚本 |

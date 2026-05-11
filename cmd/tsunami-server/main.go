@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	configfile "github.com/tsunami-protocol/tsunami/pkg/config"
+	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/server"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
@@ -30,6 +31,10 @@ func main() {
 		password    = flag.String("password", "", "User password")
 		configPath  = flag.String("config", "", "JSON config file")
 		fallback    = flag.String("fallback", "", "Fallback backend address (e.g., 127.0.0.1:8080)")
+		useFronting = flag.Bool("fronting", false, "Serve a Caddy-like HTTPS/HTTP2/WebSocket front")
+		frontPath   = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
+		frontSecret = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
+		frontSite   = flag.String("front-site-name", "Welcome", "Fronting decoy site name")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -70,6 +75,12 @@ func main() {
 				},
 			},
 			FallbackAddr: *fallback,
+			Fronting: fronting.Config{
+				Enabled:  *useFronting,
+				Path:     *frontPath,
+				Secret:   *frontSecret,
+				SiteName: *frontSite,
+			},
 		}
 	}
 
