@@ -149,13 +149,17 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --password "your-strong-password" \
   --fallback 127.0.0.1:8080
 
-# With TLS certificate
+# Self-signed mode is for local testing only. Public deployments should use
+# fronting with a real domain certificate.
+
+# Public deployment: real domain certificate + fronting
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fallback 127.0.0.1:8080
+  --fronting \
+  --front-decoy-proxy http://127.0.0.1:8080
 
 # With JSON config
 ./tsunami-server --config /etc/tsunami/config.json
@@ -167,6 +171,8 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--cert` | — | TLS certificate file (PEM) |
 | `--key` | — | TLS private key file (PEM) |
 | `--password` | *(required)* | Authentication password |
+| `--fronting` | `false` | Serve the public listener as HTTPS/HTTP2/WebSocket fronting |
+| `--front-decoy-proxy` | - | Optional HTTP(S) decoy origin for unauthenticated fronting requests |
 | `--fallback` | — | Fallback HTTP backend |
 | `--config` | — | JSON configuration file |
 

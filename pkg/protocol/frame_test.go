@@ -7,8 +7,8 @@ import (
 
 func TestFrameEncodeDecode(t *testing.T) {
 	tests := []struct {
-		name    string
-		frame   *Frame
+		name  string
+		frame *Frame
 	}{
 		{
 			name:  "empty data",
@@ -28,7 +28,7 @@ func TestFrameEncodeDecode(t *testing.T) {
 		},
 		{
 			name:  "settings data",
-			frame: NewFrame(CmdSettings, 0, []byte("v=3\nclient=tsunami/1.0.0")),
+			frame: NewFrame(CmdSettings, 0, []byte("v=3\nclient=http-client/1.0")),
 		},
 	}
 

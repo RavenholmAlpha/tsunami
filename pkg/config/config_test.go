@@ -30,7 +30,8 @@ func TestLoadFile(t *testing.T) {
       "path": "/assets/update",
       "secret": "front-secret",
       "server_header": "Caddy",
-      "site_name": "Front Site"
+      "site_name": "Front Site",
+      "decoy_proxy": "http://127.0.0.1:8081"
     },
     "fallback": "127.0.0.1:8080",
     "padding_scheme": "stop=4\n0=50-50"
@@ -88,7 +89,7 @@ func TestLoadFile(t *testing.T) {
 	if scfg.FallbackAddr != "127.0.0.1:8080" {
 		t.Errorf("server config fallback = %q", scfg.FallbackAddr)
 	}
-	if !scfg.Fronting.Enabled || scfg.Fronting.Secret != "front-secret" || scfg.Fronting.SiteName != "Front Site" {
+	if !scfg.Fronting.Enabled || scfg.Fronting.Secret != "front-secret" || scfg.Fronting.SiteName != "Front Site" || scfg.Fronting.DecoyProxy != "http://127.0.0.1:8081" {
 		t.Errorf("server config fronting = %+v", scfg.Fronting)
 	}
 

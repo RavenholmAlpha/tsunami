@@ -14,12 +14,21 @@ import (
 )
 
 const (
-	headerVersion = "X-Tsunami-Front"
-	headerDate    = "X-Tsunami-Date"
-	headerNonce   = "X-Tsunami-Nonce"
-	headerAuth    = "X-Tsunami-Auth"
+	headerVersion = "X-Request-Version"
+	headerDate    = "X-Request-Date"
+	headerNonce   = "X-Request-Nonce"
+	headerAuth    = "X-Request-Signature"
 	authVersion   = "v1"
 )
+
+// StripAuthHeaders removes fronting-only request metadata before a decoy proxy
+// forwards unauthenticated traffic to a normal origin.
+func StripAuthHeaders(h http.Header) {
+	h.Del(headerVersion)
+	h.Del(headerDate)
+	h.Del(headerNonce)
+	h.Del(headerAuth)
+}
 
 // SignRequest adds HTTP-layer authentication headers.
 func SignRequest(req *http.Request, key [32]byte, now time.Time) error {

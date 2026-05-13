@@ -7,7 +7,7 @@ import (
 func TestClientSettingsEncodeDecode(t *testing.T) {
 	original := &ClientSettings{
 		Version:        3,
-		Client:         "tsunami/1.0.0",
+		Client:         "http-client/1.0",
 		PaddingMD5:     "abcdef0123456789",
 		SurgeBandwidth: 100,
 	}

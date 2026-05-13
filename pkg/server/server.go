@@ -10,6 +10,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +72,7 @@ type Server struct {
 	scheme    *padding.Scheme
 	listener  net.Listener
 	httpSrv   *http.Server
+	decoy     *httputil.ReverseProxy
 	traffic   control.TrafficPolicy
 	frontKeys [][32]byte
 
@@ -112,6 +115,10 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	decoyProxy, err := buildFrontingDecoyProxy(config.Fronting.DecoyProxy, config.Fronting.ServerHeader)
+	if err != nil {
+		return nil, err
+	}
 
 	// Set defaults
 	if config.MaxConnections == 0 {
@@ -132,6 +139,7 @@ func New(config Config) (*Server, error) {
 		auth:      auth,
 		fallback:  fb,
 		scheme:    scheme,
+		decoy:     decoyProxy,
 		traffic:   config.Traffic,
 		frontKeys: frontKeys,
 	}, nil
@@ -489,6 +497,11 @@ func (s *Server) handleFrontingWebSocket(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
+	if s.decoy != nil {
+		s.decoy.ServeHTTP(w, r)
+		return
+	}
+
 	cfg := s.config.Fronting
 	cfg.Normalize()
 	w.Header().Set("Server", cfg.ServerHeader)
@@ -534,6 +547,47 @@ func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func buildFrontingDecoyProxy(rawOrigin, serverHeader string) (*httputil.ReverseProxy, error) {
+	rawOrigin = strings.TrimSpace(rawOrigin)
+	if rawOrigin == "" {
+		return nil, nil
+	}
+	if !strings.Contains(rawOrigin, "://") {
+		rawOrigin = "http://" + rawOrigin
+	}
+	origin, err := url.Parse(rawOrigin)
+	if err != nil {
+		return nil, fmt.Errorf("tsunami fronting: parse decoy proxy %q: %w", rawOrigin, err)
+	}
+	if origin.Scheme != "http" && origin.Scheme != "https" {
+		return nil, fmt.Errorf("tsunami fronting: decoy proxy must use http or https, got %q", origin.Scheme)
+	}
+	if origin.Host == "" {
+		return nil, fmt.Errorf("tsunami fronting: decoy proxy %q has no host", rawOrigin)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(origin)
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		fronting.StripAuthHeaders(req.Header)
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if serverHeader != "" {
+			resp.Header.Set("Server", serverHeader)
+		}
+		return nil
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("tsunami fronting: decoy proxy error remote=%s origin=%s err=%v", r.RemoteAddr, origin.Redacted(), err)
+		if serverHeader != "" {
+			w.Header().Set("Server", serverHeader)
+		}
+		http.NotFound(w, r)
+	}
+	return proxy, nil
 }
 
 func buildFrontingKeys(config Config) ([][32]byte, error) {

@@ -36,6 +36,7 @@ func main() {
 		frontPath   = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
 		frontSecret = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
 		frontSite   = flag.String("front-site-name", "Welcome", "Fronting decoy site name")
+		frontDecoy  = flag.String("front-decoy-proxy", "", "Optional HTTP(S) origin for unauthenticated fronting requests")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -81,6 +82,7 @@ func main() {
 				Path:     *frontPath,
 				Secret:   *frontSecret,
 				SiteName: *frontSite,
+				DecoyProxy: *frontDecoy,
 			},
 		}
 	}

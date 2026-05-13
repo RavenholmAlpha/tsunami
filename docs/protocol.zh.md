@@ -131,7 +131,7 @@ TSUNAMI 是一个在 TLS 1.3 连接内运行的多路复用代理协议。该协
 
 ```
 v=3
-client=tsunami-client/1.0
+client=http-client/1.0
 padding-md5=a1b2c3d4e5f6...
 surge-bandwidth=100
 ```

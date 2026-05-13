@@ -54,6 +54,9 @@ type Config struct {
 	ServerHeader string
 	// SiteName is used by the built-in decoy website.
 	SiteName string
+	// DecoyProxy is an optional HTTP origin for unauthenticated fronting
+	// requests. When empty, the built-in decoy site is served.
+	DecoyProxy string
 }
 
 // Normalize fills default values.

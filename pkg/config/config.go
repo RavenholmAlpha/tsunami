@@ -87,6 +87,7 @@ type ServerConfig struct {
 			Secret       string `json:"secret" yaml:"secret"`
 			ServerHeader string `json:"server_header" yaml:"server-header"`
 			SiteName     string `json:"site_name" yaml:"site-name"`
+			DecoyProxy   string `json:"decoy_proxy" yaml:"decoy-proxy"`
 		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 	} `json:"server" yaml:"server"`
@@ -138,6 +139,7 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 			Secret:       c.Server.Fronting.Secret,
 			ServerHeader: c.Server.Fronting.ServerHeader,
 			SiteName:     c.Server.Fronting.SiteName,
+			DecoyProxy:   c.Server.Fronting.DecoyProxy,
 		},
 		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
 	}

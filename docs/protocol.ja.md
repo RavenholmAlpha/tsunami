@@ -131,7 +131,7 @@ TSUNAMI は TLS 1.3 接続内で動作する多重化プロキシプロトコル
 
 ```
 v=3
-client=tsunami-client/1.0
+client=http-client/1.0
 padding-md5=a1b2c3d4e5f6...
 surge-bandwidth=100
 ```

@@ -35,6 +35,20 @@ If a domain is provided, the installer **automatically requests a Let's Encrypt
 certificate** using certbot. If no domain is given and no certificate paths are
 set, the server uses a self-signed certificate.
 
+## Public Safety Baseline
+
+For public censorship-resistance deployments, use the fronting mode documented
+in [Built-in Fronting](fronting.md):
+
+- Use a real domain and a publicly trusted certificate.
+- Do not expose the auto-generated self-signed certificate publicly.
+- Do not expose the raw post-TLS protocol mode as the public entry point.
+- Prefer HTTP/2 fronting and, when possible, configure a real decoy origin with
+  `--front-decoy-proxy` or `fronting.decoy_proxy`.
+
+The one-click installer can still be used for basic deployment, but review the
+generated `/etc/tsunami/config.json` before using it in an adversarial network.
+
 ## Let's Encrypt (Automatic TLS)
 
 When you provide a domain name during installation:

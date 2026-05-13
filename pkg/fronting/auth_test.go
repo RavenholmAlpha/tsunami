@@ -2,6 +2,7 @@ package fronting
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,6 +21,11 @@ func TestSignAndVerifyRequest(t *testing.T) {
 	}
 	if !VerifyRequest(req, [][32]byte{key}, now, ClockSkew) {
 		t.Fatal("signed request did not verify")
+	}
+	for name := range req.Header {
+		if strings.Contains(strings.ToLower(name), "tsunami") {
+			t.Fatalf("signed request leaked project marker header %q", name)
+		}
 	}
 }
 

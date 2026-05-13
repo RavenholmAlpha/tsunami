@@ -330,7 +330,7 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	// Send client settings
 	settings := &protocol.ClientSettings{
 		Version:    protocol.CurrentVersion,
-		Client:     "tsunami/1.0.0",
+		Client:     "http-client/1.0",
 		PaddingMD5: scheme.MD5(),
 	}
 	if err := session.SendSettings(settings); err != nil {

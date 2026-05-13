@@ -5,7 +5,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,15 @@ import (
 
 func startFrontingTsunamiServer(t *testing.T) (string, func()) {
 	t.Helper()
+	return startFrontingTsunamiServerWithFronting(t, fronting.Config{
+		Enabled:  true,
+		Path:     "/assets/update",
+		SiteName: "Front Site",
+	})
+}
+
+func startFrontingTsunamiServerWithFronting(t *testing.T, frontCfg fronting.Config) (string, func()) {
+	t.Helper()
 
 	addr := reserveTCPAddr(t)
 	srv, err := server.New(server.Config{
@@ -34,11 +45,7 @@ func startFrontingTsunamiServer(t *testing.T) (string, func()) {
 			{Name: "fronting-user", Password: testPassword},
 		},
 		SurgeMode: string(surge.ModeNone),
-		Fronting: fronting.Config{
-			Enabled:  true,
-			Path:     "/assets/update",
-			SiteName: "Front Site",
-		},
+		Fronting:  frontCfg,
 	})
 	if err != nil {
 		t.Fatalf("fronting server new: %v", err)
@@ -173,6 +180,62 @@ func TestFrontingDecoyLooksLikeHTTPServer(t *testing.T) {
 	defer probeResp.Body.Close()
 	if probeResp.StatusCode == http.StatusSwitchingProtocols || probeResp.StatusCode == http.StatusOK {
 		t.Fatalf("unauthenticated probe got status %d", probeResp.StatusCode)
+	}
+}
+
+func TestFrontingDecoyProxy(t *testing.T) {
+	var sawSignatureHeader atomic.Bool
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Request-Signature") != "" {
+			sawSignatureHeader.Store(true)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("proxied decoy:" + r.URL.Path))
+	}))
+	defer origin.Close()
+
+	serverAddr, stopServer := startFrontingTsunamiServerWithFronting(t, fronting.Config{
+		Enabled:    true,
+		Path:       "/assets/update",
+		SiteName:   "Front Site",
+		DecoyProxy: origin.URL,
+	})
+	defer stopServer()
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2: true,
+	}
+	if err := http2.ConfigureTransport(tr); err != nil {
+		t.Fatalf("configure h2 transport: %v", err)
+	}
+	httpClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	req, err := http.NewRequest(http.MethodGet, "https://"+serverAddr+"/probe", nil)
+	if err != nil {
+		t.Fatalf("new decoy request: %v", err)
+	}
+	req.Header.Set("X-Request-Signature", "probe-value")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("decoy proxy GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("decoy proxy status = %d, want 202", resp.StatusCode)
+	}
+	if got := string(body); got != "proxied decoy:/probe" {
+		t.Fatalf("decoy proxy body = %q", got)
+	}
+	if sawSignatureHeader.Load() {
+		t.Fatal("fronting auth header leaked to decoy proxy")
 	}
 }
 

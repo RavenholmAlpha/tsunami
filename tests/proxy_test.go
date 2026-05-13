@@ -23,8 +23,8 @@ import (
 func startHTTPTarget(t *testing.T) (string, func()) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Tsunami", "ok")
-		fmt.Fprintf(w, "Hello from TSUNAMI target! Method=%s Path=%s", r.Method, r.URL.Path)
+		w.Header().Set("X-Upstream-Test", "ok")
+		fmt.Fprintf(w, "Hello from upstream target! Method=%s Path=%s", r.Method, r.URL.Path)
 	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -44,7 +44,6 @@ func startHTTPTarget(t *testing.T) (string, func()) {
 		ln.Close()
 	}
 }
-
 
 // TestSOCKS5ProxyEcho tests SOCKS5 proxy → TSUNAMI → echo server
 func TestSOCKS5ProxyEcho(t *testing.T) {
@@ -183,10 +182,10 @@ func TestSOCKS5ProxyHTTP(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
-	if resp.Header.Get("X-Tsunami") != "ok" {
-		t.Errorf("missing X-Tsunami header")
+	if resp.Header.Get("X-Upstream-Test") != "ok" {
+		t.Errorf("missing upstream test header")
 	}
-	if !strings.Contains(bodyStr, "Hello from TSUNAMI target") {
+	if !strings.Contains(bodyStr, "Hello from upstream target") {
 		t.Errorf("unexpected body: %q", bodyStr)
 	}
 

@@ -82,7 +82,6 @@ func ClientWebSocketHandshake(conn net.Conn, endpoint *url.URL, host string, key
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("Sec-WebSocket-Key", wsKey)
-	req.Header.Set("Sec-WebSocket-Protocol", "tsunami")
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	if err := SignRequest(req, key, time.Now()); err != nil {
 		return nil, err
