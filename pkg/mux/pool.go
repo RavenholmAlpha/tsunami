@@ -34,6 +34,7 @@ type Pool struct {
 	config     PoolConfig
 	sessions   []*protocol.Session
 	mu         sync.Mutex
+	createMu   sync.Mutex
 	seqCounter atomic.Uint64
 	stopCh     chan struct{}
 	stopped    atomic.Bool
@@ -88,6 +89,18 @@ func (p *Pool) GetOrCreateSession() (*protocol.Session, error) {
 	}
 
 	// No sessions at all — create the first one
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
+	p.mu.Lock()
+	for _, s := range p.sessions {
+		if !s.IsClosed() {
+			p.mu.Unlock()
+			return s, nil
+		}
+	}
+	p.mu.Unlock()
+
 	return p.createSession()
 }
 
@@ -136,6 +149,8 @@ func (p *Pool) createSession() (*protocol.Session, error) {
 // Unlike GetOrCreateSession which reuses existing sessions, this always dials.
 // Used by Surge controller for intentional pool expansion.
 func (p *Pool) CreateNewSession() (*protocol.Session, error) {
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
 	return p.createSession()
 }
 

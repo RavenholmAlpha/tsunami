@@ -45,3 +45,31 @@ func TestSessionUpdatePaddingSchemeCallbackError(t *testing.T) {
 		t.Fatalf("handle update padding error = %v, want %v", err, wantErr)
 	}
 }
+
+func TestStreamWriteBatchesPaddingFrames(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	stream := newStream(1, session)
+
+	var calls int
+	var frameCount int
+	session.SetPaddingWriteFn(func(frames []*Frame) error {
+		calls++
+		frameCount = len(frames)
+		return nil
+	})
+
+	data := make([]byte, MaxFrameDataLen+1)
+	n, err := stream.Write(data)
+	if err != nil {
+		t.Fatalf("stream write: %v", err)
+	}
+	if n != len(data) {
+		t.Fatalf("write n = %d, want %d", n, len(data))
+	}
+	if calls != 1 {
+		t.Fatalf("padding write calls = %d, want 1", calls)
+	}
+	if frameCount != 2 {
+		t.Fatalf("batched frame count = %d, want 2", frameCount)
+	}
+}

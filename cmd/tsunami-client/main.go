@@ -36,6 +36,7 @@ func main() {
 		maxConn        = flag.Int("max-connections", 4, "Surge max connections")
 		threshold      = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
 		fingerprint    = flag.String("fingerprint", "chrome", "TLS fingerprint: chrome, firefox, safari, random, none")
+		forceBBR       = flag.Bool("force-bbr", false, "Force per-connection TCP BBR on Linux")
 		useFronting    = flag.Bool("fronting", false, "Use HTTPS/HTTP2/WebSocket fronting transport")
 		frontPath      = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
 		frontHost      = flag.String("front-host", "", "Fronting Host header (defaults to SNI)")
@@ -87,6 +88,7 @@ func main() {
 		},
 		UDP: true,
 	}
+	cfg.TCP.ForceBBR = *forceBBR
 
 	c, err := client.New(cfg)
 	if err != nil {

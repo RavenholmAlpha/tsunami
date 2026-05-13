@@ -22,6 +22,18 @@ const (
 	DefaultPath = "/assets/update"
 	// DefaultServerHeader matches Caddy's default HTTP Server header.
 	DefaultServerHeader = "Caddy"
+
+	// H2FlowControlWindow keeps long-RTT tunnels from being capped by the
+	// HTTP/2 default 64 KiB stream window.
+	H2FlowControlWindow int32 = 16 << 20
+	// H2ClientFlowControlWindow is capped below net/http's public 4 MiB
+	// HTTP2Config limit while still being far above the 64 KiB default.
+	H2ClientFlowControlWindow = 3 << 20
+	// H2MaxFrameSize allows larger HTTP/2 DATA frames while staying well
+	// below the protocol maximum.
+	H2MaxFrameSize uint32 = 1 << 20
+	// HTTPFlushThreshold amortizes h2 flushes without delaying control frames.
+	HTTPFlushThreshold = 1 << 20
 )
 
 // Config holds shared fronting settings.

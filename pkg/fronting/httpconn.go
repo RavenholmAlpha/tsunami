@@ -21,6 +21,8 @@ type HTTPServerConn struct {
 	writeMu sync.Mutex
 	closeMu sync.Mutex
 	closed  bool
+
+	bytesSinceFlush int
 }
 
 // NewHTTPServerConn returns a net.Conn backed by r.Body and w.
@@ -50,10 +52,23 @@ func (c *HTTPServerConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	n, err := c.writer.Write(p)
-	if c.flusher != nil {
-		c.flusher.Flush()
+	c.bytesSinceFlush += n
+	if c.shouldFlush(n) {
+		c.flushLocked()
 	}
 	return n, err
+}
+
+func (c *HTTPServerConn) shouldFlush(lastWrite int) bool {
+	if c.flusher == nil || lastWrite <= 0 {
+		return false
+	}
+	return lastWrite < 4096 || c.bytesSinceFlush >= HTTPFlushThreshold
+}
+
+func (c *HTTPServerConn) flushLocked() {
+	c.flusher.Flush()
+	c.bytesSinceFlush = 0
 }
 
 func (c *HTTPServerConn) Close() error {
@@ -63,6 +78,11 @@ func (c *HTTPServerConn) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.writeMu.Lock()
+	if c.flusher != nil && c.bytesSinceFlush > 0 {
+		c.flushLocked()
+	}
+	c.writeMu.Unlock()
 	return c.body.Close()
 }
 

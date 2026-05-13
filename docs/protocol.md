@@ -232,12 +232,12 @@ The ATYP/address/port fields specify the UDP destination for each individual pac
 | Parameter | Default | Description |
 |:----------|:--------|:------------|
 | `TCP_NODELAY` | enabled | Disable Nagle's algorithm for lower latency |
-| `SO_SNDBUF` | 4 MB | Large send buffer for high throughput |
-| `SO_RCVBUF` | 4 MB | Large receive buffer for high throughput |
+| `SO_SNDBUF` | kernel autotuning | TSUNAMI does not set a fixed socket send buffer unless configured by the caller |
+| `SO_RCVBUF` | kernel autotuning | TSUNAMI does not set a fixed socket receive buffer unless configured by the caller |
 | `TCP_KEEPALIVE` | 30s | Detect dead connections |
-| Congestion control | BBR | Linux only; set via `TCP_CONGESTION` setsockopt |
+| Congestion control | system default | Linux can opt into per-connection BBR with `--force-bbr` |
 
-> **Note**: BBR is set with best-effort. If the kernel doesn't have BBR loaded (`modprobe tcp_bbr`), the system default congestion control is used silently.
+> **Note**: BBR is best-effort when explicitly enabled. If the kernel doesn't have BBR loaded (`modprobe tcp_bbr`) or the socket option fails, the system default congestion control is used.
 
 ## Surge Control Actions
 

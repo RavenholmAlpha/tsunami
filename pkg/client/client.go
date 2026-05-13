@@ -220,7 +220,8 @@ func (c *Client) dialFrontedH2(cfg fronting.Config) (net.Conn, error) {
 	}
 
 	h2Transport := &http2.Transport{
-		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
+		TLSClientConfig:  c.config.TLS.BuildClientTLSConfig(),
+		MaxReadFrameSize: fronting.H2MaxFrameSize,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			dialer := &net.Dialer{Timeout: 10 * time.Second}
 			tcpConn, err := dialer.DialContext(ctx, network, addr)
@@ -319,8 +320,8 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 
 	// Wire padding system into session write path
 	pw := padding.NewWriter(tlsConn, scheme)
-	session.SetPaddingWriteFn(func(f *protocol.Frame) error {
-		return pw.WriteFramesWithPadding([]*protocol.Frame{f})
+	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+		return pw.WriteFramesWithPadding(frames)
 	})
 	session.SetOnPaddingSchemeUpdate(func(data []byte) error {
 		return c.applyPaddingSchemeUpdate(data, pw)

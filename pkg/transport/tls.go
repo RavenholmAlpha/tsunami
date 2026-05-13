@@ -94,11 +94,14 @@ type TCPConfig struct {
 // DefaultTCPConfig returns the default TCP tuning parameters.
 func DefaultTCPConfig() *TCPConfig {
 	return &TCPConfig{
-		SendBufferSize: 4 * 1024 * 1024, // 4 MB
-		RecvBufferSize: 4 * 1024 * 1024, // 4 MB
+		// Leave socket buffers on kernel autotuning by default. Manually
+		// setting SO_RCVBUF can clamp the advertised receive window on Linux
+		// and cap long-RTT throughput.
+		SendBufferSize: 0,
+		RecvBufferSize: 0,
 		NoDelay:        true,
 		KeepAlive:      30 * time.Second,
-		ForceBBR:       true,
+		ForceBBR:       false,
 	}
 }
 
@@ -119,16 +122,8 @@ func (c *TCPConfig) ApplyTCPOptions(conn *net.TCPConn) error {
 		}
 	}
 
-	// Set TCP buffer sizes (cross-platform via Go net API)
-	if c.SendBufferSize > 0 {
-		if err := conn.SetWriteBuffer(c.SendBufferSize); err != nil {
-			fmt.Printf("tsunami: set write buffer warning: %v\n", err)
-		}
-	}
-	if c.RecvBufferSize > 0 {
-		if err := conn.SetReadBuffer(c.RecvBufferSize); err != nil {
-			fmt.Printf("tsunami: set read buffer warning: %v\n", err)
-		}
+	if err := applyTCPBuffers(conn, c); err != nil {
+		fmt.Printf("tsunami: TCP buffer tuning warning: %v\n", err)
 	}
 
 	// Platform-specific: BBR congestion control (Linux only)

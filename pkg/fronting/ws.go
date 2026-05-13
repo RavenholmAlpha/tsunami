@@ -257,22 +257,20 @@ func (c *WebSocketConn) writeFrame(opcode byte, payload []byte) error {
 		if _, err := rand.Read(mask[:]); err != nil {
 			return err
 		}
-		masked := make([]byte, len(payload))
-		for i := range payload {
-			masked[i] = payload[i] ^ mask[i%4]
-		}
 		header = append(header, mask[:]...)
-		if _, err := c.conn.Write(header); err != nil {
-			return err
+		frame := make([]byte, len(header)+len(payload))
+		copy(frame, header)
+		for i := range payload {
+			frame[len(header)+i] = payload[i] ^ mask[i%4]
 		}
-		_, err := c.conn.Write(masked)
+		_, err := c.conn.Write(frame)
 		return err
 	}
 
-	if _, err := c.conn.Write(header); err != nil {
-		return err
-	}
-	_, err := c.conn.Write(payload)
+	frame := make([]byte, len(header)+len(payload))
+	copy(frame, header)
+	copy(frame[len(header):], payload)
+	_, err := c.conn.Write(frame)
 	return err
 }
 

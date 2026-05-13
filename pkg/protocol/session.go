@@ -41,9 +41,9 @@ type Session struct {
 	onPaddingSchemeUpdate func(data []byte) error // Called when client receives a padding scheme update
 
 	// Optional padding-aware write function.
-	// When set, writeFrame routes through this instead of the raw FrameWriter.
-	// Signature: func(frame) error. Caller is responsible for serialization.
-	paddingWriteFn func(f *Frame) error
+	// When set, frame writes route through this instead of the raw FrameWriter.
+	// The callback is called under writeMu and must not call writeFrame.
+	paddingWriteFn func(frames []*Frame) error
 
 	// Error channel
 	errCh chan error
@@ -145,7 +145,7 @@ func (s *Session) writeFrame(f *Frame) error {
 	s.lastActive.Store(time.Now().UnixNano())
 	var err error
 	if s.paddingWriteFn != nil {
-		err = s.paddingWriteFn(f)
+		err = s.paddingWriteFn([]*Frame{f})
 	} else {
 		err = s.writer.WriteFrame(f)
 	}
@@ -169,15 +169,10 @@ func (s *Session) writeFrames(frames []*Frame) error {
 	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
 	var err error
-	for _, f := range frames {
-		if s.paddingWriteFn != nil {
-			err = s.paddingWriteFn(f)
-		} else {
-			err = s.writer.WriteFrame(f)
-		}
-		if err != nil {
-			break
-		}
+	if s.paddingWriteFn != nil {
+		err = s.paddingWriteFn(frames)
+	} else {
+		err = s.writer.WriteFrames(frames)
 	}
 	s.writeMu.Unlock()
 	return err
@@ -224,7 +219,7 @@ func (s *Session) SetOnPaddingSchemeUpdate(fn func(data []byte) error) {
 // SetPaddingWriteFn sets a custom write function that applies padding.
 // When set, all frame writes go through this function instead of the raw FrameWriter.
 // The function is called under the writeMu lock — it must not call writeFrame.
-func (s *Session) SetPaddingWriteFn(fn func(f *Frame) error) {
+func (s *Session) SetPaddingWriteFn(fn func(frames []*Frame) error) {
 	s.writeMu.Lock()
 	s.paddingWriteFn = fn
 	s.writeMu.Unlock()

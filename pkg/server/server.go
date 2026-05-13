@@ -206,7 +206,12 @@ func (s *Server) startFronting() error {
 	httpSrv.Protocols = new(http.Protocols)
 	httpSrv.Protocols.SetHTTP1(true)
 	httpSrv.Protocols.SetUnencryptedHTTP2(true)
-	if err := http2.ConfigureServer(httpSrv, new(http2.Server)); err != nil {
+	h2Server := &http2.Server{
+		MaxReadFrameSize:             fronting.H2MaxFrameSize,
+		MaxUploadBufferPerConnection: fronting.H2FlowControlWindow,
+		MaxUploadBufferPerStream:     fronting.H2FlowControlWindow,
+	}
+	if err := http2.ConfigureServer(httpSrv, h2Server); err != nil {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
 	}
@@ -293,8 +298,8 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Wire padding system into session write path
 	pw := padding.NewWriter(conn, s.scheme)
-	session.SetPaddingWriteFn(func(f *protocol.Frame) error {
-		return pw.WriteFramesWithPadding([]*protocol.Frame{f})
+	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+		return pw.WriteFramesWithPadding(frames)
 	})
 
 	// Send server settings as auth-success confirmation.
