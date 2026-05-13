@@ -149,13 +149,16 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --password "your-strong-password" \
   --fallback 127.0.0.1:8080
 
-# 使用 TLS 证书
+# 自签名模式仅用于本地测试。公网部署应使用真实域名证书和 fronting。
+
+# 公网部署：真实域名证书 + fronting
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fallback 127.0.0.1:8080
+  --fronting \
+  --front-decoy-proxy http://127.0.0.1:8080
 
 # 使用 JSON 配置
 ./tsunami-server --config /etc/tsunami/config.json
@@ -167,6 +170,8 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--cert` | — | TLS 证书文件（PEM） |
 | `--key` | — | TLS 私钥文件（PEM） |
 | `--password` | *（必填）* | 认证密码 |
+| `--fronting` | `false` | 将公网监听器作为 HTTPS/HTTP2/WebSocket 前置层 |
+| `--front-decoy-proxy` | — | 未认证 fronting 请求的可选 HTTP(S) 伪装源站 |
 | `--fallback` | — | 回退 HTTP 后端 |
 | `--config` | — | JSON 配置文件 |
 

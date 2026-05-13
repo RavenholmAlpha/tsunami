@@ -149,13 +149,16 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --password "your-strong-password" \
   --fallback 127.0.0.1:8080
 
-# TLS 証明書を使用
+# 自己署名モードはローカルテスト専用です。公開環境では実ドメイン証明書と fronting を使ってください。
+
+# 公開環境: 実ドメイン証明書 + fronting
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fallback 127.0.0.1:8080
+  --fronting \
+  --front-decoy-proxy http://127.0.0.1:8080
 
 # JSON 設定を使用
 ./tsunami-server --config /etc/tsunami/config.json
@@ -167,6 +170,8 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--cert` | — | TLS 証明書ファイル（PEM） |
 | `--key` | — | TLS 秘密鍵ファイル（PEM） |
 | `--password` | *（必須）* | 認証パスワード |
+| `--fronting` | `false` | 公開リスナーを HTTPS/HTTP2/WebSocket fronting として動作させる |
+| `--front-decoy-proxy` | — | 未認証 fronting リクエスト用の任意 HTTP(S) デコイ origin |
 | `--fallback` | — | フォールバック HTTP バックエンド |
 | `--config` | — | JSON 設定ファイル |
 
