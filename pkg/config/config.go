@@ -90,6 +90,7 @@ type ServerConfig struct {
 			DecoyProxy   string `json:"decoy_proxy" yaml:"decoy-proxy"`
 		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
+		AllowAll      bool   `json:"allow_all" yaml:"allow-all"`
 	} `json:"server" yaml:"server"`
 }
 
@@ -142,6 +143,7 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 			DecoyProxy:   c.Server.Fronting.DecoyProxy,
 		},
 		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
+		AllowAll:      c.Server.AllowAll,
 	}
 
 	// Apply defaults

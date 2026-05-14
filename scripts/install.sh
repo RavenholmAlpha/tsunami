@@ -102,6 +102,19 @@ sha256_hex() {
   die "sha256sum or openssl is required"
 }
 
+sha256_file() {
+  local file="$1"
+  if has_cmd sha256sum; then
+    sha256sum "$file" | awk '{print $1}'
+    return
+  fi
+  if has_cmd openssl; then
+    openssl dgst -sha256 -r "$file" | awk '{print $1}'
+    return
+  fi
+  die "sha256sum or openssl is required for checksum verification"
+}
+
 json_escape() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -180,6 +193,31 @@ install_from_release() {
 
   log "downloading $url"
   curl -fL "$url" -o "$tmp/tsunami.tar.gz"
+
+  # Verify checksum
+  local checksums_url="${url%/*}/checksums.sha256"
+  log "verifying integrity (checksums.sha256)"
+  if curl -fsSL "$checksums_url" -o "$tmp/checksums.sha256"; then
+    local tarball_name
+    tarball_name="$(basename "$url")"
+    local expected
+    expected="$(sed -n "s/^\([a-f0-9]\{64\}\)  .*${tarball_name}$/\1/p" "$tmp/checksums.sha256" | head -n 1)"
+    if [ -z "$expected" ]; then
+      rm -rf "$tmp"
+      die "checksum entry not found for $tarball_name in checksums.sha256"
+    fi
+    local actual
+    actual="$(sha256_file "$tmp/tsunami.tar.gz")"
+    if [ "$actual" != "$expected" ]; then
+      rm -rf "$tmp"
+      die "checksum mismatch: expected $expected, got $actual"
+    fi
+    log "checksum verified"
+  else
+    rm -rf "$tmp"
+    die "failed to download checksums.sha256 — cannot verify binary integrity"
+  fi
+
   tar -xzf "$tmp/tsunami.tar.gz" -C "$tmp"
 
   local server_bin

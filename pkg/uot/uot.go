@@ -82,6 +82,8 @@ func (r *Relay) Run() error {
 
 // streamToUDP reads UoT packets from the stream and sends them as UDP.
 func (r *Relay) streamToUDP() {
+	defer r.cleanupNAT()
+
 	for {
 		// Read ATYP
 		var atypBuf [1]byte
@@ -133,12 +135,16 @@ func (r *Relay) udpToStream() {
 			return
 		}
 
-		// Check NAT table
+		// Check NAT table (with expiry)
 		r.mu.Lock()
-		_, exists := r.natTable[remoteAddr.String()]
+		lastSeen, exists := r.natTable[remoteAddr.String()]
+		if exists && time.Since(lastSeen) > r.natTimeout {
+			delete(r.natTable, remoteAddr.String())
+			exists = false
+		}
 		r.mu.Unlock()
 		if !exists {
-			continue // drop unsolicited packets
+			continue // drop unsolicited or expired packets
 		}
 
 		// Encode UoT response packet
@@ -219,4 +225,16 @@ func encodeUoTPacket(addr *net.UDPAddr, data []byte) ([]byte, error) {
 	copy(packet[len(addrBytes)+2:], data)
 
 	return packet, nil
+}
+
+// cleanupNAT removes all expired entries from the NAT table.
+func (r *Relay) cleanupNAT() {
+	r.mu.Lock()
+	now := time.Now()
+	for k, v := range r.natTable {
+		if now.Sub(v) > r.natTimeout {
+			delete(r.natTable, k)
+		}
+	}
+	r.mu.Unlock()
 }

@@ -37,6 +37,7 @@ func main() {
 		frontSecret = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
 		frontSite   = flag.String("front-site-name", "Welcome", "Fronting decoy site name")
 		frontDecoy  = flag.String("front-decoy-proxy", "", "Optional HTTP(S) origin for unauthenticated fronting requests")
+		allowAll    = flag.Bool("allow-all", false, "Allow proxying to private/reserved IP addresses")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -87,6 +88,7 @@ func main() {
 		}
 	}
 	config.TCP.ForceBBR = *forceBBR
+	config.AllowAll = *allowAll
 
 	srv, err := server.New(config)
 	if err != nil {

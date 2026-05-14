@@ -46,6 +46,7 @@ func startFrontingTsunamiServerWithFronting(t *testing.T, frontCfg fronting.Conf
 		},
 		SurgeMode: string(surge.ModeNone),
 		Fronting:  frontCfg,
+		AllowAll:  true,
 	})
 	if err != nil {
 		t.Fatalf("fronting server new: %v", err)

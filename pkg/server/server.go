@@ -62,6 +62,9 @@ type Config struct {
 
 	// Traffic applies per-user accounting and rate limiting.
 	Traffic control.TrafficPolicy
+
+	// AllowAll disables the private-IP blocklist, allowing proxying to any address.
+	AllowAll bool
 }
 
 // Server is the TSUNAMI proxy server.
@@ -382,6 +385,12 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 		if err := relay.Run(); err != nil {
 			log.Printf("tsunami server: UoT relay error: %v", err)
 		}
+		return
+	}
+
+	// Check private IP blocklist
+	if !s.config.AllowAll && isPrivateTarget(target) {
+		log.Printf("tsunami server: blocked connection to private address %s for user '%s'", target, user.Name)
 		return
 	}
 
