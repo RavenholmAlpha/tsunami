@@ -75,18 +75,43 @@ func (h *Handler) Handle(clientConn net.Conn, preReadData []byte) error {
 	return nil
 }
 
-// DefaultPage returns a minimal static HTML page for fallback
-// when no backend is configured.
-var DefaultPage = []byte(`HTTP/1.1 200 OK
-Content-Type: text/html; charset=utf-8
-Content-Length: 75
-Connection: close
+// DefaultPage mimics a Caddy server's default welcome page response.
+var DefaultPage = buildDefaultPage()
 
-<html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>`)
+func buildDefaultPage() []byte {
+	body := `<!DOCTYPE html>
+<html>
+<head>
+	<title>Caddy - Welcome</title>
+	<style>
+	body {
+		font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+		text-align: center;
+		padding: 50px;
+		background: #fff;
+		color: #434343;
+	}
+	h1 { font-size: 2em; font-weight: 300; }
+	p { color: #666; }
+	a { color: #0076d1; }
+	</style>
+</head>
+<body>
+	<h1>Caddy is working!</h1>
+	<p>Congratulations, your Caddy web server is running.</p>
+	<p><a href="https://caddyserver.com/docs/">View the Caddy documentation</a></p>
+</body>
+</html>
+`
+	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	header := fmt.Sprintf("HTTP/1.1 200 OK\r\nServer: Caddy\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nDate: %s\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n", len(body), date)
+	return append([]byte(header), []byte(body)...)
+}
 
-// HandleDefault sends a static default page and drains the connection.
+// HandleDefault sends a Caddy-like default page and drains the connection.
 func HandleDefault(conn net.Conn) {
-	conn.Write(DefaultPage)
+	// Build a fresh response with current timestamp
+	conn.Write(buildDefaultPage())
 	// Drain remaining data to avoid RST
 	io.Copy(io.Discard, conn)
 	conn.Close()

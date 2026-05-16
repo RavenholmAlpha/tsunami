@@ -65,3 +65,25 @@ func TestVerifyRequestRejectsExpiredTimestamp(t *testing.T) {
 		t.Fatal("expired request verified")
 	}
 }
+
+func TestVerifyRequestRejectsReplay(t *testing.T) {
+	key := KeyFromSecret("secret")
+	now := time.Unix(1000, 0)
+	cache := NewNonceCache(5 * time.Minute)
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/assets/update", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "example.com"
+	if err := SignRequest(req, key, now); err != nil {
+		t.Fatalf("sign request: %v", err)
+	}
+
+	if !VerifyRequest(req, [][32]byte{key}, now, ClockSkew, cache) {
+		t.Fatal("first request should verify")
+	}
+	if VerifyRequest(req, [][32]byte{key}, now, ClockSkew, cache) {
+		t.Fatal("replayed request should be rejected")
+	}
+}

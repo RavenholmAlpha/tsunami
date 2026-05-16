@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,50 @@ const (
 	headerAuth    = "Authorization"
 	authVersion   = "v1"
 )
+
+// NonceCache tracks recently seen nonces to prevent replay attacks.
+type NonceCache struct {
+	mu      sync.Mutex
+	entries map[string]time.Time
+	ttl     time.Duration
+}
+
+// NewNonceCache creates a nonce cache with the given TTL and starts a
+// background goroutine to evict expired entries.
+func NewNonceCache(ttl time.Duration) *NonceCache {
+	nc := &NonceCache{
+		entries: make(map[string]time.Time),
+		ttl:     ttl,
+	}
+	go nc.evictLoop()
+	return nc
+}
+
+// Add records a nonce. Returns false if the nonce was already seen (replay).
+func (nc *NonceCache) Add(nonce string) bool {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	if _, exists := nc.entries[nonce]; exists {
+		return false
+	}
+	nc.entries[nonce] = time.Now()
+	return true
+}
+
+func (nc *NonceCache) evictLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		nc.mu.Lock()
+		cutoff := time.Now().Add(-nc.ttl)
+		for k, t := range nc.entries {
+			if t.Before(cutoff) {
+				delete(nc.entries, k)
+			}
+		}
+		nc.mu.Unlock()
+	}
+}
 
 // StripAuthHeaders removes fronting-only request metadata before a decoy proxy
 // forwards unauthenticated traffic to a normal origin.
@@ -47,7 +92,8 @@ func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
 }
 
 // VerifyRequest checks HTTP-layer auth against any accepted key.
-func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.Duration) bool {
+// The nonceCache parameter prevents replay attacks; pass nil to skip replay protection.
+func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.Duration, nonceCache ...*NonceCache) bool {
 	if len(keys) == 0 {
 		return false
 	}
@@ -77,6 +123,13 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	}
 	if _, err := hex.DecodeString(got); err != nil {
 		return false
+	}
+
+	// Replay protection: reject previously seen nonces
+	if len(nonceCache) > 0 && nonceCache[0] != nil {
+		if !nonceCache[0].Add(nonce) {
+			return false
+		}
 	}
 
 	requestPath := req.URL.EscapedPath()

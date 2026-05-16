@@ -11,6 +11,9 @@
 # Binaries
 *.exe
 *.exe~
+tsunami-server-linux
+tsunami-client-linux
+tsunami-*-linux-*
 
 # IDE
 .idea/

@@ -69,15 +69,16 @@ type Config struct {
 
 // Server is the TSUNAMI proxy server.
 type Server struct {
-	config    Config
-	auth      UserAuthenticator
-	fallback  *fallback.Handler
-	scheme    *padding.Scheme
-	listener  net.Listener
-	httpSrv   *http.Server
-	decoy     *httputil.ReverseProxy
-	traffic   control.TrafficPolicy
-	frontKeys [][32]byte
+	config     Config
+	auth       UserAuthenticator
+	fallback   *fallback.Handler
+	scheme     *padding.Scheme
+	listener   net.Listener
+	httpSrv    *http.Server
+	decoy      *httputil.ReverseProxy
+	traffic    control.TrafficPolicy
+	frontKeys  [][32]byte
+	nonceCache *fronting.NonceCache
 
 	mu     sync.Mutex
 	closed bool
@@ -138,13 +139,14 @@ func New(config Config) (*Server, error) {
 	}
 
 	return &Server{
-		config:    config,
-		auth:      auth,
-		fallback:  fb,
-		scheme:    scheme,
-		decoy:     decoyProxy,
-		traffic:   config.Traffic,
-		frontKeys: frontKeys,
+		config:     config,
+		auth:       auth,
+		fallback:   fb,
+		scheme:     scheme,
+		decoy:      decoyProxy,
+		traffic:    config.Traffic,
+		frontKeys:  frontKeys,
+		nonceCache: fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
 	}, nil
 }
 
@@ -210,8 +212,8 @@ func (s *Server) startFronting() error {
 	httpSrv := &http.Server{
 		Handler:           http.HandlerFunc(s.handleFrontingHTTP),
 		TLSConfig:         tlsCfg,
-		ReadHeaderTimeout: time.Minute,
-		IdleTimeout:       5 * time.Minute,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
 	httpSrv.Protocols = new(http.Protocols)
@@ -464,7 +466,7 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Server", cfg.ServerHeader)
 
-	if r.URL.Path == cfg.Path && fronting.VerifyRequest(r, s.frontKeys, time.Now(), fronting.ClockSkew) {
+	if r.URL.Path == cfg.Path && fronting.VerifyRequest(r, s.frontKeys, time.Now(), fronting.ClockSkew, s.nonceCache) {
 		switch {
 		case r.Method == http.MethodPost:
 			s.handleFrontingHTTP2(w, r)
@@ -474,6 +476,11 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Add jitter before serving decoy to align timing with the authenticated
+	// path, preventing an observer from distinguishing auth success vs failure
+	// based on time-to-first-byte.
+	time.Sleep(fronting.AuthJitter())
 
 	s.serveFrontingDecoy(w, r)
 }

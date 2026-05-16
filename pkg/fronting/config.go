@@ -2,8 +2,10 @@
 package fronting
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/url"
@@ -26,15 +28,15 @@ const (
 	// DefaultUserAgent mimics a recent Chrome browser to blend with normal traffic.
 	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-	// H2FlowControlWindow keeps long-RTT tunnels from being capped by the
-	// HTTP/2 default 64 KiB stream window.
-	H2FlowControlWindow int32 = 16 << 20
-	// H2ClientFlowControlWindow is capped below net/http's public 4 MiB
-	// HTTP2Config limit while still being far above the 64 KiB default.
-	H2ClientFlowControlWindow = 3 << 20
-	// H2MaxFrameSize allows larger HTTP/2 DATA frames while staying well
-	// below the protocol maximum.
-	H2MaxFrameSize uint32 = 1 << 20
+	// H2FlowControlWindow is set to 4 MiB per stream — within the range real
+	// Go HTTP/2 servers use, while still supporting high throughput on
+	// high-latency links.
+	H2FlowControlWindow int32 = 4 << 20
+	// H2ClientFlowControlWindow matches Go's net/http2 connection-level default.
+	H2ClientFlowControlWindow = 4 << 20
+	// H2MaxFrameSize uses 32 KiB — slightly above Go's 16 KiB default but
+	// within the range CDN-fronted servers commonly use.
+	H2MaxFrameSize uint32 = 32 << 10
 	// HTTPFlushThreshold amortizes h2 flushes without delaying control frames.
 	HTTPFlushThreshold = 1 << 20
 )
@@ -117,7 +119,6 @@ func CaddyLikeTLSConfig(certs []tls.Certificate) *tls.Config {
 		MaxVersion:   tls.VersionTLS13,
 		CipherSuites: caddyLikeCipherSuites(),
 		CurvePreferences: []tls.CurveID{
-			tls.X25519MLKEM768,
 			tls.X25519,
 			tls.CurveP256,
 		},
@@ -126,7 +127,6 @@ func CaddyLikeTLSConfig(certs []tls.Certificate) *tls.Config {
 
 func caddyLikeCipherSuites() []uint16 {
 	return []uint16{
-		tls.TLS_FALLBACK_SCSV,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -147,4 +147,14 @@ func ValidateTransport(transport string) error {
 	default:
 		return fmt.Errorf("fronting: unsupported transport %q", transport)
 	}
+}
+
+// AuthJitter returns a random duration between 1-5ms to add to the decoy
+// response path, making it indistinguishable from the authenticated path's
+// time-to-first-byte.
+func AuthJitter() time.Duration {
+	var b [2]byte
+	rand.Read(b[:])
+	ms := 1 + int(binary.LittleEndian.Uint16(b[:]))%5
+	return time.Duration(ms) * time.Millisecond
 }
