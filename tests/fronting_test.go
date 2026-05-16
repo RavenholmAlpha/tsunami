@@ -187,7 +187,7 @@ func TestFrontingDecoyLooksLikeHTTPServer(t *testing.T) {
 func TestFrontingDecoyProxy(t *testing.T) {
 	var sawSignatureHeader atomic.Bool
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Request-Signature") != "" {
+		if r.Header.Get("Authorization") != "" {
 			sawSignatureHeader.Store(true)
 		}
 		w.Header().Set("Content-Type", "text/plain")
@@ -221,7 +221,7 @@ func TestFrontingDecoyProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new decoy request: %v", err)
 	}
-	req.Header.Set("X-Request-Signature", "probe-value")
+	req.Header.Set("Authorization", "HMAC-SHA256 Signature=probe-value")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("decoy proxy GET: %v", err)

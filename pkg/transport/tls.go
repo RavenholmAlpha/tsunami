@@ -2,7 +2,6 @@
 package transport
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -137,15 +136,14 @@ func (c *TCPConfig) ApplyTCPOptions(conn *net.TCPConn) error {
 	return nil
 }
 
-// Dial creates a new TCP connection with TSUNAMI tuning applied, then wraps with TLS.
-func Dial(addr string, tlsCfg *TLSConfig, tcpCfg *TCPConfig) (*tls.Conn, error) {
-	// TCP dial
+// Dial creates a new TCP connection with tuning applied, then wraps with TLS
+// using the configured uTLS fingerprint (default: Chrome).
+func Dial(addr string, tlsCfg *TLSConfig, tcpCfg *TCPConfig) (net.Conn, error) {
 	tcpConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("tsunami: TCP dial %s: %w", addr, err)
 	}
 
-	// Apply TCP tuning
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
 		if err := tcpCfg.ApplyTCPOptions(tc); err != nil {
 			tcpConn.Close()
@@ -153,11 +151,10 @@ func Dial(addr string, tlsCfg *TLSConfig, tcpCfg *TCPConfig) (*tls.Conn, error) 
 		}
 	}
 
-	// TLS handshake
-	tlsConn := tls.Client(tcpConn, tlsCfg.BuildClientTLSConfig())
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	tlsConn, err := DialUTLS(tcpConn, tlsCfg)
+	if err != nil {
 		tcpConn.Close()
-		return nil, fmt.Errorf("tsunami: TLS handshake: %w", err)
+		return nil, err
 	}
 
 	return tlsConn, nil

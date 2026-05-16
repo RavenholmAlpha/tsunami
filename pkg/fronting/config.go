@@ -23,6 +23,9 @@ const (
 	// DefaultServerHeader matches Caddy's default HTTP Server header.
 	DefaultServerHeader = "Caddy"
 
+	// DefaultUserAgent mimics a recent Chrome browser to blend with normal traffic.
+	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 	// H2FlowControlWindow keeps long-RTT tunnels from being capped by the
 	// HTTP/2 default 64 KiB stream window.
 	H2FlowControlWindow int32 = 16 << 20

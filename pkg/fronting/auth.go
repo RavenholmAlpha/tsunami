@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	headerVersion = "X-Request-Version"
-	headerDate    = "X-Request-Date"
-	headerNonce   = "X-Request-Nonce"
-	headerAuth    = "X-Request-Signature"
+	headerVersion = "X-Api-Version"
+	headerDate    = "X-Date"
+	headerNonce   = "X-Trace-Id"
+	headerAuth    = "Authorization"
 	authVersion   = "v1"
 )
 
@@ -41,7 +41,8 @@ func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
 	req.Header.Set(headerVersion, authVersion)
 	req.Header.Set(headerDate, ts)
 	req.Header.Set(headerNonce, nonce)
-	req.Header.Set(headerAuth, computeMAC(req.Method, req.URL.EscapedPath(), req.Host, ts, nonce, key))
+	sig := computeMAC(req.Method, req.URL.EscapedPath(), req.Host, ts, nonce, key)
+	req.Header.Set(headerAuth, "HMAC-SHA256 Signature="+sig)
 	return nil
 }
 
@@ -55,8 +56,12 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	}
 	ts := req.Header.Get(headerDate)
 	nonce := req.Header.Get(headerNonce)
-	got := req.Header.Get(headerAuth)
-	if ts == "" || nonce == "" || got == "" {
+	authHeader := req.Header.Get(headerAuth)
+	if ts == "" || nonce == "" || authHeader == "" {
+		return false
+	}
+	got := strings.TrimPrefix(authHeader, "HMAC-SHA256 Signature=")
+	if got == authHeader {
 		return false
 	}
 	if len(nonce) < 16 || len(nonce) > 128 {

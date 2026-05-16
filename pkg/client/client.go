@@ -213,7 +213,7 @@ func (c *Client) dialFrontedH2(cfg fronting.Config) (net.Conn, error) {
 	applyFrontingHost(req, cfg, c.config)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Cache-Control", "no-store")
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", fronting.DefaultUserAgent)
 	if err := fronting.SignRequest(req, c.frontingKey(cfg), time.Now()); err != nil {
 		pw.Close()
 		return nil, err
@@ -276,11 +276,10 @@ func (c *Client) dialFrontedWebSocket(cfg fronting.Config) (net.Conn, error) {
 
 	tlsCfg := c.config.TLS
 	tlsCfg.ALPN = []string{"http/1.1"}
-	// uTLS browser presets may advertise h2 even when this transport needs
-	// an HTTP/1.1 Upgrade handshake. Force the standard TLS stack here so the
-	// server selects http/1.1 instead of routing the connection to HTTP/2.
-	tlsCfg.Fingerprint = transport.FingerprintNone
-	tlsConn, err := transport.DialUTLS(tcpConn, &tlsCfg)
+	// Use a browser-like ClientHello but override ALPN to http/1.1 only,
+	// so the server selects HTTP/1.1 for the WebSocket upgrade while the
+	// TLS fingerprint still looks like a real browser.
+	tlsConn, err := transport.DialUTLSWithALPN(tcpConn, &tlsCfg, []string{"http/1.1"})
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("TLS handshake: %w", err)
