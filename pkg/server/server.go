@@ -21,6 +21,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/padding"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
+	"github.com/tsunami-protocol/tsunami/pkg/shaping"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 	"github.com/tsunami-protocol/tsunami/pkg/uot"
 	"golang.org/x/net/http2"
@@ -56,6 +57,9 @@ type Config struct {
 
 	// Fronting enables the built-in Caddy-like HTTPS/HTTP2/WebSocket front.
 	Fronting fronting.Config
+
+	// Shaping enables constant-rate traffic shaping when the client requests it.
+	Shaping *shaping.Config
 
 	// Padding scheme text
 	PaddingScheme string
@@ -315,6 +319,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		return pw.WriteFramesWithPadding(frames)
 	})
 
+	// Determine if shaping should be activated (both sides must agree)
+	shapingEnabled := s.config.Shaping != nil && clientSettings != nil && clientSettings.Shaping
+
 	// Send server settings as auth-success confirmation.
 	// The client blocks waiting for this frame after sending auth+settings.
 	serverSettings := &protocol.ServerSettings{
@@ -322,10 +329,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		SurgeMode:      protocol.SurgeMode(s.config.SurgeMode),
 		MaxConnections: s.config.MaxConnections,
 		Threshold:      s.config.SurgeThreshold,
+		Shaping:        shapingEnabled,
 	}
 	if err := session.SendServerSettings(serverSettings); err != nil {
 		log.Printf("tsunami server: send server settings: %v", err)
 		return
+	}
+
+	// Activate traffic shaping after settings exchange
+	if shapingEnabled {
+		shaped := shaping.Wrap(conn, *s.config.Shaping)
+		session.ReplaceConn(shaped)
+		pw = padding.NewWriter(shaped, s.scheme)
+		session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+			return pw.WriteFramesWithPadding(frames)
+		})
+		log.Printf("tsunami server: traffic shaping enabled for user '%s'", user.Name)
 	}
 
 	// Push padding scheme if client's version differs

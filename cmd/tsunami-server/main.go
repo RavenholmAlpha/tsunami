@@ -13,6 +13,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/server"
+	"github.com/tsunami-protocol/tsunami/pkg/shaping"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 )
 
@@ -38,6 +39,7 @@ func main() {
 		frontSite   = flag.String("front-site-name", "Welcome", "Fronting decoy site name")
 		frontDecoy  = flag.String("front-decoy-proxy", "", "Optional HTTP(S) origin for unauthenticated fronting requests")
 		allowAll    = flag.Bool("allow-all", false, "Allow proxying to private/reserved IP addresses")
+		trafficShaping = flag.Bool("traffic-shaping", false, "Enable constant-rate traffic shaping")
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -89,6 +91,10 @@ func main() {
 	}
 	config.TCP.ForceBBR = *forceBBR
 	config.AllowAll = *allowAll
+	if *trafficShaping {
+		shapingCfg := shaping.DefaultConfig()
+		config.Shaping = &shapingCfg
+	}
 
 	srv, err := server.New(config)
 	if err != nil {

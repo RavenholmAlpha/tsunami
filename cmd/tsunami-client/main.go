@@ -14,6 +14,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/proxy"
+	"github.com/tsunami-protocol/tsunami/pkg/shaping"
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 )
@@ -42,6 +43,7 @@ func main() {
 		frontHost      = flag.String("front-host", "", "Fronting Host header (defaults to SNI)")
 		frontSecret    = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
 		frontTransport = flag.String("front-transport", fronting.TransportH2, "Fronting transport: h2 or websocket")
+		trafficShaping = flag.Bool("traffic-shaping", false, "Enable constant-rate traffic shaping")
 		showVersion    = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -89,6 +91,10 @@ func main() {
 		UDP: true,
 	}
 	cfg.TCP.ForceBBR = *forceBBR
+	if *trafficShaping {
+		shapingCfg := shaping.DefaultConfig()
+		cfg.Shaping = &shapingCfg
+	}
 
 	c, err := client.New(cfg)
 	if err != nil {

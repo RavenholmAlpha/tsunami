@@ -17,6 +17,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/padding"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
+	"github.com/tsunami-protocol/tsunami/pkg/shaping"
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 	"golang.org/x/net/http2"
@@ -42,6 +43,9 @@ type Config struct {
 
 	// Fronting enables HTTPS/HTTP2/WebSocket application fronting.
 	Fronting fronting.Config
+
+	// Shaping enables constant-rate traffic shaping for anti-traffic-analysis.
+	Shaping *shaping.Config
 
 	// Enable UDP-over-TCP
 	UDP bool
@@ -331,6 +335,7 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		Version:    protocol.CurrentVersion,
 		Client:     "http-client/1.0",
 		PaddingMD5: scheme.MD5(),
+		Shaping:    c.config.Shaping != nil,
 	}
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()
@@ -358,10 +363,24 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	}
 
 	// Process server settings
+	var shapingConfirmed bool
 	if frame.Data != nil {
 		if ss, err := protocol.DecodeServerSettings(frame.Data); err == nil {
 			log.Printf("tsunami: server version=%d surge-mode=%s", ss.Version, ss.SurgeMode)
+			shapingConfirmed = ss.Shaping
 		}
+	}
+
+	// Activate traffic shaping if both sides agreed
+	if c.config.Shaping != nil && shapingConfirmed {
+		shaped := shaping.Wrap(tlsConn, *c.config.Shaping)
+		session.ReplaceConn(shaped)
+		pw = padding.NewWriter(shaped, scheme)
+		session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+			return pw.WriteFramesWithPadding(frames)
+		})
+		log.Printf("tsunami: traffic shaping enabled (frame=%d interval=%v burst=%d)",
+			c.config.Shaping.FrameSize, c.config.Shaping.Interval, c.config.Shaping.BurstSlots)
 	}
 
 	// Start session event loop in background

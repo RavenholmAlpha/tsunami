@@ -12,6 +12,7 @@ type ClientSettings struct {
 	Client         string
 	PaddingMD5     string
 	SurgeBandwidth int // Mbps, 0 = disabled
+	Shaping        bool
 }
 
 // EncodeClientSettings serializes client settings to the wire format.
@@ -23,7 +24,10 @@ func EncodeClientSettings(s *ClientSettings) []byte {
 		fmt.Fprintf(&b, "padding-md5=%s\n", s.PaddingMD5)
 	}
 	if s.SurgeBandwidth > 0 {
-		fmt.Fprintf(&b, "surge-bandwidth=%d", s.SurgeBandwidth)
+		fmt.Fprintf(&b, "surge-bandwidth=%d\n", s.SurgeBandwidth)
+	}
+	if s.Shaping {
+		fmt.Fprintf(&b, "shaping=1\n")
 	}
 	return []byte(b.String())
 }
@@ -55,6 +59,8 @@ func DecodeClientSettings(data []byte) (*ClientSettings, error) {
 				return nil, fmt.Errorf("tsunami: invalid surge-bandwidth: %w", err)
 			}
 			s.SurgeBandwidth = bw
+		case "shaping":
+			s.Shaping = val == "1"
 		}
 	}
 	return s, nil
@@ -74,6 +80,7 @@ type ServerSettings struct {
 	SurgeMode      SurgeMode
 	MaxConnections int
 	Threshold      int // concurrent stream threshold for Layer 2 upgrade
+	Shaping        bool
 }
 
 // EncodeServerSettings serializes server settings to the wire format.
@@ -87,7 +94,10 @@ func EncodeServerSettings(s *ServerSettings) []byte {
 		fmt.Fprintf(&b, "max-connections=%d\n", s.MaxConnections)
 	}
 	if s.Threshold > 0 {
-		fmt.Fprintf(&b, "threshold=%d", s.Threshold)
+		fmt.Fprintf(&b, "threshold=%d\n", s.Threshold)
+	}
+	if s.Shaping {
+		fmt.Fprintf(&b, "shaping=1\n")
 	}
 	return []byte(b.String())
 }
@@ -123,6 +133,8 @@ func DecodeServerSettings(data []byte) (*ServerSettings, error) {
 				return nil, fmt.Errorf("tsunami: invalid threshold: %w", err)
 			}
 			s.Threshold = th
+		case "shaping":
+			s.Shaping = val == "1"
 		}
 	}
 	return s, nil

@@ -64,6 +64,14 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 	return s
 }
 
+// ReplaceConn swaps the underlying connection for a wrapped one (e.g., traffic shaping).
+// Must be called before RunEventLoop.
+func (s *Session) ReplaceConn(conn io.ReadWriteCloser) {
+	s.conn = conn
+	s.writer = NewFrameWriter(conn)
+	s.reader = NewFrameReader(conn)
+}
+
 // Seq returns the session sequence number (monotonically increasing within a client).
 func (s *Session) Seq() uint64 {
 	return s.seq
