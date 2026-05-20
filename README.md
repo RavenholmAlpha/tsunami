@@ -376,4 +376,4 @@ go test ./...
 
 ## Acknowledgments
 
-Protocol design inspired by [anytls-go](https://github.com/anytls/anytls-go).
+Protocol design inspired by [anytls-go](https://github.com/anytls/anytls-go). TSUNAMI's transport layer protocol (frame format, session multiplexing, padding scheme, and UDP-over-TCP signaling) is based on the [AnyTLS](https://github.com/anytls/anytls-go) protocol specification. TSUNAMI extends it with HTTPS/HTTP2/WebSocket fronting, Surge adaptive connection scaling, constant-rate traffic shaping, and a control plane for user management.

@@ -117,7 +117,7 @@ const FrameHeaderLen = 7
 const AuthHashLen = 32
 
 // UoTMagicAddress is the magic domain for UDP-over-TCP signaling.
-const UoTMagicAddress = "sp.v2.udp-over-tcp.arpa"
+const UoTMagicAddress = "love.uot.world.anytls"
 
 // SOCKS5 address types.
 const (
