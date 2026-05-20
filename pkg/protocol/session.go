@@ -149,8 +149,8 @@ func (s *Session) writeFrame(f *Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
-	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
+	s.writeMu.Lock()
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn([]*Frame{f})

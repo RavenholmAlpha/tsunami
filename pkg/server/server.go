@@ -423,6 +423,10 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	}
 	defer targetConn.Close()
 
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
 	// Bidirectional relay
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -430,9 +434,10 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	// Stream → Target
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
 		uploadReader := s.traffic.WrapReader(stream, user, control.DirectionUpload)
-		io.CopyBuffer(targetConn, uploadReader, buf)
+		io.CopyBuffer(targetConn, uploadReader, *bufp)
+		protocol.RelayBufPool.Put(bufp)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -441,9 +446,10 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	// Target → Stream
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
 		downloadReader := s.traffic.WrapReader(targetConn, user, control.DirectionDownload)
-		io.CopyBuffer(stream, downloadReader, buf)
+		io.CopyBuffer(stream, downloadReader, *bufp)
+		protocol.RelayBufPool.Put(bufp)
 	}()
 
 	wg.Wait()

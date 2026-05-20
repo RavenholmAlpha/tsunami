@@ -41,6 +41,22 @@ var frameBufPool = sync.Pool{
 	},
 }
 
+// RelayBufPool provides 256KB buffers for bidirectional relay copies.
+var RelayBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 256*1024)
+		return &buf
+	},
+}
+
+// writeCoalesceBufPool provides buffers for WriteFrames coalescing.
+var writeCoalesceBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 128*1024)
+		return buf
+	},
+}
+
 // EncodeFrame writes a frame to the writer in TSUNAMI wire format.
 // The data length MUST NOT exceed MaxFrameDataLen (65535).
 func EncodeFrame(w io.Writer, f *Frame) error {
@@ -84,7 +100,7 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 		Command:  Command(header[0]),
 		StreamID: binary.BigEndian.Uint32(header[1:5]),
 	}
-	dataLen := binary.BigEndian.Uint16(header[5:7])
+	dataLen := int(binary.BigEndian.Uint16(header[5:7]))
 
 	if dataLen > 0 {
 		f.Data = make([]byte, dataLen)
@@ -136,7 +152,12 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 		totalLen += FrameHeaderLen + len(f.Data)
 	}
 
-	buf := make([]byte, 0, totalLen)
+	buf := writeCoalesceBufPool.Get().([]byte)
+	if cap(buf) < totalLen {
+		buf = make([]byte, 0, totalLen)
+	}
+	buf = buf[:0]
+
 	for _, f := range frames {
 		var header [FrameHeaderLen]byte
 		header[0] = byte(f.Command)
@@ -149,6 +170,7 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 	}
 
 	_, err := fw.w.Write(buf)
+	writeCoalesceBufPool.Put(buf[:0])
 	return err
 }
 

@@ -7,9 +7,6 @@ import (
 	"time"
 )
 
-// shapedFrame is a fixed-size wire frame used by the shaper.
-// Format: [1 byte type] [payload...]
-// Types: 0x00 = dummy (discard), 0x01 = data
 const (
 	frameTypeData  = 0x01
 	frameTypeDummy = 0x00
@@ -24,19 +21,19 @@ type Conn struct {
 	// Write side
 	writeBuf  []byte
 	writeMu   sync.Mutex
-	writeCond *sync.Cond
 	writeDone chan struct{}
+	framePool sync.Pool
 
 	// Read side
-	readBuf []byte
-	readMu  sync.Mutex
+	readBuf   []byte
+	readFrame []byte
+	readMu    sync.Mutex
 
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
 // Wrap creates a shaped connection. The returned Conn implements net.Conn.
-// The caller should use the returned Conn for all subsequent I/O.
 func Wrap(conn net.Conn, cfg Config) *Conn {
 	if cfg.FrameSize < 2 {
 		cfg.FrameSize = 1200
@@ -52,10 +49,16 @@ func Wrap(conn net.Conn, cfg Config) *Conn {
 		inner:     conn,
 		cfg:       cfg,
 		writeBuf:  make([]byte, 0, cfg.FrameSize*cfg.BurstSlots),
+		readFrame: make([]byte, cfg.FrameSize),
 		writeDone: make(chan struct{}),
 		closed:    make(chan struct{}),
+		framePool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, cfg.FrameSize)
+				return &buf
+			},
+		},
 	}
-	c.writeCond = sync.NewCond(&c.writeMu)
 
 	go c.writeLoop()
 
@@ -72,7 +75,6 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 	c.writeMu.Lock()
 	c.writeBuf = append(c.writeBuf, b...)
-	c.writeCond.Signal()
 	c.writeMu.Unlock()
 
 	return len(b), nil
@@ -81,32 +83,32 @@ func (c *Conn) Write(b []byte) (int, error) {
 // Read returns de-shaped data (dummy frames stripped).
 func (c *Conn) Read(b []byte) (int, error) {
 	for {
-		// Try to return buffered data first
 		c.readMu.Lock()
 		if len(c.readBuf) > 0 {
 			n := copy(b, c.readBuf)
-			c.readBuf = c.readBuf[n:]
+			remaining := len(c.readBuf) - n
+			if remaining == 0 {
+				c.readBuf = c.readBuf[:0]
+			} else {
+				copy(c.readBuf, c.readBuf[n:])
+				c.readBuf = c.readBuf[:remaining]
+			}
 			c.readMu.Unlock()
 			return n, nil
 		}
 		c.readMu.Unlock()
 
-		// Read one shaped frame from the wire
-		frame := make([]byte, c.cfg.FrameSize)
-		_, err := io.ReadFull(c.inner, frame)
+		// Read one shaped frame from the wire using pre-allocated buffer
+		_, err := io.ReadFull(c.inner, c.readFrame)
 		if err != nil {
 			return 0, err
 		}
 
-		frameType := frame[0]
-		payload := frame[1:]
-
-		if frameType == frameTypeDummy {
-			continue // discard dummy frames
+		if c.readFrame[0] == frameTypeDummy {
+			continue
 		}
 
-		// Data frame: find actual data length.
-		// Last 2 bytes encode the real payload length within this frame.
+		payload := c.readFrame[1:]
 		if len(payload) < 2 {
 			continue
 		}
@@ -114,19 +116,21 @@ func (c *Conn) Read(b []byte) (int, error) {
 		if dataLen > len(payload)-2 {
 			dataLen = len(payload) - 2
 		}
-
 		if dataLen == 0 {
 			continue
 		}
 
+		// Copy into readBuf and return
 		c.readMu.Lock()
 		c.readBuf = append(c.readBuf, payload[:dataLen]...)
-		c.readMu.Unlock()
-
-		// Return what we can
-		c.readMu.Lock()
 		n := copy(b, c.readBuf)
-		c.readBuf = c.readBuf[n:]
+		remaining := len(c.readBuf) - n
+		if remaining == 0 {
+			c.readBuf = c.readBuf[:0]
+		} else {
+			copy(c.readBuf, c.readBuf[n:])
+			c.readBuf = c.readBuf[:remaining]
+		}
 		c.readMu.Unlock()
 		return n, nil
 	}
@@ -157,7 +161,6 @@ func (c *Conn) sendSlots(payloadCap int) {
 	buffered := len(c.writeBuf)
 	c.writeMu.Unlock()
 
-	// Determine how many slots to send
 	slots := 1
 	if buffered > payloadCap {
 		slots = (buffered + payloadCap - 1) / payloadCap
@@ -166,12 +169,20 @@ func (c *Conn) sendSlots(payloadCap int) {
 		}
 	}
 
+	// Set deadline once for the entire batch
+	deadline := time.Now().Add(c.cfg.Interval * time.Duration(slots+1))
+	c.inner.SetWriteDeadline(deadline)
+
 	for i := 0; i < slots; i++ {
 		select {
 		case <-c.closed:
+			c.inner.SetWriteDeadline(time.Time{})
 			return
 		default:
 		}
+
+		framep := c.framePool.Get().(*[]byte)
+		frame := *framep
 
 		c.writeMu.Lock()
 		n := len(c.writeBuf)
@@ -179,37 +190,37 @@ func (c *Conn) sendSlots(payloadCap int) {
 			n = payloadCap
 		}
 
-		frame := make([]byte, c.cfg.FrameSize)
+		// Zero the frame
+		clear(frame)
 
 		if n > 0 {
-			// Data frame
 			frame[0] = frameTypeData
 			copy(frame[1:], c.writeBuf[:n])
-			// Encode actual data length in last 2 bytes
 			frame[c.cfg.FrameSize-2] = byte(n >> 8)
 			frame[c.cfg.FrameSize-1] = byte(n)
-			c.writeBuf = c.writeBuf[n:]
+			// Compact writeBuf to reclaim memory
+			copy(c.writeBuf, c.writeBuf[n:])
+			c.writeBuf = c.writeBuf[:len(c.writeBuf)-n]
 		} else {
-			// Dummy frame
 			frame[0] = frameTypeDummy
 		}
 		c.writeMu.Unlock()
 
-		// Use a write deadline to avoid blocking forever on slow/dead peers
-		c.inner.SetWriteDeadline(time.Now().Add(c.cfg.Interval * 2))
 		_, err := c.inner.Write(frame)
-		c.inner.SetWriteDeadline(time.Time{})
+		c.framePool.Put(framep)
 		if err != nil {
+			c.inner.SetWriteDeadline(time.Time{})
 			c.Close()
 			return
 		}
 	}
+
+	c.inner.SetWriteDeadline(time.Time{})
 }
 
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
-		c.writeCond.Signal()
 	})
 	<-c.writeDone
 	return c.inner.Close()
