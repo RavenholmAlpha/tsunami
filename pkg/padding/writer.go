@@ -149,8 +149,8 @@ func serializeFrames(frames []*protocol.Frame) []byte {
 	}
 
 	buf := make([]byte, 0, size)
+	var header [protocol.FrameHeaderLen]byte
 	for _, f := range frames {
-		header := make([]byte, protocol.FrameHeaderLen)
 		header[0] = byte(f.Command)
 		header[1] = byte(f.StreamID >> 24)
 		header[2] = byte(f.StreamID >> 16)
@@ -158,7 +158,7 @@ func serializeFrames(frames []*protocol.Frame) []byte {
 		header[4] = byte(f.StreamID)
 		header[5] = byte(len(f.Data) >> 8)
 		header[6] = byte(len(f.Data))
-		buf = append(buf, header...)
+		buf = append(buf, header[:]...)
 		buf = append(buf, f.Data...)
 	}
 

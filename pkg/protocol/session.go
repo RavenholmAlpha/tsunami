@@ -174,8 +174,8 @@ func (s *Session) writeFrame(f *Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
-	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
+	s.writeMu.Lock()
 	if nc, ok := s.conn.(net.Conn); ok {
 		nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	}
