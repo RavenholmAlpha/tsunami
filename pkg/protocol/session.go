@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,7 @@ type Session struct {
 	// Idle tracking (atomic to avoid data races between event loop and write goroutines)
 	idleSince  atomic.Int64 // stores UnixNano; 0 = not idle
 	lastActive atomic.Int64 // stores UnixNano
+	lastPong   atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
 
 	// Callbacks
 	onStreamOpen          func(s *Stream)         // Called when server receives a new stream
@@ -60,7 +62,9 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 		localVersion: CurrentVersion,
 		errCh:        make(chan error, 1),
 	}
-	s.lastActive.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.lastPong.Store(now)
 	return s
 }
 
@@ -142,6 +146,27 @@ func (s *Session) LastActive() time.Time {
 	return time.Unix(0, ns)
 }
 
+// LastPong returns the time of the last heartbeat response.
+func (s *Session) LastPong() time.Time {
+	ns := s.lastPong.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// IsAlive returns true if the session has responded to a heartbeat within the given timeout.
+func (s *Session) IsAlive(timeout time.Duration) bool {
+	if s.closed.Load() {
+		return false
+	}
+	lp := s.LastPong()
+	if lp.IsZero() {
+		return true // no heartbeat sent yet, assume alive
+	}
+	return time.Since(lp) < timeout
+}
+
 // writeFrame writes a frame to the underlying TLS connection.
 // It is safe for concurrent use by multiple goroutines.
 // If a paddingWriteFn is set, frames are routed through it for padding.
@@ -151,11 +176,17 @@ func (s *Session) writeFrame(f *Frame) error {
 	}
 	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	}
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn([]*Frame{f})
 	} else {
 		err = s.writer.WriteFrame(f)
+	}
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Time{})
 	}
 	s.writeMu.Unlock()
 	return err
@@ -176,11 +207,17 @@ func (s *Session) writeFrames(frames []*Frame) error {
 	}
 	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	}
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn(frames)
 	} else {
 		err = s.writer.WriteFrames(frames)
+	}
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Time{})
 	}
 	s.writeMu.Unlock()
 	return err
@@ -317,7 +354,8 @@ func (s *Session) handleFrame(f *Frame) error {
 		return s.writeFrame(NewFrame(CmdHeartResponse, 0, nil))
 
 	case CmdHeartResponse:
-		// Received pong — update last active
+		// Received pong — update last active and pong timestamp
+		s.lastPong.Store(time.Now().UnixNano())
 		return nil
 
 	case CmdAlert:

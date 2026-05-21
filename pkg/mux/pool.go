@@ -3,6 +3,7 @@ package mux
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,7 @@ func NewPool(config PoolConfig, dialFn func() (*protocol.Session, error)) *Pool 
 		stopCh: make(chan struct{}),
 	}
 	go p.idleChecker()
+	go p.heartbeatLoop()
 	return p
 }
 
@@ -207,6 +209,65 @@ func (p *Pool) idleChecker() {
 			p.cleanupIdle()
 		}
 	}
+}
+
+const (
+	heartbeatInterval = 15 * time.Second
+	heartbeatTimeout  = 30 * time.Second
+)
+
+// heartbeatLoop periodically sends heartbeats to all sessions and closes dead ones.
+func (p *Pool) heartbeatLoop() {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.sendHeartbeats()
+			p.cleanupDead()
+		}
+	}
+}
+
+// sendHeartbeats sends a heartbeat ping to all active sessions.
+func (p *Pool) sendHeartbeats() {
+	p.mu.Lock()
+	snapshot := make([]*protocol.Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		if !s.IsClosed() {
+			snapshot = append(snapshot, s)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, s := range snapshot {
+		if err := s.SendHeartbeat(); err != nil {
+			log.Printf("tsunami: heartbeat send failed session=%d: %v", s.Seq(), err)
+		}
+	}
+}
+
+// cleanupDead closes sessions that have not responded to heartbeats within the timeout.
+func (p *Pool) cleanupDead() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	remaining := make([]*protocol.Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		if s.IsClosed() {
+			continue
+		}
+		if !s.IsAlive(heartbeatTimeout) {
+			log.Printf("tsunami: closing dead session %d (no heartbeat response for %v)", s.Seq(), heartbeatTimeout)
+			s.Close()
+			continue
+		}
+		remaining = append(remaining, s)
+	}
+	p.sessions = remaining
 }
 
 // cleanupIdle removes sessions that have been idle too long.
