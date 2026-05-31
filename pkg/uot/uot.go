@@ -39,14 +39,16 @@ type Relay struct {
 	natTable   map[string]time.Time
 	natTimeout time.Duration
 	mu         sync.Mutex
+	allowAddr  func(string) bool // checks if destination address is allowed
 }
 
-// NewRelay creates a new UoT relay for the given stream.
-func NewRelay(stream io.ReadWriteCloser) *Relay {
+// NewRelay creates a new UoT relay for the given stream with an optional address validator.
+func NewRelay(stream io.ReadWriteCloser, allowAddr func(string) bool) *Relay {
 	return &Relay{
 		stream:     stream,
 		natTable:   make(map[string]time.Time),
 		natTimeout: 120 * time.Second,
+		allowAddr:  allowAddr,
 	}
 }
 
@@ -112,6 +114,10 @@ func (r *Relay) streamToUDP() {
 		}
 
 		// Resolve and send UDP
+		if r.allowAddr != nil && !r.allowAddr(target) {
+			continue
+		}
+
 		udpAddr, err := net.ResolveUDPAddr("udp", target)
 		if err != nil {
 			continue

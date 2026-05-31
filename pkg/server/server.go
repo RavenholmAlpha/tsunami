@@ -402,7 +402,13 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	if strings.HasPrefix(target, protocol.UoTMagicAddress) {
 		log.Printf("tsunami server: UoT relay for user '%s'", user.Name)
 		relayStream := s.traffic.WrapReadWriteCloser(stream, user)
-		relay := uot.NewRelay(relayStream)
+		var allowAddr func(string) bool
+		if !s.config.AllowAll {
+			allowAddr = func(addr string) bool {
+				return !isPrivateTarget(addr)
+			}
+		}
+		relay := uot.NewRelay(relayStream, allowAddr)
 		if err := relay.Run(); err != nil {
 			log.Printf("tsunami server: UoT relay error: %v", err)
 		}
