@@ -7,6 +7,12 @@
 本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [1.2.1] - 2026-06-22
+
+### 修复
+- `wget -qO- ... | sudo bash` 这类管道安装命令现在会在存在控制终端时打开交互式菜单。
+- 管道交互运行时，安装脚本会从 `/dev/tty` 读取提示输入；完全非交互环境仍保持非交互安装路径。
+
 ## [1.2.0] - 2026-06-22
 
 ### 新增
@@ -60,6 +66,7 @@
 - 跨平台构建（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 集成测试套件（端到端、多流、认证失败、会话重用、大数据传输）
 
+[1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0

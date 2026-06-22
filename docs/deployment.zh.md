@@ -16,6 +16,8 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
+在交互式终端中，这些管道命令会通过 `/dev/tty` 读取输入并打开管理菜单。在自动化或没有控制终端的环境中，同一命令仍会保持非交互安装路径。
+
 从本地源码安装：
 
 ```bash

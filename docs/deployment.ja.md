@@ -16,6 +16,8 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
+対話型ターミナルで実行した場合、これらのパイプコマンドは `/dev/tty` から入力を読み取り、管理メニューを開きます。自動化環境や制御端末がない環境では、同じコマンドは従来どおり非対話インストール経路を維持します。
+
 ローカルソースチェックアウトから：
 
 ```bash

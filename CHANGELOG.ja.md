@@ -7,6 +7,12 @@
 本フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に基づいており、
 本プロジェクトは [セマンティックバージョニング](https://semver.org/lang/ja/spec/v2.0.0.html) に準拠しています。
 
+## [1.2.1] - 2026-06-22
+
+### 修正
+- `wget -qO- ... | sudo bash` のようなパイプインストールコマンドが、制御端末を利用できる場合に対話型メニューを開くように修正。
+- パイプされた対話型実行ではインストーラーが `/dev/tty` から入力を読み取り、完全な非対話環境では従来どおり非対話インストール経路を維持。
+
 ## [1.2.0] - 2026-06-22
 
 ### 追加
@@ -60,6 +66,7 @@
 - クロスプラットフォームビルド（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 統合テストスイート（E2E、マルチストリーム、認証失敗、セッション再利用、大容量データ転送）
 
+[1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0

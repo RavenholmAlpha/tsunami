@@ -20,7 +20,7 @@ CLIENT_FILE="$CONFIG_DIR/client-command.txt"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Detect piped execution (wget/curl | bash) — disable interactive prompts
-if [ ! -t 0 ] && [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
+if [ ! -t 0 ] && [ ! -r /dev/tty ] && [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
   TSUNAMI_ASSUME_YES="${TSUNAMI_ASSUME_YES:-1}"
 fi
 
@@ -71,21 +71,39 @@ ask() {
   local prompt="$1"
   local default="$2"
   local answer
-  if [ -t 0 ] && [ "${TSUNAMI_ASSUME_YES:-}" != "1" ]; then
-    read -r -p "$prompt [$default]: " answer
+  if is_interactive; then
+    if ! answer="$(read_prompt "$prompt [$default]: ")"; then
+      answer="$default"
+    fi
     printf '%s' "${answer:-$default}"
   else
     printf '%s' "$default"
   fi
 }
 
+has_prompt_tty() {
+  [ "${TSUNAMI_TEST_HAS_TTY:-0}" = "1" ] || [ -r /dev/tty ]
+}
+
+read_prompt() {
+  local prompt="$1"
+  local answer
+  if [ -t 0 ] || [ "${TSUNAMI_TEST_SOURCE:-0}" = "1" ]; then
+    read -r -p "$prompt" answer || return 1
+  else
+    read -r -p "$prompt" answer </dev/tty || return 1
+  fi
+  printf '%s' "$answer"
+}
+
 is_interactive() {
-  [ -t 0 ] && [ "${TSUNAMI_ASSUME_YES:-}" != "1" ]
+  [ "${TSUNAMI_ASSUME_YES:-}" != "1" ] && { [ -t 0 ] || has_prompt_tty; }
 }
 
 default_command_for_context() {
   local stdin_is_tty="$1"
-  if [ "$stdin_is_tty" = "1" ]; then
+  local prompt_tty="${2:-$stdin_is_tty}"
+  if [ "$stdin_is_tty" = "1" ] || [ "$prompt_tty" = "1" ]; then
     printf 'menu'
   else
     printf 'install'
@@ -125,7 +143,7 @@ prompt_choice() {
       i=$((i + 1))
     done
 
-    if ! read -r -p "Choice${default:+ [$default]}: " answer; then
+    if ! answer="$(read_prompt "Choice${default:+ [$default]}: ")"; then
       [ -n "$default" ] || return 1
       answer="$default"
     fi
@@ -152,7 +170,7 @@ confirm() {
   if [ "${TSUNAMI_ASSUME_YES:-}" = "1" ]; then
     return 0
   fi
-  if ! [ -t 0 ] && [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
+  if ! is_interactive; then
     normalize_yes "$default"
     return
   fi
@@ -164,7 +182,7 @@ confirm() {
   fi
 
   while true; do
-    if ! read -r -p "$prompt [$suffix]: " answer; then
+    if ! answer="$(read_prompt "$prompt [$suffix]: ")"; then
       answer="$default"
     fi
     answer="${answer:-$default}"

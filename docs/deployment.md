@@ -18,6 +18,11 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
+When run from an interactive terminal, these piped commands open the management
+menu by reading prompts from `/dev/tty`. In automation or any environment
+without a controlling TTY, the same commands keep the non-interactive install
+path.
+
 From a local source checkout:
 
 ```bash

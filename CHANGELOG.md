@@ -7,6 +7,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-06-22
+
+### Fixed
+- Piped installer commands such as `wget -qO- ... | sudo bash` now open the interactive menu when a controlling terminal is available.
+- Installer prompts read from `/dev/tty` for piped interactive runs, while fully non-interactive environments still use the non-interactive install path.
+
 ## [1.2.0] - 2026-06-22
 
 ### Added
@@ -60,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform builds (linux/amd64, linux/arm64, windows/amd64, darwin/amd64, darwin/arm64)
 - Integration test suite (E2E, multi-stream, auth failure, session reuse, large data transfer)
 
+[1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0

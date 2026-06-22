@@ -40,6 +40,7 @@ source_installer() {
   local tmp_dir="$1"
   unset TSUNAMI_LISTEN TSUNAMI_PASSWORD TSUNAMI_USER TSUNAMI_PUBLIC_HOST
   unset TSUNAMI_TLS_MODE TSUNAMI_ASSUME_YES
+  unset TSUNAMI_TEST_HAS_TTY
   export TSUNAMI_TEST_SOURCE=1
   export TSUNAMI_CONFIG_DIR="$tmp_dir/etc/tsunami"
   export TSUNAMI_SERVICE_NAME="tsunami-test"
@@ -52,8 +53,24 @@ test_default_dispatch_context() {
   tmp_dir="$(mktemp -d)"
   source_installer "$tmp_dir"
 
-  assert_eq "menu" "$(default_command_for_context 1)" "tty no-arg dispatch opens menu"
-  assert_eq "install" "$(default_command_for_context 0)" "non-tty no-arg dispatch installs"
+  assert_eq "menu" "$(default_command_for_context 1 1)" "tty no-arg dispatch opens menu"
+  assert_eq "menu" "$(default_command_for_context 0 1)" "piped no-arg dispatch opens menu when prompt tty exists"
+  assert_eq "install" "$(default_command_for_context 0 0)" "non-tty no-arg dispatch installs without prompt tty"
+
+  rm -rf "$tmp_dir"
+}
+
+test_main_piped_with_prompt_tty_opens_menu() {
+  local tmp_dir output
+  tmp_dir="$(mktemp -d)"
+  source_installer "$tmp_dir"
+
+  TSUNAMI_TEST_HAS_TTY=1
+  interactive_menu() { printf 'menu\n'; }
+  install_all() { printf 'install\n'; }
+
+  output="$(main)"
+  assert_eq "menu" "$output" "piped command with prompt tty opens menu"
 
   rm -rf "$tmp_dir"
 }
@@ -217,6 +234,7 @@ test_write_config_cancel_skips_config_file() {
   TSUNAMI_LISTEN=:443
   TSUNAMI_PUBLIC_HOST=example.com
   TSUNAMI_LETSENCRYPT=n
+  TSUNAMI_FALLBACK=127.0.0.1:8080
   TSUNAMI_PASSWORD=secret-password
   TSUNAMI_MAX_CONNECTIONS=4
   TSUNAMI_THRESHOLD=8
@@ -250,11 +268,24 @@ test_prompt_choice_defaults_and_retries() {
   rm -rf "$tmp_dir"
 }
 
+test_ask_reads_input_when_prompt_tty_exists() {
+  local tmp_dir output
+  tmp_dir="$(mktemp -d)"
+  source_installer "$tmp_dir"
+
+  TSUNAMI_TEST_HAS_TTY=1
+  output="$(printf 'typed-value\n' | ask "Value" "default")"
+  assert_eq "typed-value" "$output" "ask reads prompt tty input even when stdin is piped"
+
+  rm -rf "$tmp_dir"
+}
+
 test_confirm_defaults_and_assume_yes() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   source_installer "$tmp_dir"
 
+  TSUNAMI_TEST_HAS_TTY=1
   run_confirm_default_yes() { printf '\n' | confirm "Proceed?" "y"; }
   run_confirm_explicit_no() { printf 'n\n' | confirm "Proceed?" "y"; }
 
@@ -271,7 +302,9 @@ test_default_dispatch_context
 test_main_explicit_command_bypasses_menu
 test_main_default_menu_path
 test_main_default_pipe_path
+test_main_piped_with_prompt_tty_opens_menu
 test_prompt_choice_defaults_and_retries
+test_ask_reads_input_when_prompt_tty_exists
 test_confirm_defaults_and_assume_yes
 test_load_state_defaults_reuses_previous_values
 test_load_state_defaults_preserves_env_values
