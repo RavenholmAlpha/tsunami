@@ -189,16 +189,13 @@ load_state_defaults() {
   local current_password="${TSUNAMI_PASSWORD-}"
   local current_user="${TSUNAMI_USER-}"
   local current_public_host="${TSUNAMI_PUBLIC_HOST-}"
-  local loaded_tls_mode
 
   . "$STATE_FILE" 2>/dev/null || true
-  loaded_tls_mode="${TSUNAMI_TLS_MODE:-}"
 
   [ -z "$have_listen" ] || TSUNAMI_LISTEN="$current_listen"
   [ -z "$have_password" ] || TSUNAMI_PASSWORD="$current_password"
   [ -z "$have_user" ] || TSUNAMI_USER="$current_user"
   [ -z "$have_public_host" ] || TSUNAMI_PUBLIC_HOST="$current_public_host"
-  TSUNAMI_PREVIOUS_TLS_MODE="$loaded_tls_mode"
 }
 
 mask_secret() {

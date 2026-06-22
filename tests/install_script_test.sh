@@ -39,7 +39,7 @@ assert_failure() {
 source_installer() {
   local tmp_dir="$1"
   unset TSUNAMI_LISTEN TSUNAMI_PASSWORD TSUNAMI_USER TSUNAMI_PUBLIC_HOST
-  unset TSUNAMI_TLS_MODE TSUNAMI_PREVIOUS_TLS_MODE TSUNAMI_ASSUME_YES
+  unset TSUNAMI_TLS_MODE TSUNAMI_ASSUME_YES
   export TSUNAMI_TEST_SOURCE=1
   export TSUNAMI_CONFIG_DIR="$tmp_dir/etc/tsunami"
   export TSUNAMI_SERVICE_NAME="tsunami-test"
@@ -119,7 +119,7 @@ STATE
   assert_eq "secret-value" "$TSUNAMI_PASSWORD" "state default password"
   assert_eq "alice" "$TSUNAMI_USER" "state default user"
   assert_eq "example.com" "$TSUNAMI_PUBLIC_HOST" "state default public host"
-  assert_eq "letsencrypt" "$TSUNAMI_PREVIOUS_TLS_MODE" "state default previous TLS mode"
+  assert_eq "letsencrypt" "$TSUNAMI_TLS_MODE" "state default TLS mode"
 
   rm -rf "$tmp_dir"
 }
