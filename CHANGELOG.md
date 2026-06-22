@@ -7,6 +7,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-22
+
+### Added
+- Interactive deployment management menu for local `scripts/install.sh` and `tsunami-manage` runs.
+- Guided configuration summary with masked password display before writing config.
+- Confirmation prompts for install, reconfigure, update, uninstall, and config removal flows.
+- Installer behavior tests covering menu dispatch, confirmation handling, state defaults, and non-interactive compatibility.
+
+### Changed
+- No-argument interactive runs now open the management menu; pipe/non-TTY installs still run the existing install path.
+- Reconfiguration reuses previous `/etc/tsunami/install.env` values as prompt defaults while preserving `TSUNAMI_*` environment variable priority.
+- Deployment documentation now explains menu usage and explicit command mode.
+
 ## [1.1.0] - 2026-05-08
 
 ### Added
@@ -47,5 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform builds (linux/amd64, linux/arm64, windows/amd64, darwin/amd64, darwin/arm64)
 - Integration test suite (E2E, multi-stream, auth failure, session reuse, large data transfer)
 
+[1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0

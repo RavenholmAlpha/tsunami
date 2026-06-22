@@ -7,6 +7,19 @@
 本フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に基づいており、
 本プロジェクトは [セマンティックバージョニング](https://semver.org/lang/ja/spec/v2.0.0.html) に準拠しています。
 
+## [1.2.0] - 2026-06-22
+
+### 追加
+- ローカルの `scripts/install.sh` と `tsunami-manage` 実行向けに対話型デプロイ管理メニューを追加。
+- 設定を書き込む前に、パスワードをマスクした設定サマリーを表示。
+- インストール、再設定、更新、アンインストール、設定削除フローに確認プロンプトを追加。
+- メニュー分岐、確認処理、状態デフォルト、非対話互換性をカバーするインストーラーテストを追加。
+
+### 変更
+- 対話型ターミナルで引数なしに実行すると管理メニューを開くように変更。パイプ/非 TTY インストールは従来のインストール経路を維持。
+- 再設定時に以前の `/etc/tsunami/install.env` の値をプロンプトのデフォルトとして再利用しつつ、`TSUNAMI_*` 環境変数の優先度を維持。
+- デプロイドキュメントにメニュー利用方法と明示的なコマンドモードを追記。
+
 ## [1.1.0] - 2026-05-08
 
 ### 追加
@@ -47,5 +60,6 @@
 - クロスプラットフォームビルド（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 統合テストスイート（E2E、マルチストリーム、認証失敗、セッション再利用、大容量データ転送）
 
+[1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0

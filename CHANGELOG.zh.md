@@ -7,6 +7,19 @@
 本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [1.2.0] - 2026-06-22
+
+### 新增
+- 为本地 `scripts/install.sh` 和 `tsunami-manage` 运行新增交互式部署管理菜单。
+- 写入配置前展示配置摘要，并对密码做遮蔽显示。
+- 为安装、重新配置、更新、卸载和删除配置流程新增确认提示。
+- 新增安装脚本行为测试，覆盖菜单分发、确认处理、状态默认值和非交互兼容性。
+
+### 变更
+- 交互式终端中不带参数运行现在会打开管理菜单；管道/非 TTY 安装仍保持原有安装路径。
+- 重新配置会复用之前 `/etc/tsunami/install.env` 中的值作为提示默认值，同时保持 `TSUNAMI_*` 环境变量优先。
+- 部署文档补充菜单使用方式和显式命令模式说明。
+
 ## [1.1.0] - 2026-05-08
 
 ### 新增
@@ -47,5 +60,6 @@
 - 跨平台构建（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 集成测试套件（端到端、多流、认证失败、会话重用、大数据传输）
 
+[1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/RavenholmAlpha/tsunami/releases/tag/v1.0.0
