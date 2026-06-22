@@ -20,7 +20,7 @@ CLIENT_FILE="$CONFIG_DIR/client-command.txt"
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Detect piped execution (wget/curl | bash) — disable interactive prompts
-if [ ! -t 0 ]; then
+if [ ! -t 0 ] && [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
   TSUNAMI_ASSUME_YES="${TSUNAMI_ASSUME_YES:-1}"
 fi
 
@@ -77,6 +77,160 @@ ask() {
   else
     printf '%s' "$default"
   fi
+}
+
+is_interactive() {
+  [ -t 0 ] && [ "${TSUNAMI_ASSUME_YES:-}" != "1" ]
+}
+
+default_command_for_context() {
+  local stdin_is_tty="$1"
+  if [ "$stdin_is_tty" = "1" ]; then
+    printf 'menu'
+  else
+    printf 'install'
+  fi
+}
+
+normalize_yes() {
+  case "${1,,}" in
+    y | yes | 1 | true) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_no() {
+  case "${1,,}" in
+    n | no | 0 | false) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_choice() {
+  local prompt="$1"
+  local default="$2"
+  shift 2
+  local count="$#"
+  local answer i option
+
+  while true; do
+    printf '%s\n' "$prompt" >&2
+    i=1
+    for option in "$@"; do
+      if [ "$i" = "$default" ]; then
+        printf '  %s) %s [default]\n' "$i" "$option" >&2
+      else
+        printf '  %s) %s\n' "$i" "$option" >&2
+      fi
+      i=$((i + 1))
+    done
+
+    if ! read -r -p "Choice${default:+ [$default]}: " answer; then
+      [ -n "$default" ] || return 1
+      answer="$default"
+    fi
+    answer="${answer:-$default}"
+
+    case "$answer" in
+      '' | *[!0-9]*) printf 'Please enter a number from 1 to %s.\n' "$count" >&2 ;;
+      *)
+        if [ "$answer" -ge 1 ] && [ "$answer" -le "$count" ]; then
+          printf '%s' "$answer"
+          return 0
+        fi
+        printf 'Please enter a number from 1 to %s.\n' "$count" >&2
+        ;;
+    esac
+  done
+}
+
+confirm() {
+  local prompt="$1"
+  local default="${2:-n}"
+  local answer suffix
+
+  if [ "${TSUNAMI_ASSUME_YES:-}" = "1" ]; then
+    return 0
+  fi
+  if ! [ -t 0 ] && [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
+    normalize_yes "$default"
+    return
+  fi
+
+  if normalize_yes "$default"; then
+    suffix="Y/n"
+  else
+    suffix="y/N"
+  fi
+
+  while true; do
+    if ! read -r -p "$prompt [$suffix]: " answer; then
+      answer="$default"
+    fi
+    answer="${answer:-$default}"
+    if normalize_yes "$answer"; then
+      return 0
+    fi
+    if normalize_no "$answer"; then
+      return 1
+    fi
+    printf 'Please answer y or n.\n' >&2
+  done
+}
+
+load_state_defaults() {
+  [ -f "$STATE_FILE" ] || return 0
+
+  local have_listen="${TSUNAMI_LISTEN+x}"
+  local have_password="${TSUNAMI_PASSWORD+x}"
+  local have_user="${TSUNAMI_USER+x}"
+  local have_public_host="${TSUNAMI_PUBLIC_HOST+x}"
+  local current_listen="${TSUNAMI_LISTEN-}"
+  local current_password="${TSUNAMI_PASSWORD-}"
+  local current_user="${TSUNAMI_USER-}"
+  local current_public_host="${TSUNAMI_PUBLIC_HOST-}"
+  local loaded_tls_mode
+
+  . "$STATE_FILE" 2>/dev/null || true
+  loaded_tls_mode="${TSUNAMI_TLS_MODE:-}"
+
+  [ -z "$have_listen" ] || TSUNAMI_LISTEN="$current_listen"
+  [ -z "$have_password" ] || TSUNAMI_PASSWORD="$current_password"
+  [ -z "$have_user" ] || TSUNAMI_USER="$current_user"
+  [ -z "$have_public_host" ] || TSUNAMI_PUBLIC_HOST="$current_public_host"
+  TSUNAMI_PREVIOUS_TLS_MODE="$loaded_tls_mode"
+}
+
+mask_secret() {
+  local value="$1"
+  if [ -z "$value" ]; then
+    printf '(generated)'
+  elif [ "${#value}" -gt 12 ]; then
+    printf '%s...%s' "${value:0:6}" "${value: -4}"
+  else
+    printf '********'
+  fi
+}
+
+show_config_summary() {
+  local listen="$1"
+  local domain="$2"
+  local tls_mode="$3"
+  local fallback="$4"
+  local max_conn="$5"
+  local threshold="$6"
+  local password="$7"
+
+  printf '\n'
+  printf 'Configuration summary:\n'
+  printf '  Listen address : %s\n' "$listen"
+  printf '  Public host    : %s\n' "$domain"
+  printf '  TLS mode       : %s\n' "$tls_mode"
+  printf '  Fallback       : %s\n' "${fallback:-built-in page}"
+  printf '  Surge max conn : %s\n' "$max_conn"
+  printf '  Surge threshold: %s\n' "$threshold"
+  printf '  Password       : %s\n' "$(mask_secret "$password")"
+  printf '\n'
 }
 
 random_password() {
@@ -332,6 +486,10 @@ HOOK
 # ── Configuration ────────────────────────────────────────────────────────
 
 write_config() {
+  if is_interactive; then
+    load_state_defaults
+  fi
+
   mkdir -p "$CONFIG_DIR"
   chmod 0755 "$CONFIG_DIR"
 
@@ -365,6 +523,9 @@ write_config() {
         use_le="$(ask "Use Let's Encrypt for $domain? (y/n)" "y")"
       fi
       if [ "$use_le" = "y" ] || [ "$use_le" = "yes" ] || [ "$use_le" = "1" ]; then
+        if is_interactive; then
+          log "Let's Encrypt requires DNS to point at this server and port 80 to be reachable."
+        fi
         obtain_letsencrypt_cert "$domain"
         write_certbot_hooks
         cert="/etc/letsencrypt/live/$domain/fullchain.pem"
@@ -383,6 +544,11 @@ write_config() {
 
   require_uint "max_connections" "$max_conn"
   require_uint "threshold" "$threshold"
+
+  if is_interactive; then
+    show_config_summary "$listen" "$domain" "$tls_mode" "$fallback" "$max_conn" "$threshold" "$password"
+    confirm "Write this configuration?" "y" || die "configuration cancelled"
+  fi
 
   cat >"$CONFIG_FILE" <<EOF
 {
@@ -635,10 +801,12 @@ Usage:
     curl -fsSL https://...install.sh | TSUNAMI_PUBLIC_HOST=example.com TSUNAMI_LETSENCRYPT=y sudo -E bash
 
   Local:
-    sudo bash install.sh [command]
+    sudo bash install.sh              Open interactive menu
+    sudo bash install.sh install      Install immediately
 
 Commands:
-  install     Install binary, configure, and start service (default)
+  menu        Open interactive management menu
+  install     Install binary, configure, and start service (default for pipe/non-TTY)
   config      Re-configure and restart
   update      Download latest binary and restart
   status      Show service status
@@ -662,9 +830,81 @@ Environment:
 EOF
 }
 
+interactive_install_all() {
+  confirm "Install or reinstall $SERVICE_NAME now?" "y" || return 0
+  install_all
+}
+
+interactive_configure_all() {
+  confirm "Reconfigure $SERVICE_NAME and restart it?" "y" || return 0
+  configure_all
+}
+
+interactive_update_binary() {
+  confirm "Update tsunami binaries and restart $SERVICE_NAME?" "y" || return 0
+  update_binary
+}
+
+interactive_uninstall_all() {
+  confirm "Uninstall $SERVICE_NAME?" "n" || return 0
+  if confirm "Also remove $CONFIG_DIR?" "n"; then
+    TSUNAMI_KEEP_CONFIG=0 uninstall_all
+  else
+    uninstall_all
+  fi
+}
+
+run_menu_action() {
+  local choice="$1"
+  case "$choice" in
+    1) interactive_install_all ;;
+    2) interactive_configure_all ;;
+    3) interactive_update_binary ;;
+    4) status_service ;;
+    5) show_client ;;
+    6) logs_service ;;
+    7) cert_status ;;
+    8) interactive_uninstall_all ;;
+    9) printf 'exit' ;;
+    *) return 1 ;;
+  esac
+}
+
+interactive_menu() {
+  local choice
+  while true; do
+    choice="$(prompt_choice "TSUNAMI management" "5" \
+      "Install or reinstall service" \
+      "Reconfigure and restart" \
+      "Update binary and restart" \
+      "Show service status" \
+      "Show client connection information" \
+      "Follow service logs" \
+      "Show Let's Encrypt certificate status" \
+      "Uninstall" \
+      "Exit")"
+    if [ "$choice" = "9" ]; then
+      return 0
+    fi
+    run_menu_action "$choice"
+    if [ "$choice" = "6" ]; then
+      return 0
+    fi
+  done
+}
+
 main() {
-  local cmd="${1:-install}"
+  local cmd="${1:-}"
+  if [ -z "$cmd" ]; then
+    if is_interactive; then
+      cmd="$(default_command_for_context 1)"
+    else
+      cmd="$(default_command_for_context 0)"
+    fi
+  fi
+
   case "$cmd" in
+    menu) interactive_menu ;;
     install) install_all ;;
     config | configure) configure_all ;;
     update) update_binary ;;
@@ -679,4 +919,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${TSUNAMI_TEST_SOURCE:-0}" != "1" ]; then
+  main "$@"
+fi

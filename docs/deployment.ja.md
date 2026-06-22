@@ -22,6 +22,8 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 sudo bash scripts/install.sh
 ```
 
+対話型ターミナルでコマンドなしに実行すると、管理メニューが開きます。メニューからデプロイする場合は **Install or reinstall service** を選び、すぐにインストールする場合は `sudo bash scripts/install.sh install` を実行します。
+
 インストーラーが確認する項目：
 
 - リッスンアドレス、デフォルト `:443`
@@ -103,6 +105,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 使用方法：
 
 ```bash
+sudo tsunami-manage           # 対話型メニューを開く
 sudo tsunami-manage status
 sudo tsunami-manage config
 sudo tsunami-manage update
@@ -112,6 +115,8 @@ sudo tsunami-manage client    # 接続情報パネルを表示
 sudo tsunami-manage cert      # Let's Encrypt 証明書状態を表示
 sudo tsunami-manage uninstall
 ```
+
+明示的なコマンドは引き続き自動化に使用できます。対話型ターミナルで引数なしに実行するとメニューが開きます。
 
 またはソースチェックアウトから：
 

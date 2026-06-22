@@ -24,6 +24,10 @@ From a local source checkout:
 sudo bash scripts/install.sh
 ```
 
+In an interactive terminal, running the script without a command opens the
+management menu. Choose **Install or reinstall service** to deploy from the
+menu, or run `sudo bash scripts/install.sh install` to install immediately.
+
 The installer asks for:
 
 - listen address, default `:443`
@@ -123,6 +127,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 Then use it:
 
 ```bash
+sudo tsunami-manage           # open interactive menu
 sudo tsunami-manage status
 sudo tsunami-manage config
 sudo tsunami-manage update
@@ -132,6 +137,9 @@ sudo tsunami-manage client    # show connection info panel
 sudo tsunami-manage cert      # show Let's Encrypt certificate status
 sudo tsunami-manage uninstall
 ```
+
+Explicit commands continue to work for automation; a no-argument interactive
+run opens the menu.
 
 Or from a source checkout:
 

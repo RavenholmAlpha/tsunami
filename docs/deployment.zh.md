@@ -22,6 +22,8 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 sudo bash scripts/install.sh
 ```
 
+在交互式终端中，不带命令运行脚本会打开管理菜单。选择 **安装/重新安装服务** 即可从菜单部署；如果要跳过菜单直接安装，运行 `sudo bash scripts/install.sh install`。
+
 安装程序会询问：
 
 - 监听地址，默认 `:443`
@@ -103,6 +105,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 然后使用：
 
 ```bash
+sudo tsunami-manage           # 打开交互式菜单
 sudo tsunami-manage status
 sudo tsunami-manage config
 sudo tsunami-manage update
@@ -112,6 +115,8 @@ sudo tsunami-manage client    # 显示连接信息面板
 sudo tsunami-manage cert      # 显示 Let's Encrypt 证书状态
 sudo tsunami-manage uninstall
 ```
+
+显式命令仍然适合自动化使用；交互式终端中不带参数运行会打开菜单。
 
 或从源码目录：
 
