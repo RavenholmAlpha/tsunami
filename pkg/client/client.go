@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -311,6 +313,10 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		padding0Size = padding.RandomInRange(segs[0].MinSize, segs[0].MaxSize)
 	}
 	padding0 := make([]byte, padding0Size)
+	if _, err := rand.Read(padding0); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("generate auth padding: %w", err)
+	}
 
 	if err := protocol.EncodeAuthRequest(tlsConn, c.passwordHash, padding0); err != nil {
 		tlsConn.Close()
@@ -354,7 +360,7 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 			authErr.ServerAddr, authErr.Reason, authErr.Hint(), authErr.Err)
 		return nil, authErr
 	}
-	if frame.Command != protocol.CmdServerSettings {
+	if frame.Command != protocol.CmdServerSettings || frame.StreamID != 0 || len(frame.Data) == 0 {
 		session.Close()
 		authErr := newUnexpectedAuthFrameError(c.config.ServerAddr, frame)
 		log.Printf("tsunami client: auth failed server=%s reason=%s hint=%q command=%d stream_id=%d data_len=%d",
@@ -363,13 +369,17 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	}
 
 	// Process server settings
-	var shapingConfirmed bool
-	if frame.Data != nil {
-		if ss, err := protocol.DecodeServerSettings(frame.Data); err == nil {
-			log.Printf("tsunami: server version=%d surge-mode=%s", ss.Version, ss.SurgeMode)
-			shapingConfirmed = ss.Shaping
-		}
+	ss, err := protocol.DecodeServerSettings(frame.Data)
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("decode server settings: %w", err)
 	}
+	if ss.Version != protocol.CurrentVersion {
+		session.Close()
+		return nil, fmt.Errorf("server version=%d: %w", ss.Version, protocol.ErrVersionMismatch)
+	}
+	log.Printf("tsunami: server version=%d surge-mode=%s", ss.Version, ss.SurgeMode)
+	shapingConfirmed := ss.Shaping
 
 	// Activate traffic shaping if both sides agreed
 	if c.config.Shaping != nil && shapingConfirmed {
@@ -429,8 +439,10 @@ func encodeSocksAddr(target string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid target address: %w", err)
 	}
 
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid target port %q", portStr)
+	}
 
 	// Try parsing as IP first
 	if ip := net.ParseIP(host); ip != nil {

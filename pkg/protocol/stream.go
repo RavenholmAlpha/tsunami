@@ -1,9 +1,11 @@
 package protocol
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Stream represents a single multiplexed proxy connection within a Session.
@@ -17,6 +19,8 @@ type Stream struct {
 	readBufOnce sync.Once
 	doneCh      chan struct{} // closed when stream is done, unblocks reads and delivery
 	readLeft    []byte        // leftover from partial reads
+	openResult  chan error    // resolved by SYNACK for locally initiated streams
+	openOnce    sync.Once
 
 	// State.
 	closed  atomic.Bool
@@ -30,12 +34,45 @@ type Stream struct {
 // newStream creates a new stream within a session.
 func newStream(id uint32, session *Session) *Stream {
 	return &Stream{
-		id:       id,
-		session:  session,
-		priority: DefaultStreamPriority,
-		readBuf:  make(chan []byte, 1024), // large buffer to absorb short bursts
-		doneCh:   make(chan struct{}),
+		id:         id,
+		session:    session,
+		priority:   DefaultStreamPriority,
+		readBuf:    make(chan []byte, 1024), // large buffer to absorb short bursts
+		doneCh:     make(chan struct{}),
+		openResult: make(chan error, 1),
 	}
+}
+
+func (s *Stream) waitForOpen(timeout time.Duration) error {
+	// Prefer an already delivered SYNACK result over doneCh. Rejection closes
+	// the stream as part of cleanup, but callers still need the rejection cause.
+	select {
+	case err := <-s.openResult:
+		return err
+	default:
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-s.openResult:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("tsunami: wait for stream %d SYNACK: %w", s.id, ErrSessionClosed)
+	case <-s.doneCh:
+		select {
+		case err := <-s.openResult:
+			return err
+		default:
+		}
+		return ErrStreamClosed
+	}
+}
+
+func (s *Stream) resolveOpen(err error) {
+	s.openOnce.Do(func() {
+		s.openResult <- err
+	})
 }
 
 // closeReadBuf safely marks the read side closed exactly once.
@@ -126,6 +163,7 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.closed.Store(true)
+	s.resolveOpen(ErrStreamClosed)
 
 	// Send FIN to remote (best effort).
 	_ = s.session.writeFrame(NewFrame(CmdFIN, s.id, nil))
@@ -154,7 +192,7 @@ func (s *Stream) deliverData(data []byte) error {
 }
 
 // closeByRemote is called when the remote sends cmdFIN for this stream.
-func (s *Stream) closeByRemote() {
+func (s *Stream) closeByRemote(err error) {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 
@@ -162,6 +200,10 @@ func (s *Stream) closeByRemote() {
 		return
 	}
 	s.closed.Store(true)
+	if err == nil {
+		err = ErrStreamClosed
+	}
+	s.resolveOpen(err)
 	s.closeReadBuf()
 	s.session.removeStream(s.id)
 }

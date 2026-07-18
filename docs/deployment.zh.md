@@ -4,6 +4,8 @@
 
 本项目包含一个 Linux 安装脚本 `scripts/install.sh`。它会安装 `tsunami-server`、写入 `/etc/tsunami/config.json`、创建 systemd 服务单元、启动服务，并打印可直接使用的客户端命令。
 
+`scripts/install-node.sh` 是单独的 XBoard TSUNAMI 节点安装器。它安装 `tsunami-node`、写入 `/etc/tsunami/node.json`、注册长期节点凭据并创建 `tsunami-node.service`；不要把它与静态用户服务端安装器混用。节点的完整安装命令、凭据生命周期和设备限制说明见 [XBoard 独立节点](xboard-node.zh.md)。
+
 ## 交互式安装
 
 从 GitHub 安装（推荐）：

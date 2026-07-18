@@ -19,9 +19,11 @@ type Session struct {
 	writeMu sync.Mutex // protects writer from concurrent writes
 
 	// Stream management
-	streams  map[uint32]*Stream
-	streamMu sync.RWMutex
-	nextID   atomic.Uint32
+	streams            map[uint32]*Stream
+	streamMu           sync.RWMutex
+	openMu             sync.Mutex // preserves on-wire SYN ordering for concurrent OpenStream calls
+	nextID             atomic.Uint32
+	lastRemoteStreamID uint32 // accessed only by the session event loop
 
 	// Session state
 	closed    atomic.Bool
@@ -83,7 +85,9 @@ func (s *Session) Seq() uint64 {
 
 // OpenStream creates a new stream on this session (client side).
 func (s *Session) OpenStream() (*Stream, error) {
+	s.openMu.Lock()
 	if s.closed.Load() {
+		s.openMu.Unlock()
 		return nil, ErrSessionClosed
 	}
 
@@ -99,8 +103,15 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	// Send SYN
 	if err := s.writeFrame(NewFrame(CmdSYN, id, nil)); err != nil {
-		s.removeStream(id)
+		s.openMu.Unlock()
+		stream.closeByRemote(err)
 		return nil, fmt.Errorf("tsunami: send SYN: %w", err)
+	}
+	s.openMu.Unlock()
+
+	if err := stream.waitForOpen(10 * time.Second); err != nil {
+		_ = stream.Close()
+		return nil, err
 	}
 
 	s.lastActive.Store(time.Now().UnixNano())
@@ -174,6 +185,12 @@ func (s *Session) writeFrame(f *Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
+	if f == nil {
+		return ErrInvalidFrame
+	}
+	if len(f.Data) > MaxFrameDataLen {
+		return ErrFrameTooLarge
+	}
 	s.lastActive.Store(time.Now().UnixNano())
 	s.writeMu.Lock()
 	if nc, ok := s.conn.(net.Conn); ok {
@@ -204,6 +221,14 @@ func (s *Session) WriteFrame(f *Frame) error {
 func (s *Session) writeFrames(frames []*Frame) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
+	}
+	for _, frame := range frames {
+		if frame == nil {
+			return ErrInvalidFrame
+		}
+		if len(frame.Data) > MaxFrameDataLen {
+			return ErrFrameTooLarge
+		}
 	}
 	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
@@ -311,13 +336,25 @@ func (s *Session) handleFrame(f *Frame) error {
 		return nil
 
 	case CmdSYN:
-		// Server-side: new stream opened by client
+		if s.onStreamOpen == nil {
+			return ErrInvalidFrame
+		}
+		if f.StreamID == 0 || f.StreamID <= s.lastRemoteStreamID || s.getStream(f.StreamID) != nil {
+			return s.writeFrame(NewFrame(CmdSYNACK, f.StreamID, []byte("invalid stream id")))
+		}
+
+		// Server-side: new stream opened by client.
 		stream := newStream(f.StreamID, s)
 		s.streamMu.Lock()
 		s.streams[f.StreamID] = stream
 		count := len(s.streams)
 		s.streamMu.Unlock()
+		s.lastRemoteStreamID = f.StreamID
 		s.notifyStreamCountChange(count)
+		if err := s.writeFrame(NewFrame(CmdSYNACK, f.StreamID, nil)); err != nil {
+			stream.closeByRemote(err)
+			return err
+		}
 		if s.onStreamOpen != nil {
 			go s.onStreamOpen(stream)
 		}
@@ -331,9 +368,10 @@ func (s *Session) handleFrame(f *Frame) error {
 		if len(f.Data) > 0 {
 			// Error response — close the stream
 			log.Printf("tsunami: stream %d rejected: %s", f.StreamID, string(f.Data))
-			stream.closeByRemote()
+			stream.closeByRemote(fmt.Errorf("%w: %s", ErrStreamRejected, string(f.Data)))
+			return nil
 		}
-		// Success — no action needed
+		stream.resolveOpen(nil)
 
 	case CmdPSH:
 		stream := s.getStream(f.StreamID)
@@ -347,7 +385,7 @@ func (s *Session) handleFrame(f *Frame) error {
 	case CmdFIN:
 		stream := s.getStream(f.StreamID)
 		if stream != nil {
-			stream.closeByRemote()
+			stream.closeByRemote(nil)
 		}
 
 	case CmdHeartRequest:
@@ -428,6 +466,7 @@ func (s *Session) Close() error {
 		s.streamMu.Lock()
 		for _, stream := range s.streams {
 			stream.closed.Store(true)
+			stream.resolveOpen(ErrSessionClosed)
 			stream.closeReadBuf()
 		}
 		s.streams = make(map[uint32]*Stream)

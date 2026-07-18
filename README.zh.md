@@ -135,7 +135,23 @@ sudo tsunami-manage uninstall    # 删除所有内容
 ```bash
 go build -trimpath -ldflags="-s -w" -o tsunami-server ./cmd/tsunami-server/
 go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
+go build -trimpath -ldflags="-s -w" -o tsunami-node ./cmd/tsunami-node/
 ```
+
+### 私有 XBoard 节点
+
+`tsunami-node` 是独立的节点后端，承担与 V2BX 节点守护进程相同的控制面职责，但数据面直接使用 TSUNAMI 内核，不依赖 Xray、sing-box 或 V2BX。它从私有 XBoard 获取用户快照、热更新用户状态并批量回传流量；面板不需要了解 TSUNAMI 的线路格式。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install-node.sh \
+  | sudo env \
+      TSUNAMI_XBOARD_URL=https://panel.example.com \
+      TSUNAMI_NODE_ID=42 \
+      TSUNAMI_ENROLLMENT_TOKEN='<short-lived-one-time-token>' \
+      bash
+```
+
+安装完成后使用 `sudo tsunami-node-manage {status|restart|logs|sync|update|config|uninstall}` 管理节点。首次 token 只用于换取保存在 `/etc/tsunami/node.credential` 的长期凭据，随后会从 `/etc/tsunami/node.json` 移除。完整 API 契约、设备限制语义和配置示例见 [XBoard 独立节点](docs/xboard-node.zh.md)。
 
 ### 手动使用
 
@@ -254,7 +270,8 @@ curl -x http://127.0.0.1:8080 https://httpbin.org/ip
 tsunami/
 ├── cmd/
 │   ├── tsunami-server/        服务端二进制
-│   └── tsunami-client/        客户端二进制（SOCKS5 + HTTP）
+│   ├── tsunami-client/        客户端二进制（SOCKS5 + HTTP）
+│   └── tsunami-node/          XBoard 托管的独立节点后端
 ├── pkg/
 │   ├── protocol/              线路格式、帧、认证、会话、流
 │   ├── padding/               可编程填充引擎
@@ -267,9 +284,11 @@ tsunami/
 │   ├── client/                客户端 API
 │   ├── server/                服务端实现
 │   ├── control/               控制面板（适配器/中间件/用户存储）
+│   ├── node/                  面板同步与流量回传生命周期
 │   └── config/                配置加载
 ├── scripts/
 │   └── install.sh             一键部署脚本
+│   └── install-node.sh        XBoard 独立节点安装与管理脚本
 ├── tests/                     集成测试
 ├── build/                     跨平台构建脚本
 ├── docs/                      设计文档
@@ -303,6 +322,7 @@ tsunami/
 | [内置前置层](docs/fronting.md) | 类 Caddy 的 HTTPS/HTTP2/WebSocket 前置模式 |
 | [部署指南](docs/deployment.zh.md) | 一键安装、Let's Encrypt、环境变量 |
 | [控制面板](docs/control-plane.zh.md) | 面板适配器、中间件、用户存储 |
+| [XBoard 独立节点](docs/xboard-node.zh.md) | 私有 XBoard API 契约、节点配置与运维 |
 | [构建系统](build/README.zh.md) | 跨平台构建脚本 |
 
 ## 测试

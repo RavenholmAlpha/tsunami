@@ -74,7 +74,7 @@ func TestStreamDeliverDataUnblocksWhenClosed(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	stream.closeByRemote()
+	stream.closeByRemote(nil)
 
 	select {
 	case err := <-delivered:

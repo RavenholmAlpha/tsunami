@@ -1,0 +1,11 @@
+{
+  "xboard": {
+    "base_url": "https://panel.example.com",
+    "node_id": "42",
+    "enrollment_token": "replace-with-a-short-lived-one-time-token",
+    "credential_file": "/etc/tsunami/node.credential",
+    "sync_interval": "1m",
+    "config_interval": "1m",
+    "request_timeout": "15s"
+  }
+}

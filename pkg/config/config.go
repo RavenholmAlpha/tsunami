@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tsunami-protocol/tsunami/pkg/control/adapters/xboardtsunami"
 	"github.com/tsunami-protocol/tsunami/pkg/fronting"
+	"github.com/tsunami-protocol/tsunami/pkg/node"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/server"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
@@ -92,6 +94,19 @@ type ServerConfig struct {
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 		AllowAll      bool   `json:"allow_all" yaml:"allow-all"`
 	} `json:"server" yaml:"server"`
+
+	// XBoard is used only by tsunami-node. The panel owns all data-plane
+	// settings so no server block is required in a node configuration.
+	XBoard struct {
+		BaseURL         string `json:"base_url" yaml:"base-url"`
+		NodeID          string `json:"node_id" yaml:"node-id"`
+		EnrollmentToken string `json:"enrollment_token" yaml:"enrollment-token"`
+		Credential      string `json:"credential" yaml:"credential"`
+		CredentialFile  string `json:"credential_file" yaml:"credential-file"`
+		SyncInterval    string `json:"sync_interval" yaml:"sync-interval"`
+		ConfigInterval  string `json:"config_interval" yaml:"config-interval"`
+		RequestTimeout  string `json:"request_timeout" yaml:"request-timeout"`
+	} `json:"xboard" yaml:"xboard"`
 }
 
 // LoadFile loads a JSON configuration file.
@@ -107,7 +122,7 @@ func LoadFile(path string) (*ServerConfig, error) {
 	}
 
 	// Validate required fields
-	if len(cfg.Server.Users) == 0 {
+	if len(cfg.Server.Users) == 0 && cfg.XBoard.BaseURL == "" {
 		return nil, fmt.Errorf("config: at least one user is required")
 	}
 	for i, u := range cfg.Server.Users {
@@ -117,6 +132,54 @@ func LoadFile(path string) (*ServerConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+// ToNodeConfig converts the file configuration to a panel-managed node.
+// XBoard users intentionally replace static users at runtime.
+func (c *ServerConfig) ToNodeConfig() (node.Config, error) {
+	if c == nil {
+		return node.Config{}, fmt.Errorf("config: nil configuration")
+	}
+
+	syncInterval, err := parseDuration("xboard.sync_interval", c.XBoard.SyncInterval)
+	if err != nil {
+		return node.Config{}, err
+	}
+	configInterval, err := parseDuration("xboard.config_interval", c.XBoard.ConfigInterval)
+	if err != nil {
+		return node.Config{}, err
+	}
+	requestTimeout, err := parseDuration("xboard.request_timeout", c.XBoard.RequestTimeout)
+	if err != nil {
+		return node.Config{}, err
+	}
+
+	return node.Config{
+		XBoard: xboardtsunami.Config{
+			BaseURL:         c.XBoard.BaseURL,
+			NodeID:          c.XBoard.NodeID,
+			EnrollmentToken: c.XBoard.EnrollmentToken,
+			Credential:      c.XBoard.Credential,
+			CredentialFile:  c.XBoard.CredentialFile,
+			SyncInterval:    syncInterval,
+			ConfigInterval:  configInterval,
+			RequestTimeout:  requestTimeout,
+		},
+	}, nil
+}
+
+func parseDuration(field, value string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("config: parse %s: %w", field, err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("config: %s must be positive", field)
+	}
+	return duration, nil
 }
 
 // ToServerConfig converts the parsed config into a server.Config.

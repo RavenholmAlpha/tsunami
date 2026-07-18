@@ -3,14 +3,18 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -69,6 +73,17 @@ type Config struct {
 
 	// AllowAll disables the private-IP blocklist, allowing proxying to any address.
 	AllowAll bool
+
+	// SessionAdmission authorizes a connection after protocol authentication but
+	// before the server acknowledges it. It is used by panel-managed nodes for
+	// device and connection limits.
+	SessionAdmission control.SessionAdmission
+
+	// AdmissionTimeout bounds each panel lease request. Zero uses 10 seconds.
+	AdmissionTimeout time.Duration
+	// SessionRenewInterval controls the lease refresh cadence. Zero uses 90
+	// seconds, which is comfortably below XBoard's five-minute lease TTL.
+	SessionRenewInterval time.Duration
 }
 
 // Server is the TSUNAMI proxy server.
@@ -86,6 +101,9 @@ type Server struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	connectionsMu sync.Mutex
+	connections   map[net.Conn]struct{}
 }
 
 // New creates a new TSUNAMI server.
@@ -141,16 +159,23 @@ func New(config Config) (*Server, error) {
 	if config.Traffic.Limiter == nil {
 		config.Traffic.Limiter = control.NewUserLimiter()
 	}
+	if config.AdmissionTimeout <= 0 {
+		config.AdmissionTimeout = 10 * time.Second
+	}
+	if config.SessionRenewInterval <= 0 {
+		config.SessionRenewInterval = 90 * time.Second
+	}
 
 	return &Server{
-		config:     config,
-		auth:       auth,
-		fallback:   fb,
-		scheme:     scheme,
-		decoy:      decoyProxy,
-		traffic:    config.Traffic,
-		frontKeys:  frontKeys,
-		nonceCache: fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
+		config:      config,
+		auth:        auth,
+		fallback:    fb,
+		scheme:      scheme,
+		decoy:       decoyProxy,
+		traffic:     config.Traffic,
+		frontKeys:   frontKeys,
+		nonceCache:  fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
+		connections: make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -171,7 +196,14 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("tsunami server: listen %s: %w", s.config.Listen, err)
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	s.listener = ln
+	s.mu.Unlock()
 
 	log.Printf("tsunami server: listening on %s", s.config.Listen)
 
@@ -211,8 +243,6 @@ func (s *Server) startFronting() error {
 	if err != nil {
 		return fmt.Errorf("tsunami fronting: listen %s: %w", s.config.Listen, err)
 	}
-	s.listener = ln
-
 	httpSrv := &http.Server{
 		Handler:           http.HandlerFunc(s.handleFrontingHTTP),
 		TLSConfig:         tlsCfg,
@@ -232,7 +262,15 @@ func (s *Server) startFronting() error {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	s.listener = ln
 	s.httpSrv = httpSrv
+	s.mu.Unlock()
 
 	log.Printf("tsunami fronting: listening on %s path=%s", s.config.Listen, s.config.Fronting.Path)
 	tuned := &tcpTuningListener{Listener: ln, tcp: &s.config.TCP}
@@ -259,6 +297,8 @@ func (s *Server) handleTLSConn(tlsConn *tls.Conn) {
 
 // handleConn handles a single incoming TLS connection.
 func (s *Server) handleConn(conn net.Conn) {
+	s.trackConnection(conn)
+	defer s.untrackConnection(conn)
 	defer conn.Close()
 
 	// Set read deadline for auth phase
@@ -295,18 +335,57 @@ func (s *Server) handleConn(conn net.Conn) {
 		log.Printf("tsunami server: read client settings: %v", err)
 		return
 	}
-	var clientSettings *protocol.ClientSettings
-	if settingsFrame.Command == protocol.CmdSettings && settingsFrame.Data != nil {
-		clientSettings, err = protocol.DecodeClientSettings(settingsFrame.Data)
+	if settingsFrame.Command != protocol.CmdSettings || settingsFrame.StreamID != 0 || len(settingsFrame.Data) == 0 {
+		log.Printf("tsunami server: invalid client settings frame command=%s stream=%d data_len=%d", settingsFrame.Command, settingsFrame.StreamID, len(settingsFrame.Data))
+		return
+	}
+	clientSettings, err := protocol.DecodeClientSettings(settingsFrame.Data)
+	if err != nil {
+		log.Printf("tsunami server: decode client settings: %v", err)
+		return
+	}
+	if clientSettings.Version != protocol.CurrentVersion {
+		log.Printf("tsunami server: reject client version=%d expected=%d", clientSettings.Version, protocol.CurrentVersion)
+		return
+	}
+	log.Printf("tsunami server: client v=%d client=%s", clientSettings.Version, clientSettings.Client)
+
+	var lease control.SessionLease
+	if s.config.SessionAdmission != nil {
+		clientIP, err := normalizedRemoteIP(conn.RemoteAddr())
 		if err != nil {
-			log.Printf("tsunami server: decode client settings: %v", err)
-		} else {
-			log.Printf("tsunami server: client v=%d client=%s", clientSettings.Version, clientSettings.Client)
+			log.Printf("tsunami server: reject user '%s': invalid client address %q: %v", user.Name, conn.RemoteAddr(), err)
+			return
 		}
+		sessionID, err := newSessionID()
+		if err != nil {
+			log.Printf("tsunami server: create session id for user '%s': %v", user.Name, err)
+			return
+		}
+		admissionCtx, cancel := context.WithTimeout(context.Background(), s.config.AdmissionTimeout)
+		lease, err = s.config.SessionAdmission.Admit(admissionCtx, user, clientIP, sessionID)
+		cancel()
+		if err != nil {
+			if errors.Is(err, control.ErrAdmissionDenied) {
+				log.Printf("tsunami server: reject user '%s' from %s: device or connection limit reached", user.Name, clientIP)
+			} else {
+				log.Printf("tsunami server: admission failed for user '%s' from %s: %v", user.Name, clientIP, err)
+			}
+			return
+		}
+		if lease == nil {
+			log.Printf("tsunami server: admission returned no lease for user '%s'", user.Name)
+			return
+		}
+		defer s.releaseSessionLease(user, lease)
 	}
 
 	// Create session
 	session := protocol.NewSession(conn, 0)
+	if lease != nil {
+		stopRenewal := s.startLeaseRenewal(session, user, lease)
+		defer stopRenewal()
+	}
 
 	// Set up stream handler
 	session.SetOnStreamOpen(func(stream *protocol.Stream) {
@@ -380,26 +459,133 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
+func (s *Server) startLeaseRenewal(session *protocol.Session, user *protocol.UserInfo, lease control.SessionLease) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(s.config.SessionRenewInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), s.config.AdmissionTimeout)
+				err := lease.Renew(ctx)
+				cancel()
+				if err == nil {
+					continue
+				}
+				log.Printf("tsunami server: lease renewal failed for user '%s': %v; closing session", user.Name, err)
+				_ = session.Close()
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+func (s *Server) releaseSessionLease(user *protocol.UserInfo, lease control.SessionLease) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.AdmissionTimeout)
+	err := lease.Release(ctx)
+	cancel()
+	if err != nil {
+		log.Printf("tsunami server: lease release failed for user '%s': %v", user.Name, err)
+	}
+}
+
+func normalizedRemoteIP(remote net.Addr) (string, error) {
+	if remote == nil {
+		return "", errors.New("missing remote address")
+	}
+	if tcp, ok := remote.(*net.TCPAddr); ok {
+		if tcp.IP == nil {
+			return "", errors.New("TCP address has no IP")
+		}
+		address, ok := netip.AddrFromSlice(tcp.IP)
+		if !ok {
+			return "", errors.New("TCP address has invalid IP")
+		}
+		return address.Unmap().String(), nil
+	}
+
+	raw := strings.TrimSpace(remote.String())
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+	}
+	address, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse IP: %w", err)
+	}
+	return address.Unmap().String(), nil
+}
+
+func newSessionID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func (s *Server) trackConnection(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.connectionsMu.Lock()
+	s.connections[conn] = struct{}{}
+	s.connectionsMu.Unlock()
+}
+
+func (s *Server) untrackConnection(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.connectionsMu.Lock()
+	delete(s.connections, conn)
+	s.connectionsMu.Unlock()
+}
+
+func (s *Server) closeConnections() error {
+	s.connectionsMu.Lock()
+	connections := make([]net.Conn, 0, len(s.connections))
+	for conn := range s.connections {
+		connections = append(connections, conn)
+	}
+	s.connectionsMu.Unlock()
+
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // handleStream handles a new incoming stream (proxy request).
 func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) {
 	defer stream.Close()
 
-	// Read target address (SOCKS5 format)
-	addrBuf := make([]byte, 512)
-	n, err := stream.Read(addrBuf)
-	if err != nil {
-		log.Printf("tsunami server: read target addr: %v", err)
-		return
-	}
-
-	target, err := decodeSocksAddr(addrBuf[:n])
+	// Read the target incrementally so it remains correct across short reads
+	// and PSH frame boundaries.
+	target, err := protocol.ReadSocksAddr(stream)
 	if err != nil {
 		log.Printf("tsunami server: decode target addr: %v", err)
 		return
 	}
 
 	// Check for UDP-over-TCP magic address
-	if strings.HasPrefix(target, protocol.UoTMagicAddress) {
+	if isUoTTarget(target) {
 		log.Printf("tsunami server: UoT relay for user '%s'", user.Name)
 		relayStream := s.traffic.WrapReadWriteCloser(stream, user)
 		var allowAddr func(string) bool
@@ -459,6 +645,15 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	}()
 
 	wg.Wait()
+}
+
+func isUoTTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	return host == protocol.UoTMagicAddress || host == protocol.LegacyUoTMagicAddress
 }
 
 // doFallback handles unauthenticated connections by forwarding them to the
@@ -700,16 +895,26 @@ func (l *tcpTuningListener) Accept() (net.Conn, error) {
 // Close shuts down the server.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.closed = true
-	if s.httpSrv != nil {
-		_ = s.httpSrv.Close()
+	httpSrv := s.httpSrv
+	listener := s.listener
+	s.mu.Unlock()
+
+	var errs []error
+	if httpSrv != nil {
+		if err := httpSrv.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, err)
+		}
 	}
-	if s.listener != nil {
-		return s.listener.Close()
+	if listener != nil {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	if err := s.closeConnections(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // decodeSocksAddr decodes a SOCKS5 format address to "host:port" string.

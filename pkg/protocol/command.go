@@ -102,9 +102,9 @@ func (c Command) HasData() bool {
 // Surge control action constants.
 const (
 	SurgeActionReportThroughput = 0x01
-	SurgeActionRequestMoreConn = 0x02
-	SurgeActionReduceConn      = 0x03
-	SurgeActionBandwidthLimit  = 0x04
+	SurgeActionRequestMoreConn  = 0x02
+	SurgeActionReduceConn       = 0x03
+	SurgeActionBandwidthLimit   = 0x04
 )
 
 // MaxFrameDataLen is the maximum data length in a single frame (65535 bytes).
@@ -116,8 +116,12 @@ const FrameHeaderLen = 7
 // AuthHashLen is the length of SHA-256(password).
 const AuthHashLen = 32
 
-// UoTMagicAddress is the magic domain for UDP-over-TCP signaling.
-const UoTMagicAddress = "love.uot.world.anytls"
+// UoTMagicAddress is the UoT v2 magic domain for UDP-over-TCP signaling.
+const UoTMagicAddress = "sp.v2.udp-over-tcp.arpa"
+
+// LegacyUoTMagicAddress is accepted by servers during the v3 migration.
+// New clients always use UoTMagicAddress.
+const LegacyUoTMagicAddress = "love.uot.world.anytls"
 
 // SOCKS5 address types.
 const (

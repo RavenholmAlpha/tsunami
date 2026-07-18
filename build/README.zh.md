@@ -2,7 +2,7 @@
 
 > [English](README.md) | **中文** | [日本語](README.ja.md)
 
-`tsunami-server` 和 `tsunami-client` 的自动化跨平台构建脚本。
+`tsunami-server`、`tsunami-client` 和面板托管节点 `tsunami-node` 的自动化跨平台构建脚本。
 
 ## 输出结构
 
@@ -11,19 +11,24 @@ build/
 ├── v1.0.0/                      # 版本化发布
 │   ├── linux-amd64/
 │   │   ├── tsunami-server
-│   │   └── tsunami-client
+│   │   ├── tsunami-client
+│   │   └── tsunami-node
 │   ├── linux-arm64/
 │   │   ├── tsunami-server
-│   │   └── tsunami-client
+│   │   ├── tsunami-client
+│   │   └── tsunami-node
 │   ├── windows-amd64/
 │   │   ├── tsunami-server.exe
-│   │   └── tsunami-client.exe
+│   │   ├── tsunami-client.exe
+│   │   └── tsunami-node.exe
 │   ├── darwin-amd64/
 │   │   ├── tsunami-server
-│   │   └── tsunami-client
+│   │   ├── tsunami-client
+│   │   └── tsunami-node
 │   ├── darwin-arm64/
 │   │   ├── tsunami-server
-│   │   └── tsunami-client
+│   │   ├── tsunami-client
+│   │   └── tsunami-node
 │   └── checksums.sha256
 ├── v1.1.0/                      # 另一个版本
 │   └── ...

@@ -25,12 +25,14 @@ type Frame struct {
 }
 
 var (
-	ErrFrameTooLarge  = errors.New("tsunami: frame data exceeds maximum length")
-	ErrInvalidFrame   = errors.New("tsunami: invalid frame")
-	ErrStreamClosed   = errors.New("tsunami: stream closed")
-	ErrSessionClosed  = errors.New("tsunami: session closed")
-	ErrAuthFailed     = errors.New("tsunami: authentication failed")
-	ErrVersionMismatch = errors.New("tsunami: version mismatch")
+	ErrFrameTooLarge       = errors.New("tsunami: frame data exceeds maximum length")
+	ErrInvalidFrame        = errors.New("tsunami: invalid frame")
+	ErrStreamClosed        = errors.New("tsunami: stream closed")
+	ErrSessionClosed       = errors.New("tsunami: session closed")
+	ErrAuthFailed          = errors.New("tsunami: authentication failed")
+	ErrAuthPaddingTooLarge = errors.New("tsunami: authentication padding exceeds maximum length")
+	ErrVersionMismatch     = errors.New("tsunami: version mismatch")
+	ErrStreamRejected      = errors.New("tsunami: stream rejected")
 )
 
 // frameBufPool reuses frame encode buffers to reduce GC pressure under high throughput.
@@ -60,6 +62,9 @@ var writeCoalesceBufPool = sync.Pool{
 // EncodeFrame writes a frame to the writer in TSUNAMI wire format.
 // The data length MUST NOT exceed MaxFrameDataLen (65535).
 func EncodeFrame(w io.Writer, f *Frame) error {
+	if f == nil {
+		return ErrInvalidFrame
+	}
 	dataLen := len(f.Data)
 	if dataLen > MaxFrameDataLen {
 		return ErrFrameTooLarge
@@ -123,6 +128,9 @@ func NewFrame(cmd Command, streamID uint32, data []byte) *Frame {
 
 // NewWasteFrame creates a cmdWaste padding frame with the specified number of zero bytes.
 func NewWasteFrame(size int) *Frame {
+	if size < 0 {
+		size = 0
+	}
 	return &Frame{
 		Command:  CmdWaste,
 		StreamID: 0,
@@ -149,6 +157,12 @@ func (fw *FrameWriter) WriteFrame(f *Frame) error {
 func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 	totalLen := 0
 	for _, f := range frames {
+		if f == nil {
+			return ErrInvalidFrame
+		}
+		if len(f.Data) > MaxFrameDataLen {
+			return ErrFrameTooLarge
+		}
 		totalLen += FrameHeaderLen + len(f.Data)
 	}
 
