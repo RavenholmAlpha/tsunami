@@ -41,7 +41,7 @@ jobs:
         golangci-lint run --timeout=5m ./...
 
     - name: Shellcheck
-      run: shellcheck scripts/install.sh
+      run: shellcheck scripts/install.sh scripts/install-node.sh
 
   # ── Stage 2: Test ────────────────────────────────────────────────────
   test:
@@ -63,12 +63,16 @@ jobs:
       run: go test -v -count=1 -race -timeout 5m -coverprofile=coverage.out ./pkg/...
 
     - name: Integration Tests
-      run: go test -v -count=1 -timeout 5m ./tests/...
+      run: |
+        go test -v -count=1 -timeout 5m ./tests/...
+        bash tests/install_script_test.sh
+        bash tests/install_node_script_test.sh
 
     - name: Verify Build
       run: |
         go build -o /dev/null ./cmd/tsunami-server/
         go build -o /dev/null ./cmd/tsunami-client/
+        go build -o /dev/null ./cmd/tsunami-node/
 
     - name: Upload Coverage
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -141,6 +145,10 @@ jobs:
           CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
             go build -trimpath -ldflags="${LDFLAGS}" \
             -o "$DIR/tsunami-client-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-client/
+
+          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+            go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "$DIR/tsunami-node-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-node/
           echo "::endgroup::"
         done
 
@@ -159,14 +167,16 @@ jobs:
           ARCHIVE="tsunami-${VERSION}-${pair}.tar.gz"
           tar -czvf "../../${ARCHIVES}/${ARCHIVE}" \
             "tsunami-server-${GOOS}-${GOARCH}" \
-            "tsunami-client-${GOOS}-${GOARCH}"
+            "tsunami-client-${GOOS}-${GOARCH}" \
+            "tsunami-node-${GOOS}-${GOARCH}"
           echo "Packaged: $ARCHIVE"
         done
 
         ARCHIVE="tsunami-${VERSION}-windows-amd64.zip"
         zip "../../${ARCHIVES}/${ARCHIVE}" \
           tsunami-server-windows-amd64.exe \
-          tsunami-client-windows-amd64.exe
+          tsunami-client-windows-amd64.exe \
+          tsunami-node-windows-amd64.exe
         echo "Packaged: $ARCHIVE"
 
     - name: Generate Checksums

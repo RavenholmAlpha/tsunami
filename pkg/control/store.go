@@ -135,16 +135,19 @@ func (s *UserStore) AuthenticateDetailed(hash [protocol.AuthHashLen]byte) AuthRe
 
 	state := s.current()
 	now := time.Now()
+	var matched *protocol.UserInfo
 	for _, entry := range state.entries {
-		if subtle.ConstantTimeCompare(hash[:], entry.hash[:]) != 1 {
-			continue
+		if subtle.ConstantTimeCompare(hash[:], entry.hash[:]) == 1 {
+			matched = entry.user
 		}
-		if ok, reason := entry.user.IsUsable(now); !ok {
-			return AuthResult{Reason: reason}
-		}
-		return AuthResult{User: entry.user.Clone()}
 	}
-	return AuthResult{Reason: "not found"}
+	if matched == nil {
+		return AuthResult{Reason: "not found"}
+	}
+	if ok, reason := matched.IsUsable(now); !ok {
+		return AuthResult{Reason: reason}
+	}
+	return AuthResult{User: matched.Clone()}
 }
 
 // Snapshot returns the current in-memory snapshot.

@@ -4,10 +4,39 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 )
 
 type testReadWriteCloser struct {
 	bytes.Buffer
+}
+
+func TestSessionSYNACKResolvesOpenStream(t *testing.T) {
+	conn := &testReadWriteCloser{}
+	session := NewSession(conn, 1)
+	stream := newStream(1, session)
+	session.streams[stream.id] = stream
+
+	if err := session.handleFrame(NewFrame(CmdSYNACK, stream.id, nil)); err != nil {
+		t.Fatalf("handle SYNACK: %v", err)
+	}
+	if err := stream.waitForOpen(time.Second); err != nil {
+		t.Fatalf("wait for successful SYNACK: %v", err)
+	}
+}
+
+func TestSessionSYNACKRejectsOpenStream(t *testing.T) {
+	conn := &testReadWriteCloser{}
+	session := NewSession(conn, 1)
+	stream := newStream(1, session)
+	session.streams[stream.id] = stream
+
+	if err := session.handleFrame(NewFrame(CmdSYNACK, stream.id, []byte("policy denied"))); err != nil {
+		t.Fatalf("handle rejected SYNACK: %v", err)
+	}
+	if err := stream.waitForOpen(time.Second); !errors.Is(err, ErrStreamRejected) {
+		t.Fatalf("wait error = %v, want ErrStreamRejected", err)
+	}
 }
 
 func (c *testReadWriteCloser) Close() error {

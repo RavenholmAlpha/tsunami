@@ -11,11 +11,11 @@
 # Output structure:
 #   build/
 #     v1.0.0/
-#       linux-amd64/tsunami-server, tsunami-client
-#       linux-arm64/tsunami-server, tsunami-client
-#       windows-amd64/tsunami-server.exe, tsunami-client.exe
-#       darwin-amd64/tsunami-server, tsunami-client
-#       darwin-arm64/tsunami-server, tsunami-client
+#       linux-amd64/tsunami-server, tsunami-client, tsunami-node
+#       linux-arm64/tsunami-server, tsunami-client, tsunami-node
+#       windows-amd64/tsunami-server.exe, tsunami-client.exe, tsunami-node.exe
+#       darwin-amd64/tsunami-server, tsunami-client, tsunami-node
+#       darwin-arm64/tsunami-server, tsunami-client, tsunami-node
 #       checksums.sha256
 
 set -euo pipefail
@@ -50,7 +50,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODULE="github.com/tsunami-protocol/tsunami"
-COMMANDS=("tsunami-server" "tsunami-client")
+COMMANDS=("tsunami-server" "tsunami-client" "tsunami-node")
 
 VERSION_TAG="v${VERSION}"
 OUT_DIR="${SCRIPT_DIR}/${VERSION_TAG}"

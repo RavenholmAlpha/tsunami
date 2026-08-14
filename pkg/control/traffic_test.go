@@ -32,6 +32,28 @@ func TestUsageTrackerRecordsAndResets(t *testing.T) {
 	}
 }
 
+func TestUsageTrackerRestoreMergesDeltas(t *testing.T) {
+	tracker := NewUsageTracker()
+	user := &protocol.UserInfo{ID: "u1"}
+
+	tracker.Record(user, DirectionUpload, 3)
+	tracker.Restore([]UsageDelta{
+		{UserID: "u1", UploadBytes: 10, DownloadBytes: 20},
+		{UserID: "u2", DownloadBytes: 30},
+	})
+
+	deltas := tracker.Snapshot()
+	if len(deltas) != 2 {
+		t.Fatalf("deltas = %d, want 2", len(deltas))
+	}
+	if deltas[0] != (UsageDelta{UserID: "u1", UploadBytes: 13, DownloadBytes: 20}) {
+		t.Fatalf("u1 delta = %+v", deltas[0])
+	}
+	if deltas[1] != (UsageDelta{UserID: "u2", DownloadBytes: 30}) {
+		t.Fatalf("u2 delta = %+v", deltas[1])
+	}
+}
+
 func TestTrafficPolicyWrapReader(t *testing.T) {
 	tracker := NewUsageTracker()
 	user := &protocol.UserInfo{ID: "u1"}

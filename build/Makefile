@@ -17,7 +17,7 @@ GIT_COMMIT  := $(shell git -C $(PROJECT_DIR) rev-parse --short HEAD 2>/dev/null 
 BUILD_TIME  := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS     := -s -w -X main.version=$(VERSION_TAG) -X main.commit=$(GIT_COMMIT) -X main.buildTime=$(BUILD_TIME)
 
-COMMANDS = tsunami-server tsunami-client
+COMMANDS = tsunami-server tsunami-client tsunami-node
 
 # ── Platform targets ──────────────────────────────────────────────────────
 LINUX_TARGETS   = linux-amd64 linux-arm64

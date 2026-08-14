@@ -1,7 +1,7 @@
 package surge
 
 import (
-	"bytes"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,19 +10,41 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 )
 
-type testReadWriteCloser struct {
-	bytes.Buffer
-}
-
-func (c *testReadWriteCloser) Close() error {
-	return nil
-}
-
 func newTestPool() *mux.Pool {
 	var seq atomic.Uint64
 	return mux.NewPool(mux.DefaultPoolConfig(), func() (*protocol.Session, error) {
-		return protocol.NewSession(&testReadWriteCloser{}, seq.Add(1)), nil
+		return newTestSession(seq.Add(1)), nil
 	})
+}
+
+func newTestSession(seq uint64) *protocol.Session {
+	clientConn, peerConn := net.Pipe()
+	session := protocol.NewSession(clientConn, seq)
+
+	go func() {
+		defer peerConn.Close()
+		for {
+			frame, err := protocol.DecodeFrame(peerConn)
+			if err != nil {
+				return
+			}
+
+			switch frame.Command {
+			case protocol.CmdSYN:
+				err = protocol.EncodeFrame(peerConn, protocol.NewFrame(protocol.CmdSYNACK, frame.StreamID, nil))
+			case protocol.CmdHeartRequest:
+				err = protocol.EncodeFrame(peerConn, protocol.NewFrame(protocol.CmdHeartResponse, 0, nil))
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		_ = session.RunEventLoop()
+	}()
+	return session
 }
 
 func TestNewControllerAppliesDefaults(t *testing.T) {

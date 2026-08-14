@@ -174,6 +174,39 @@ func TestLoadFilePanelUserFields(t *testing.T) {
 	}
 }
 
+func TestToNodeConfigUsesDedicatedBootstrap(t *testing.T) {
+	jsonContent := `{
+  "xboard": {
+    "base_url": "https://panel.example.com",
+    "node_id": "42",
+    "enrollment_token": "01234567890123456789012345678901",
+    "credential_file": "/etc/tsunami/node.credential",
+    "sync_interval": "45s",
+    "config_interval": "2m",
+    "request_timeout": "10s"
+  }
+}`
+
+	path := filepath.Join(t.TempDir(), "node.json")
+	if err := os.WriteFile(path, []byte(jsonContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("load node config: %v", err)
+	}
+	nodeCfg, err := cfg.ToNodeConfig()
+	if err != nil {
+		t.Fatalf("to node config: %v", err)
+	}
+	if nodeCfg.XBoard.BaseURL != "https://panel.example.com" || nodeCfg.XBoard.NodeID != "42" {
+		t.Fatalf("bootstrap identity = %+v", nodeCfg.XBoard)
+	}
+	if nodeCfg.XBoard.SyncInterval.String() != "45s" || nodeCfg.XBoard.ConfigInterval.String() != "2m0s" || nodeCfg.XBoard.RequestTimeout.String() != "10s" {
+		t.Fatalf("bootstrap intervals = %+v", nodeCfg.XBoard)
+	}
+}
+
 func TestLoadFileValidation(t *testing.T) {
 	// No users → error
 	noUsers := `{ "server": {} }`

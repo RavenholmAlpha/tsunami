@@ -34,6 +34,9 @@ type AuthRequest struct {
 // to avoid predictable packet size patterns.
 func EncodeAuthRequest(w io.Writer, hash [AuthHashLen]byte, padding []byte) error {
 	paddingLen := len(padding)
+	if paddingLen > MaxFrameDataLen {
+		return ErrAuthPaddingTooLarge
+	}
 	buf := make([]byte, AuthHashLen+2+paddingLen)
 
 	copy(buf[:AuthHashLen], hash[:])
@@ -198,13 +201,17 @@ func NewAuthenticator(users []*UserInfo) *Authenticator {
 // Authenticate checks the provided hash against known users.
 // Returns the matched UserInfo or nil if authentication fails.
 func (a *Authenticator) Authenticate(hash [AuthHashLen]byte) *UserInfo {
+	var matched *UserInfo
 	for knownHash, user := range a.users {
 		if subtle.ConstantTimeCompare(hash[:], knownHash[:]) == 1 {
-			if ok, _ := user.IsUsable(time.Now()); !ok {
-				return nil
-			}
-			return user
+			matched = user
 		}
 	}
-	return nil
+	if matched == nil {
+		return nil
+	}
+	if ok, _ := matched.IsUsable(time.Now()); !ok {
+		return nil
+	}
+	return matched
 }

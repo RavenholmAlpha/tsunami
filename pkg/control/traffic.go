@@ -196,6 +196,29 @@ func (t *UsageTracker) SnapshotAndReset() []UsageDelta {
 	return deltas
 }
 
+// Restore merges previously drained deltas back into the tracker. It is used
+// when a panel rejects or times out a reporting request, so no accepted usage
+// is silently lost while new traffic continues to be recorded.
+func (t *UsageTracker) Restore(deltas []UsageDelta) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, delta := range deltas {
+		if delta.UserID == "" || (delta.UploadBytes == 0 && delta.DownloadBytes == 0) {
+			continue
+		}
+		current := t.deltas[delta.UserID]
+		if current == nil {
+			current = &UsageDelta{UserID: delta.UserID}
+			t.deltas[delta.UserID] = current
+		}
+		current.UploadBytes += delta.UploadBytes
+		current.DownloadBytes += delta.DownloadBytes
+	}
+}
+
 func cloneUsageDeltas(source map[string]*UsageDelta) []UsageDelta {
 	deltas := make([]UsageDelta, 0, len(source))
 	for _, delta := range source {

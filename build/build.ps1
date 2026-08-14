@@ -4,7 +4,7 @@
     TSUNAMI multi-platform build script.
 
 .DESCRIPTION
-    Builds tsunami-server and tsunami-client for all supported platforms,
+    Builds tsunami-server, tsunami-client, and tsunami-node for all supported platforms,
     organized by version into the build/ directory.
 
 .PARAMETER Version
@@ -44,7 +44,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectDir = Split-Path -Parent $ScriptDir
 $Module     = "github.com/tsunami-protocol/tsunami"
-$Commands   = @("tsunami-server", "tsunami-client")
+$Commands   = @("tsunami-server", "tsunami-client", "tsunami-node")
 
 $VersionTag = "v$Version"
 $OutDir     = Join-Path $ScriptDir $VersionTag
