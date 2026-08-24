@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -237,6 +239,102 @@ func TestFrontingDecoyProxy(t *testing.T) {
 	}
 	if sawSignatureHeader.Load() {
 		t.Fatal("fronting auth header leaked to decoy proxy")
+	}
+}
+
+func TestFrontingRejectsBadOrReplayedHMACAsDecoy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, "cover response:"+r.Method+":"+r.URL.Path)
+	}))
+	defer origin.Close()
+
+	const frontSecret = "fronting-test-secret"
+	serverAddr, stopServer := startFrontingTsunamiServerWithFronting(t, fronting.Config{
+		Enabled:    true,
+		Path:       "/assets/update",
+		Secret:     frontSecret,
+		DecoyProxy: origin.URL,
+	})
+	defer stopServer()
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName:         "localhost",
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2: true,
+	}
+	if err := http2.ConfigureTransport(tr); err != nil {
+		t.Fatalf("configure h2 transport: %v", err)
+	}
+	httpClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	newPost := func() *http.Request {
+		req, err := http.NewRequest(http.MethodPost, "https://"+serverAddr+"/assets/update", nil)
+		if err != nil {
+			t.Fatalf("new fronting POST: %v", err)
+		}
+		req.Host = "localhost"
+		return req
+	}
+	do := func(label string, req *http.Request) (int, string) {
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s request: %v", label, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read %s response: %v", label, err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	coverStatus, coverBody := do("ordinary decoy", newPost())
+	if coverStatus != http.StatusAccepted {
+		t.Fatalf("ordinary decoy status = %d, want %d", coverStatus, http.StatusAccepted)
+	}
+
+	bad := newPost()
+	if err := fronting.SignRequest(bad, fronting.KeyFromSecret(frontSecret), time.Now()); err != nil {
+		t.Fatalf("sign bad request: %v", err)
+	}
+	bad.Header.Set("Authorization", "HMAC-SHA256 Signature=0000000000000000000000000000000000000000000000000000000000000000")
+	if status, body := do("bad HMAC", bad); status != coverStatus || body != coverBody {
+		t.Fatalf("bad HMAC response = (%d, %q), want decoy (%d, %q)", status, body, coverStatus, coverBody)
+	}
+
+	signed := newPost()
+	if err := fronting.SignRequest(signed, fronting.KeyFromSecret(frontSecret), time.Now()); err != nil {
+		t.Fatalf("sign request: %v", err)
+	}
+	if status, _ := do("initial signed request", signed); status != http.StatusOK {
+		t.Fatalf("initial signed request status = %d, want %d", status, http.StatusOK)
+	}
+
+	replayed := newPost()
+	replayed.Header = signed.Header.Clone()
+	if status, body := do("replayed HMAC", replayed); status != coverStatus || body != coverBody {
+		t.Fatalf("replayed HMAC response = (%d, %q), want decoy (%d, %q)", status, body, coverStatus, coverBody)
+	}
+}
+
+func TestCLIFrontingDefaultsToEnabled(t *testing.T) {
+	for _, command := range []string{"./cmd/tsunami-server", "./cmd/tsunami-client"} {
+		t.Run(command, func(t *testing.T) {
+			cmd := exec.Command("go", "run", command, "--help")
+			cmd.Dir = ".."
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("run %s --help: %v\n%s", command, err, out)
+			}
+			if !regexp.MustCompile(`(?s)-fronting\s+.*?\(default true\)`).Match(out) {
+				t.Fatalf("%s --help does not show --fronting enabled by default:\n%s", command, out)
+			}
+		})
 	}
 }
 

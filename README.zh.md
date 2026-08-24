@@ -165,20 +165,22 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
   --password "your-strong-password" \
   --fallback 127.0.0.1:8080
 
-# 自签名模式仅用于本地测试。公网部署应使用真实域名证书和 fronting。
+# fronting 默认启用。自签名模式仅用于本地测试；公网部署应使用真实域名证书和伪装源站。
 
-# 公网部署：真实域名证书 + fronting
+# 公网部署：真实域名证书 + 伪装源站
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fronting \
   --front-decoy-proxy http://127.0.0.1:8080
 
 # 使用 JSON 配置
 ./tsunami-server --config /etc/tsunami/config.json
 ```
+
+JSON 配置遵循同一安全默认值：省略 `server.fronting.enabled` 时会启用
+fronting。原始模式必须在 `server` 对象中显式启用：`"fronting": { "enabled": false }`。
 
 | 参数 | 默认值 | 描述 |
 |:-----|:--------|:------------|
@@ -186,10 +188,10 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 | `--cert` | — | TLS 证书文件（PEM） |
 | `--key` | — | TLS 私钥文件（PEM） |
 | `--password` | *（必填）* | 认证密码 |
-| `--fronting` | `false` | 将公网监听器作为 HTTPS/HTTP2/WebSocket 前置层 |
+| `--fronting` | `true` | 将公网监听器作为 HTTPS/HTTP2/WebSocket 前置层；仅在受控的原始模式网络中使用 `--fronting=false` |
 | `--front-decoy-proxy` | — | 未认证 fronting 请求的可选 HTTP(S) 伪装源站 |
 | `--fallback` | — | 回退 HTTP 后端 |
-| `--config` | — | JSON 配置文件 |
+| `--config` | — | JSON 配置文件；省略 `server.fronting.enabled` 时默认为 `true` |
 
 </details>
 
@@ -204,6 +206,9 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
   --http 127.0.0.1:8080
 ```
 
+HTTPS/HTTP2 fronting 默认启用。仅在连接受控的原始模式服务器时使用
+`--fronting=false`。
+
 | 参数 | 默认值 | 描述 |
 |:-----|:--------|:------------|
 | `--server` | *（必填）* | 服务器地址 `host:port` |
@@ -213,6 +218,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 | `--fingerprint` | `chrome` | `chrome` / `firefox` / `safari` / `random` / `none` |
 | `--socks` | `127.0.0.1:1080` | 本地 SOCKS5 代理地址 |
 | `--http` | `127.0.0.1:8080` | 本地 HTTP 代理地址 |
+| `--fronting` | `true` | 使用 HTTPS/HTTP2/WebSocket 前置传输；仅在受控的原始模式网络中使用 `--fronting=false` |
 | `--max-connections` | `4` | 最大 TLS 连接数（Surge） |
 | `--threshold` | `8` | Surge Layer 2 流阈值 |
 

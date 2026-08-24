@@ -38,7 +38,7 @@ func main() {
 		threshold      = flag.Int("threshold", 8, "Surge stream threshold for Layer 2")
 		fingerprint    = flag.String("fingerprint", "chrome", "TLS fingerprint: chrome, firefox, safari, random, none")
 		forceBBR       = flag.Bool("force-bbr", false, "Force per-connection TCP BBR on Linux")
-		useFronting    = flag.Bool("fronting", false, "Use HTTPS/HTTP2/WebSocket fronting transport")
+		useFronting    = flag.Bool("fronting", true, "Use HTTPS/HTTP2/WebSocket fronting transport")
 		frontPath      = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
 		frontHost      = flag.String("front-host", "", "Fronting Host header (defaults to SNI)")
 		frontSecret    = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")

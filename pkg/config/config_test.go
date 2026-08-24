@@ -131,6 +131,47 @@ func TestLoadFileDefaults(t *testing.T) {
 	t.Logf("✅ Config defaults test passed")
 }
 
+func TestFileConfigFrontingDefaultsToEnabledAndPreservesExplicitRawMode(t *testing.T) {
+	tests := []struct {
+		name           string
+		frontingConfig string
+		wantFronting   bool
+	}{
+		{
+			name:         "fronting block omitted",
+			wantFronting: true,
+		},
+		{
+			name:           "enabled omitted",
+			frontingConfig: `,"fronting":{"path":"/assets/update"}`,
+			wantFronting:   true,
+		},
+		{
+			name:           "explicit raw mode",
+			frontingConfig: `,"fronting":{"enabled":false}`,
+			wantFronting:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jsonContent := `{"server":{"users":[{"name":"default","password":"test-pass"}]` + tt.frontingConfig + `}}`
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(jsonContent), 0644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			fileConfig, err := LoadFile(path)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if got := fileConfig.ToServerConfig().Fronting.Enabled; got != tt.wantFronting {
+				t.Fatalf("runtime fronting enabled = %t, want %t", got, tt.wantFronting)
+			}
+		})
+	}
+}
+
 func TestLoadFilePanelUserFields(t *testing.T) {
 	tokenHash := sha256.Sum256([]byte("panel-token"))
 	jsonContent := `{

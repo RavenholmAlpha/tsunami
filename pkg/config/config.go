@@ -85,6 +85,7 @@ type ServerConfig struct {
 		Fallback string `json:"fallback" yaml:"fallback"`
 		Fronting struct {
 			Enabled      bool   `json:"enabled" yaml:"enabled"`
+			enabledSet   bool   // distinguishes an omitted field from an explicit false
 			Path         string `json:"path" yaml:"path"`
 			Secret       string `json:"secret" yaml:"secret"`
 			ServerHeader string `json:"server_header" yaml:"server-header"`
@@ -120,6 +121,15 @@ func LoadFile(path string) (*ServerConfig, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("config: parse JSON %s: %w", path, err)
 	}
+	var presence struct {
+		Server struct {
+			Fronting map[string]json.RawMessage `json:"fronting"`
+		} `json:"server"`
+	}
+	if err := json.Unmarshal(data, &presence); err != nil {
+		return nil, fmt.Errorf("config: parse JSON %s: %w", path, err)
+	}
+	_, cfg.Server.Fronting.enabledSet = presence.Server.Fronting["enabled"]
 
 	// Validate required fields
 	if len(cfg.Server.Users) == 0 && cfg.XBoard.BaseURL == "" {
@@ -184,6 +194,11 @@ func parseDuration(field, value string) (time.Duration, error) {
 
 // ToServerConfig converts the parsed config into a server.Config.
 func (c *ServerConfig) ToServerConfig() server.Config {
+	frontingEnabled := true
+	if c.Server.Fronting.enabledSet {
+		frontingEnabled = c.Server.Fronting.Enabled
+	}
+
 	cfg := server.Config{
 		Listen: c.Server.Listen,
 		TLS: transport.TLSConfig{
@@ -198,7 +213,7 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 		SurgeThreshold: c.Server.Surge.Threshold,
 		FallbackAddr:   c.Server.Fallback,
 		Fronting: fronting.Config{
-			Enabled:      c.Server.Fronting.Enabled,
+			Enabled:      frontingEnabled,
 			Path:         c.Server.Fronting.Path,
 			Secret:       c.Server.Fronting.Secret,
 			ServerHeader: c.Server.Fronting.ServerHeader,

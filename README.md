@@ -149,21 +149,24 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --password "your-strong-password" \
   --fallback 127.0.0.1:8080
 
-# Self-signed mode is for local testing only. Public deployments should use
-# fronting with a real domain certificate.
+# Fronting is enabled by default. Self-signed mode is for local testing only;
+# public deployments should use a real domain certificate and decoy origin.
 
-# Public deployment: real domain certificate + fronting
+# Public deployment: real domain certificate + decoy origin
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fronting \
   --front-decoy-proxy http://127.0.0.1:8080
 
 # With JSON config
 ./tsunami-server --config /etc/tsunami/config.json
 ```
+
+JSON configuration follows the same safe default: omitting
+`server.fronting.enabled` enables fronting. Raw mode requires an explicit
+opt-in inside the `server` object: `"fronting": { "enabled": false }`.
 
 | Flag | Default | Description |
 |:-----|:--------|:------------|
@@ -171,10 +174,10 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--cert` | — | TLS certificate file (PEM) |
 | `--key` | — | TLS private key file (PEM) |
 | `--password` | *(required)* | Authentication password |
-| `--fronting` | `false` | Serve the public listener as HTTPS/HTTP2/WebSocket fronting |
+| `--fronting` | `true` | Serve the public listener as HTTPS/HTTP2/WebSocket fronting; use `--fronting=false` only for controlled raw-mode networks |
 | `--front-decoy-proxy` | - | Optional HTTP(S) decoy origin for unauthenticated fronting requests |
 | `--fallback` | — | Fallback HTTP backend |
-| `--config` | — | JSON configuration file |
+| `--config` | — | JSON configuration file; omitted `server.fronting.enabled` defaults to `true` |
 
 </details>
 
@@ -189,6 +192,9 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --http 127.0.0.1:8080
 ```
 
+HTTPS/HTTP2 fronting is enabled by default. Use `--fronting=false` only when
+connecting to a controlled raw-mode server.
+
 | Flag | Default | Description |
 |:-----|:--------|:------------|
 | `--server` | *(required)* | Server address `host:port` |
@@ -198,6 +204,7 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--fingerprint` | `chrome` | `chrome` / `firefox` / `safari` / `random` / `none` |
 | `--socks` | `127.0.0.1:1080` | Local SOCKS5 proxy address |
 | `--http` | `127.0.0.1:8080` | Local HTTP proxy address |
+| `--fronting` | `true` | Use HTTPS/HTTP2/WebSocket fronting; use `--fronting=false` only for controlled raw-mode networks |
 | `--max-connections` | `4` | Max TLS connections (Surge) |
 | `--threshold` | `8` | Stream threshold for Surge Layer 2 |
 

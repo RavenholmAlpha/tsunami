@@ -33,7 +33,7 @@ func main() {
 		configPath     = flag.String("config", "", "JSON config file")
 		fallback       = flag.String("fallback", "", "Fallback backend address (e.g., 127.0.0.1:8080)")
 		forceBBR       = flag.Bool("force-bbr", false, "Force per-connection TCP BBR on Linux")
-		useFronting    = flag.Bool("fronting", false, "Serve a Caddy-like HTTPS/HTTP2/WebSocket front")
+		useFronting    = flag.Bool("fronting", true, "Serve a Caddy-like HTTPS/HTTP2/WebSocket front")
 		frontPath      = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
 		frontSecret    = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
 		frontSite      = flag.String("front-site-name", "Welcome", "Fronting decoy site name")
