@@ -7,6 +7,27 @@
 本フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に基づいており、
 本プロジェクトは [セマンティックバージョニング](https://semver.org/lang/ja/spec/v2.0.0.html) に準拠しています。
 
+## [未リリース]
+
+### 追加
+- **サイトカモフラージュ**：未認証の fronting リクエストを Caddy の `reverse_proxy` と同じ意味論で処理します。`local` はローカル HTTP エンドポイントへ（同一 IP で実サイトも稼働）、`remote` は他の Web サイトへ（コンテンツを借り、既定で Host を上流に書き換え）、`builtin` は生成ページを維持します。`fronting.site`（`mode`、`upstream`、`preserve_host`、`insecure_skip_verify`）または新しい `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` で設定します。旧 `decoy_proxy` キーと `--front-decoy-proxy` は非推奨の別名として残ります。
+- プロキシされたカモフラージュ応答は fronting の形を保ちます：fronting 認証ヘッダーを削除、`Server` を設定値に固定、`Alt-Svc` を削除（HTTP/3 は提供しない）、WebSocket アップグレードを通過、上流障害時はプロキシエラーを漏らさず 200 で内蔵ページにフォールバック。
+- インストーラーの `advanced` コマンド / `TSUNAMI_ADVANCED=1` で、クイックフローを煩雑にせず詳細プロンプト（listen、fallback、Surge、カスタム fronting 値、パディングスキーム）を利用可能に。
+
+### 変更
+- パディングをセッション単位ではなく**ストリーム単位**で適用するように変更。プロキシされる各ストリームが独自のパディングエポックを開始するため、長時間接続上の最初の 1 回だけでなく、新しい内側 TLS ハンドシェイク（クライアントの ClientHello、サーバーの証明書フライト）ごとにマスクされます。
+- パディングスキーム v2 で `stream_bytes`（ストリームごとのパディングバイト予算）、`ctl`（制御書き込み用ルール。セッションのライフタイム全体に適用）、方向別の `c<idx>`/`s<idx>` オーバーライド、および `~min-max` pad-to セグメント（分割せず、1 回の書き込みを自然なサイズの単一レコードにパディング）を追加。新しい既定スキームは ClientHello を 0.9–1.2 KiB、サーバーフライトを 2.6–4.2 KiB、制御フレームを 40–160 B にマスクします。
+- クライアントは `SETTINGS` フレームで `padding-v2=1` を通知し、サーバーはその能力を通知したクライアントにのみ v2 スキームテキストをプッシュします。そのためバージョン混在のセッションも動作します。
+- クライアントのセッションプールが恒久的なアイドル接続を保持しなくなりました。`MinIdleSession` の既定値は 0、アイドルセッションはランダム化されたタイムアウト後に閉じられ、アプリケーションのハートビートは 25–55 秒のランダム間隔でトラフィックがある間は送信されません（固定 15 秒の ping を廃止）。
+- インストーラーの堅牢化：既定の TLS モードは Let's Encrypt、自己署名は明示的な開発モードのオプトインが必要、ホスト名/SNI を検証、一意の fronting パス・独立した fronting secret・ドメイン由来のデコイサイト名を生成してサーバー設定とクライアントコマンドの両方に書き込み、ハードコードされたパディングスキームを削除してサーバー内蔵の既定値を使用。
+- 新しい `security` インストーラーコマンド（メニュー 9）でデプロイのセキュリティ自己診断を実行し、問題があれば非ゼロで終了。
+- インストーラーのクイックウィザード：新規の対話インストールは「ドメイン → TLS モード → サイトカモフラージュ」の 3 問と 1 回の「Press Enter to install」確認だけになりました。既存インストールでは保存済み設定の再利用を提案し、ローカル実サイトの上流は `ss`/`lsof` から自動検出し、その他（listen、Surge、fallback、fronting パス/secret、デコイサイト名）は自動生成されます。`security` はサイトカモフラージュのモードと上流も報告します。
+- README・デプロイ・パディングのドキュメントを新しいインストーラーフローとストリーム単位パディングに合わせて更新。
+
+### 修正
+- インストーラーが公開デプロイ向けに自己署名証明書・プレースホルダー SNI・`--skip-verify` 付きクライアントコマンドを暗黙に生成しなくなりました。
+- セッションの最初の 8 回の書き込みでパディングが止まり、以降のストリームの内側 TLS ハンドシェイクがマスクされない問題を修正。
+
 ## [1.2.1] - 2026-06-22
 
 ### 修正
@@ -66,6 +87,7 @@
 - クロスプラットフォームビルド（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 統合テストスイート（E2E、マルチストリーム、認証失敗、セッション再利用、大容量データ転送）
 
+[未リリース]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.1...HEAD
 [1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0

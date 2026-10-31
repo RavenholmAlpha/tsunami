@@ -70,7 +70,7 @@ Chrome / Firefox / Safari の ClientHello を模倣。JA3/JA4 を無効化。
 
 ### ワンクリックデプロイ
 
-任意の Linux サーバー（Ubuntu / Debian / CentOS / RHEL）で：
+任意の Linux サーバー（Ubuntu / Debian / CentOS / RHEL）で、対話型ターミナルからインストーラーを実行します：
 
 ```bash
 # wget
@@ -80,36 +80,63 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
-**非対話型 Let's Encrypt デプロイ：**
+ウィザードは短く、質問3つと確認1回だけです：
+
+1. **ドメイン** — このサーバーに解決される必要があります（デフォルトはマシンの FQDN）。
+2. **TLS モード** — `[1] Let's Encrypt（推奨）[2] 既存の証明書/秘密鍵ファイル [3] 自己署名（安全でない、テスト専用）`。
+3. **サイトカモフラージュ** — 未認証の訪問者に見える内容：
+
+| モード | 動作 | 使いどころ |
+|:--|:--|:--|
+| `local` | このサーバー上の実サイトへリバースプロキシ（デフォルト `http://127.0.0.1:8080`、ポート 80/8080/3000/8000 のリスナーを自動検出）。Host ヘッダーを保持 | 同じ IP で実サイトを運用している場合（推奨） |
+| `remote` | 別の Web サイトのコンテンツを借用（Host ヘッダーを上流に書き換え） | ローカルに実サイトがなく、上流サイトの規約と可用性を許容できる場合 |
+| `builtin` | 生成されたプレースホルダーページ（最も不自然で、クラスタリングされやすい） | 簡単なテスト専用 |
+
+その後 Enter を1回押すだけでインストールされます。その他はすべて自動です：`:443`、Surge デフォルト、ランダムパスワード、一意な fronting パス/シークレット、ドメインから導出したサイト名、サーバー内蔵のパディングスキーム。詳細パラメーター（リッスンアドレス/フォールバック/Surge/カスタム fronting パス/シークレット/サイト名/パディング）は `TSUNAMI_ADVANCED=1` または `sudo bash install.sh advanced` の場合のみ質問します。サーバー側の詳細は [Built-in Fronting](docs/fronting.md) を参照してください。
+
+非対話インストールでは TLS モードを明示する必要があります（サイトカモフラージュは `TSUNAMI_SITE_MODE` 未指定時に内蔵ページへ既定）。自己署名への暗黙のフォールバックは行いません。
+
+**非対話型 Let's Encrypt デプロイ（`example.com` は実際のドメインに置き換えてください）：**
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
-  TSUNAMI_PUBLIC_HOST=your-domain.com \
+  TSUNAMI_PUBLIC_HOST=example.com \
   TSUNAMI_LETSENCRYPT=y \
   TSUNAMI_ACME_EMAIL=you@example.com \
+  TSUNAMI_SITE_MODE=local \
+  TSUNAMI_SITE_UPSTREAM=http://127.0.0.1:8080 \
   sudo -E bash
 ```
 
-インストール後、スクリプトはすぐに使えるクライアントコマンドを表示します：
+**ローカルテスト専用（安全でない自己署名証明書）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
+  sudo env TSUNAMI_ASSUME_YES=1 TSUNAMI_TLS_MODE=self-signed TSUNAMI_DEV=1 \
+  TSUNAMI_PUBLIC_HOST=dev.tsunami.lan TSUNAMI_PASSWORD='change-this-password' bash
+```
+
+インストーラーはホスト名を検証し（IP や `example.com` などのプレースホルダーは拒否）、デプロイごとに一意な fronting パスと独立した fronting シークレットを生成し、サイト名をドメインから導出し、サイトカモフラージュブロック（`fronting.site.mode`/`upstream`/`preserve_host`）を書き込みます。インストール後、すぐに使えるクライアントコマンドを表示します：
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║           TSUNAMI  デプロイ完了 ✓                            ║
-╠══════════════════════════════════════════════════════════════╣
-║  サーバー : example.com:443                                  ║
-║  パスワード: xK9f2m...8kPq                                  ║
-║  TLS     : Let's Encrypt（自動更新）                         ║
-║  状態    : ● 稼働中                                          ║
-╠══════════════════════════════════════════════════════════════╣
-║  クライアントコマンド：                                       ║
-║  tsunami-client \                                           ║
-║    --server example.com:443 \                               ║
-║    --password '...' \                                       ║
-║    --sni example.com \                                      ║
-║    --socks 127.0.0.1:1080 \                                 ║
-║    --http 127.0.0.1:8080                                    ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║ TSUNAMI Deploy Complete                       ║
+║ Server       : example.com:443                ║
+║ Password     : xK9f2m...8kPq                  ║
+║ TLS          : Let's Encrypt (auto-renew)     ║
+║ Fronting     : enabled                        ║
+║ Front path   : /static/js/main.1a2b3c4d.js    ║
+║ Site         : local -> http://127.0.0.1:8080 ║
+║ Decoy site   : Example                        ║
+║ Status       : running                        ║
+║ Config       : /etc/tsunami/config.json       ║
+╚═══════════════════════════════════════════════╝
+
+Client command (copy-paste, also saved at /etc/tsunami/client-command.txt):
+tsunami-client --server example.com:443 --password '...' --sni example.com --fronting --front-path /static/js/main.1a2b3c4d.js --front-secret '...' --socks 127.0.0.1:1080 --http 127.0.0.1:8080
 ```
+
+`sudo tsunami-manage security` はデプロイを監査し、証明書の選択、SNI、fronting 設定、サイトカモフラージュのモードと上流、`--skip-verify` の使用、ファイル権限について PASS/WARN/FAIL を報告します。`builtin` サイトや上流のない `local` サイトは警告されます。
 
 ### サービス管理
 
@@ -123,10 +150,12 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 sudo tsunami-manage status       # サービス状態
 sudo tsunami-manage client       # 接続情報を表示
 sudo tsunami-manage update       # 最新版に更新
-sudo tsunami-manage config       # 再設定
+sudo tsunami-manage config       # 再設定（クイックウィザード、既存設定の再利用可）
+sudo tsunami-manage advanced     # 詳細プロンプトで再設定
 sudo tsunami-manage restart      # サービス再起動
 sudo tsunami-manage logs         # ログ追跡
 sudo tsunami-manage cert         # Let's Encrypt 証明書状態
+sudo tsunami-manage security     # デプロイのセキュリティ自己診断
 sudo tsunami-manage uninstall    # すべて削除
 ```
 
@@ -284,12 +313,26 @@ tsunami/
 |:---------|:--------|:------------|
 | `TSUNAMI_LISTEN` | `:443` | サーバーリッスンアドレス |
 | `TSUNAMI_PASSWORD` | *（自動生成）* | クライアントパスワード |
-| `TSUNAMI_PUBLIC_HOST` | *（プロンプト）* | サーバードメイン/パブリックホスト名 |
+| `TSUNAMI_PUBLIC_HOST` | *（プロンプト）* | 実際の公開ドメイン（IP やプレースホルダーは不可） |
+| `TSUNAMI_TLS_MODE` | `letsencrypt` | `letsencrypt`、`manual`、`self-signed` |
+| `TSUNAMI_DEV` | — | 非対話の自己署名モードでは `1` が必須 |
 | `TSUNAMI_CERT_FILE` | — | 手動 TLS 証明書パス |
 | `TSUNAMI_KEY_FILE` | — | 手動 TLS 秘密鍵パス |
 | `TSUNAMI_FALLBACK` | — | フォールバック HTTP バックエンドアドレス |
-| `TSUNAMI_LETSENCRYPT` | *（プロンプト）* | `y` で Let's Encrypt を自動承認 |
+| `TSUNAMI_LETSENCRYPT` | *（プロンプト）* | `y` で非対話的に Let's Encrypt を選択 |
 | `TSUNAMI_ACME_EMAIL` | — | Let's Encrypt 通知メール |
+| `TSUNAMI_FRONTING` | `1` | `0` で fronting を無効化（公開デプロイ非推奨） |
+| `TSUNAMI_FRONT_PATH` | *（自動生成）* | ビルドハッシュ付き fronting HTTP パス |
+| `TSUNAMI_FRONT_SECRET` | *（自動生成）* | 独立した fronting HMAC シークレット |
+| `TSUNAMI_SITE_NAME` | *（自動導出）* | サイト名（ドメインから導出） |
+| `TSUNAMI_SITE_MODE` | `builtin`（非対話） | サイトカモフラージュ：`local`、`remote`、`builtin` |
+| `TSUNAMI_SITE_UPSTREAM` | `local` は `http://127.0.0.1:8080` | `local`/`remote` の上流 HTTP(S) オリジン |
+| `TSUNAMI_SITE_PRESERVE_HOST` | `local` は `true` | 訪問者の `Host` ヘッダーを保持するか |
+| `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | HTTPS 上流の TLS 検証をスキップするか |
+| `TSUNAMI_DECOY_PROXY` | — | 旧エイリアス：`remote` + 上流にマップ |
+| `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | クライアントコマンドが使う TLS SNI |
+| `TSUNAMI_PADDING_SCHEME_JSON` | *（サーバーデフォルト）* | サーバーのデフォルトパディングスキームを上書き |
+| `TSUNAMI_ADVANCED` | — | `1` でウィザードに詳細プロンプトを表示 |
 | `TSUNAMI_VERSION` | `latest` | インストールするリリースバージョン（`v1.2.3`） |
 | `TSUNAMI_ASSUME_YES` | — | `1` ですべての対話プロンプトをスキップ |
 

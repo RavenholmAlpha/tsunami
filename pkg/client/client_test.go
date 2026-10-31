@@ -23,7 +23,7 @@ func TestApplyPaddingSchemeUpdateUpdatesClientAndWriter(t *testing.T) {
 	var out bytes.Buffer
 	writer := padding.NewWriter(&out, c.currentPaddingScheme())
 
-	schemeText := "stop=1\n0=50-50"
+	schemeText := "stop=2\nctl=~50-50\n0=~60-60\n1=~80-80"
 	expected, err := padding.Parse(schemeText)
 	if err != nil {
 		t.Fatalf("parse expected scheme: %v", err)
@@ -36,13 +36,36 @@ func TestApplyPaddingSchemeUpdateUpdatesClientAndWriter(t *testing.T) {
 		t.Fatalf("client scheme md5 = %s, want %s", got, expected.MD5())
 	}
 
+	// Control frames use the ctl rule (~50).
+	before := out.Len()
 	if err := writer.WriteFramesWithPadding([]*protocol.Frame{
 		protocol.NewFrame(protocol.CmdFIN, 1, nil),
 	}); err != nil {
-		t.Fatalf("write padded frame: %v", err)
+		t.Fatalf("write padded control frame: %v", err)
 	}
-	if out.Len() != 50 {
-		t.Fatalf("padded write length = %d, want 50", out.Len())
+	if got := out.Len() - before; got != 50 {
+		t.Fatalf("padded control write length = %d, want 50", got)
+	}
+
+	// The per-stream epoch starts at rule 0 (~60), then rule 1 (~80).
+	before = out.Len()
+	if err := writer.WriteFramesWithPadding([]*protocol.Frame{
+		protocol.NewFrame(protocol.CmdPSH, 3, make([]byte, 10)),
+	}); err != nil {
+		t.Fatalf("write padded stream frame: %v", err)
+	}
+	if got := out.Len() - before; got != 60 {
+		t.Fatalf("first stream write length = %d, want 60", got)
+	}
+
+	before = out.Len()
+	if err := writer.WriteFramesWithPadding([]*protocol.Frame{
+		protocol.NewFrame(protocol.CmdPSH, 3, make([]byte, 10)),
+	}); err != nil {
+		t.Fatalf("write second padded stream frame: %v", err)
+	}
+	if got := out.Len() - before; got != 80 {
+		t.Fatalf("second stream write length = %d, want 80", got)
 	}
 }
 
@@ -55,6 +78,22 @@ func TestApplyPaddingSchemeUpdateRejectsInvalidScheme(t *testing.T) {
 	}
 	if got := c.currentPaddingScheme().MD5(); got != original.MD5() {
 		t.Fatalf("client scheme changed after invalid update: got %s, want %s", got, original.MD5())
+	}
+}
+
+func TestAuthPaddingLengthRange(t *testing.T) {
+	// Auth padding is decoupled from the padding scheme rules and always stays
+	// inside the 24..88 byte range.
+	seen := make(map[int]struct{})
+	for i := 0; i < 2000; i++ {
+		n := authPaddingLen()
+		if n < authPaddingMin || n > authPaddingMax {
+			t.Fatalf("auth padding length = %d, want %d..%d", n, authPaddingMin, authPaddingMax)
+		}
+		seen[n] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("auth padding length is not randomized: only saw %v", seen)
 	}
 }
 

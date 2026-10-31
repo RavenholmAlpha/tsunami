@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -10,6 +11,7 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 		Client:         "http-client/1.0",
 		PaddingMD5:     "abcdef0123456789",
 		SurgeBandwidth: 100,
+		PaddingV2:      true,
 	}
 
 	data := EncodeClientSettings(original)
@@ -29,6 +31,28 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 	}
 	if decoded.SurgeBandwidth != original.SurgeBandwidth {
 		t.Errorf("surgeBandwidth = %d, want %d", decoded.SurgeBandwidth, original.SurgeBandwidth)
+	}
+	if !decoded.PaddingV2 {
+		t.Error("padding-v2 capability was not round-tripped")
+	}
+}
+
+// TestClientSettingsLegacyDecode ensures a pre-v2 client (no padding-v2 key)
+// decodes as not supporting the v2 scheme syntax. The server relies on this to
+// avoid pushing `~min-max` rules to old clients.
+func TestClientSettingsLegacyDecode(t *testing.T) {
+	data := []byte("v=3\nclient=http-client/1.0\npadding-md5=abcdef\nshaping=1\n")
+	decoded, err := DecodeClientSettings(data)
+	if err != nil {
+		t.Fatalf("decode legacy settings: %v", err)
+	}
+	if decoded.PaddingV2 {
+		t.Fatal("legacy settings must not advertise padding-v2")
+	}
+	// Encoding a client without the capability must omit the key so old
+	// servers keep ignoring the settings blob.
+	if bytes.Contains(EncodeClientSettings(decoded), []byte("padding-v2")) {
+		t.Fatal("padding-v2 key must be omitted when the capability is not set")
 	}
 }
 

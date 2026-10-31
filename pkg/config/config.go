@@ -37,9 +37,24 @@ import (
 //	      "threshold": 8
 //	    },
 //	    "fallback": "127.0.0.1:8080",
-//	    "padding_scheme": "stop=8\n0=30-30\n..."
+//	    "fronting": {
+//	      "enabled": true,
+//	      "path": "/assets/update",
+//	      "secret": "front-secret",
+//	      "site_name": "Example",
+//	      "site": {
+//	        "mode": "local",                  // builtin | local | remote
+//	        "upstream": "http://127.0.0.1:8080",
+//	        "preserve_host": true,            // optional; local=true, remote=false
+//	        "insecure_skip_verify": false     // optional; HTTPS upstream only
+//	      }
+//	    },
+//	    "padding_scheme": "stop=6\nstream_bytes=12288\nctl=~40-160\nc0=~80-200\nc1=~900-1200\ns0=~2600-4200\n..."
 //	  }
 //	}
+//
+// The deprecated "decoy_proxy": "http://127.0.0.1:8080" key is still accepted
+// as an alias for a site upstream and is migrated into the site block on load.
 type ServerConfig struct {
 	Server struct {
 		Listen string `json:"listen" yaml:"listen"`
@@ -90,7 +105,15 @@ type ServerConfig struct {
 			Secret       string `json:"secret" yaml:"secret"`
 			ServerHeader string `json:"server_header" yaml:"server-header"`
 			SiteName     string `json:"site_name" yaml:"site-name"`
-			DecoyProxy   string `json:"decoy_proxy" yaml:"decoy-proxy"`
+			// DecoyProxy is deprecated: configure Site.Upstream instead. It is
+			// still accepted for backward compatibility.
+			DecoyProxy string `json:"decoy_proxy" yaml:"decoy-proxy"`
+			Site       struct {
+				Mode               string `json:"mode" yaml:"mode"`
+				Upstream           string `json:"upstream" yaml:"upstream"`
+				PreserveHost       *bool  `json:"preserve_host" yaml:"preserve-host"`
+				InsecureSkipVerify bool   `json:"insecure_skip_verify" yaml:"insecure-skip-verify"`
+			} `json:"site" yaml:"site"`
 		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 		AllowAll      bool   `json:"allow_all" yaml:"allow-all"`
@@ -219,6 +242,12 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 			ServerHeader: c.Server.Fronting.ServerHeader,
 			SiteName:     c.Server.Fronting.SiteName,
 			DecoyProxy:   c.Server.Fronting.DecoyProxy,
+			Site: fronting.SiteConfig{
+				Mode:               fronting.SiteMode(c.Server.Fronting.Site.Mode),
+				Upstream:           c.Server.Fronting.Site.Upstream,
+				PreserveHost:       c.Server.Fronting.Site.PreserveHost,
+				InsecureSkipVerify: c.Server.Fronting.Site.InsecureSkipVerify,
+			},
 		},
 		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
 		AllowAll:      c.Server.AllowAll,

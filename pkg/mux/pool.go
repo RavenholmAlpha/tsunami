@@ -2,8 +2,11 @@
 package mux
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,22 +15,107 @@ import (
 )
 
 // PoolConfig configures the session pool behavior.
+//
+// The lifecycle knobs exist to keep the client from looking like a synthetic
+// beacon: a client that always keeps one TLS connection open, or that emits an
+// application heartbeat on a fixed period, is easy to distinguish from real
+// browsing traffic. Wherever the phase of an event would otherwise be
+// predictable it is randomized, and the pool is allowed to drain to zero
+// sessions so an idle client has no tunnel at all.
 type PoolConfig struct {
 	// MinIdleSession is the minimum number of idle sessions to keep alive.
+	// Default 0: when the user is idle the pool drains completely, so no TLS
+	// connection stays open 24/7 as a synthetic-traffic tell.
 	MinIdleSession int
-	// IdleCheckInterval is how often to check for idle sessions.
+	// IdleCheckInterval is how often to scan for idle sessions. Default 30s.
 	IdleCheckInterval time.Duration
-	// IdleTimeout is how long a session can be idle before being closed.
+	// IdleTimeout is how long a session may stay idle before being closed.
+	// The per-session deadline is scaled by a random factor in [0.7, 1.3) on
+	// every check, so a fleet of idle sessions does not disappear in lockstep
+	// on a fixed schedule. Default 5m.
 	IdleTimeout time.Duration
+	// HeartbeatMin is the minimum delay before the next application heartbeat,
+	// and also the minimum quiet period after any observed traffic. Default 25s.
+	HeartbeatMin time.Duration
+	// HeartbeatMax is the upper bound of the randomized heartbeat delay.
+	// The next ping is scheduled at lastActive + rand[HeartbeatMin, HeartbeatMax]
+	// so heartbeats never form a fixed period. Default 55s.
+	HeartbeatMax time.Duration
+	// HeartbeatTimeout is how long an outstanding heartbeat may stay unanswered
+	// before the session is declared dead and closed. Default 90s.
+	HeartbeatTimeout time.Duration
 }
 
 // DefaultPoolConfig returns sensible defaults.
+//
+// MinIdleSession is 0 (no permanent idle session) and the heartbeat schedule is
+// randomized rather than a fixed 15s period, because both a 24/7 idle TLS
+// tunnel and a machine-precise application heartbeat are synthetic-traffic
+// fingerprints.
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
-		MinIdleSession:    1,
+		MinIdleSession:    0,
 		IdleCheckInterval: 30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+		HeartbeatMin:      25 * time.Second,
+		HeartbeatMax:      55 * time.Second,
+		HeartbeatTimeout:  90 * time.Second,
 	}
+}
+
+// normalizeConfig fills zero or invalid fields from DefaultPoolConfig so
+// callers constructing a partial PoolConfig (or the zero value) still get sane
+// behavior.
+func normalizeConfig(cfg PoolConfig) PoolConfig {
+	def := DefaultPoolConfig()
+
+	if cfg.MinIdleSession < 0 {
+		cfg.MinIdleSession = 0
+	}
+	if cfg.IdleCheckInterval <= 0 {
+		cfg.IdleCheckInterval = def.IdleCheckInterval
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = def.IdleTimeout
+	}
+	if cfg.HeartbeatMin <= 0 {
+		cfg.HeartbeatMin = def.HeartbeatMin
+	}
+	if cfg.HeartbeatMax <= 0 {
+		cfg.HeartbeatMax = def.HeartbeatMax
+	}
+	if cfg.HeartbeatMax < cfg.HeartbeatMin {
+		cfg.HeartbeatMax = cfg.HeartbeatMin
+	}
+	if cfg.HeartbeatTimeout <= 0 {
+		cfg.HeartbeatTimeout = def.HeartbeatTimeout
+	}
+
+	return cfg
+}
+
+// heartbeatAction is the outcome of a keep-alive decision for one session.
+type heartbeatAction int
+
+const (
+	// heartbeatIdle means no action is needed for this session right now.
+	heartbeatIdle heartbeatAction = iota
+	// heartbeatSend means a CmdHeartRequest should be sent.
+	heartbeatSend
+	// heartbeatClose means the session is considered dead and should be closed.
+	heartbeatClose
+)
+
+// heartbeatState is the pool-side keep-alive bookkeeping for one session.
+// It is only accessed while holding Pool.mu.
+type heartbeatState struct {
+	// nextPing is the earliest time at which a heartbeat may be sent. It is
+	// anchored to the session's last activity plus a random delay so a client
+	// that is actively using the tunnel never appears to ping on a fixed clock.
+	nextPing time.Time
+	// awaitingSince is when the outstanding heartbeat was sent. It is the zero
+	// value when no pong is outstanding.
+	awaitingSince time.Time
 }
 
 // Pool manages a pool of reusable Sessions for connection multiplexing.
@@ -40,16 +128,27 @@ type Pool struct {
 	stopCh     chan struct{}
 	stopped    atomic.Bool
 
-	// Dial function to create new TLS connections
+	// heartbeatState holds the keep-alive state for each session; guarded by mu.
+	heartbeatState map[*protocol.Session]heartbeatState
+
+	// Jitter sources. They are unexported so tests can substitute deterministic
+	// functions; they are not expected to change while the pool is in use.
+	randDuration func(min, max time.Duration) time.Duration
+	randFloat64  func() float64
+
+	// Dial function to create new TLS connections.
 	dialFn func() (*protocol.Session, error)
 }
 
 // NewPool creates a new session pool.
 func NewPool(config PoolConfig, dialFn func() (*protocol.Session, error)) *Pool {
 	p := &Pool{
-		config: config,
-		dialFn: dialFn,
-		stopCh: make(chan struct{}),
+		config:         normalizeConfig(config),
+		dialFn:         dialFn,
+		stopCh:         make(chan struct{}),
+		heartbeatState: make(map[*protocol.Session]heartbeatState),
+		randDuration:   defaultRandDuration,
+		randFloat64:    rand.Float64,
 	}
 	go p.idleChecker()
 	go p.heartbeatLoop()
@@ -135,14 +234,29 @@ func (p *Pool) GetLeastLoadedSession() (*protocol.Session, error) {
 
 // createSession dials a new TLS connection and adds it to the pool.
 func (p *Pool) createSession() (*protocol.Session, error) {
+	if p.stopped.Load() {
+		return nil, fmt.Errorf("tsunami: session pool is closed")
+	}
+
 	session, err := p.dialFn()
 	if err != nil {
 		return nil, fmt.Errorf("tsunami: dial new session: %w", err)
 	}
 
 	p.mu.Lock()
+	if p.stopped.Load() {
+		p.mu.Unlock()
+		_ = session.Close()
+		return nil, fmt.Errorf("tsunami: session pool is closed")
+	}
 	p.sessions = append(p.sessions, session)
 	p.mu.Unlock()
+
+	// Start the idle clock for a session that has not carried a stream yet;
+	// protocol.Session only records IdleSince when the last stream closes.
+	if !session.IsClosed() && session.IsIdle() && session.IdleSince().IsZero() {
+		session.SetIdleSince(time.Now())
+	}
 
 	return session, nil
 }
@@ -158,9 +272,22 @@ func (p *Pool) CreateNewSession() (*protocol.Session, error) {
 
 // AddSession adds an externally created session to the pool.
 func (p *Pool) AddSession(s *protocol.Session) {
+	if s == nil {
+		return
+	}
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.stopped.Load() {
+		p.mu.Unlock()
+		_ = s.Close()
+		return
+	}
 	p.sessions = append(p.sessions, s)
+	p.mu.Unlock()
+
+	if !s.IsClosed() && s.IsIdle() && s.IdleSince().IsZero() {
+		s.SetIdleSince(time.Now())
+	}
 }
 
 // SessionCount returns the number of active (non-closed) sessions.
@@ -206,120 +333,272 @@ func (p *Pool) idleChecker() {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
+			if p.stopped.Load() {
+				return
+			}
 			p.cleanupIdle()
 		}
 	}
 }
 
-const (
-	heartbeatInterval = 15 * time.Second
-	heartbeatTimeout  = 30 * time.Second
-)
+// idleCloseDeadline returns IdleTimeout scaled by a random factor in [0.7, 1.3).
+// The jitter prevents idle sessions (and therefore connection teardown) from
+// happening on a predictable period, which would itself be a traffic pattern.
+func idleCloseDeadline(base time.Duration, randFloat func() float64) time.Duration {
+	factor := 0.7 + 0.6*randFloat() // [0.7, 1.3)
+	return time.Duration(float64(base) * factor)
+}
 
-// heartbeatLoop periodically sends heartbeats to all sessions and closes dead ones.
+// cleanupIdle removes sessions that have been idle too long.
+//
+// A session is closable once it has been idle longer than a randomized
+// IdleTimeout, but at least MinIdleSession idle sessions (0 by default) are
+// kept. The default of 0 means an idle client eventually has no open TLS
+// connection at all instead of a permanent tunnel.
+func (p *Pool) cleanupIdle() {
+	type idleCandidate struct {
+		session *protocol.Session
+		idleFor time.Duration
+	}
+
+	now := time.Now()
+
+	p.mu.Lock()
+
+	// First pass: drop already-closed sessions and their keep-alive state.
+	live := make([]*protocol.Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		if s.IsClosed() {
+			delete(p.heartbeatState, s)
+			continue
+		}
+		live = append(live, s)
+	}
+	p.sessions = live
+
+	idleCount := 0
+	candidates := make([]idleCandidate, 0, len(live))
+
+	for _, s := range live {
+		if !s.IsIdle() {
+			continue
+		}
+		idleCount++
+
+		idleSince := s.IdleSince()
+		if idleSince.IsZero() {
+			// Safety net: a session that never carried a stream has no idle
+			// timestamp. Start its idle clock now rather than keeping it
+			// forever (a permanent idle tunnel is exactly what we avoid).
+			s.SetIdleSince(now)
+			continue
+		}
+
+		idleFor := now.Sub(idleSince)
+		// Random deadline per session and per check: no shared cutoff.
+		if idleFor > idleCloseDeadline(p.config.IdleTimeout, p.randFloat64) {
+			candidates = append(candidates, idleCandidate{session: s, idleFor: idleFor})
+		}
+	}
+
+	closeable := idleCount - p.config.MinIdleSession
+	if closeable <= 0 || len(candidates) == 0 {
+		p.mu.Unlock()
+		return
+	}
+
+	// Close the longest-idle sessions first so the sessions we keep are the
+	// most recently used ones.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].idleFor > candidates[j].idleFor
+	})
+
+	closing := make(map[*protocol.Session]struct{}, len(candidates))
+	for _, c := range candidates {
+		if closeable <= 0 {
+			break
+		}
+		closing[c.session] = struct{}{}
+		delete(p.heartbeatState, c.session)
+		closeable--
+	}
+
+	remaining := make([]*protocol.Session, 0, len(live))
+	for _, s := range live {
+		if _, ok := closing[s]; ok {
+			continue
+		}
+		remaining = append(remaining, s)
+	}
+	p.sessions = remaining
+	p.mu.Unlock()
+
+	// Session.Close can write to the connection, so it must happen outside the
+	// pool lock.
+	for s := range closing {
+		log.Printf("tsunami: closing idle session %d (idle longer than %v)", s.Seq(), p.config.IdleTimeout)
+		_ = s.Close()
+	}
+}
+
+// heartbeatTickInterval returns the interval of the heartbeat scheduler tick.
+// It is deliberately shorter than the heartbeat period so jittered deadlines
+// are honored with reasonable precision, and capped at 5s.
+func heartbeatTickInterval(cfg PoolConfig) time.Duration {
+	interval := cfg.HeartbeatMax / 4
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	return interval
+}
+
+// defaultRandDuration returns a random duration in [min, max].
+func defaultRandDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int64N(int64(max-min)+1))
+}
+
+// scheduleNextPing anchors the next heartbeat to the session's last observed
+// activity: a client that is actively using the tunnel never emits an
+// application ping on a fixed schedule, and never within HeartbeatMin of real
+// traffic.
+func scheduleNextPing(lastActive, now time.Time, cfg PoolConfig, randDur func(min, max time.Duration) time.Duration) time.Time {
+	if lastActive.IsZero() || lastActive.After(now) {
+		lastActive = now
+	}
+	return lastActive.Add(randDur(cfg.HeartbeatMin, cfg.HeartbeatMax))
+}
+
+// heartbeatDecision computes what the pool should do with one session at the
+// given instant. It is pure: the caller owns locking and state persistence.
+func heartbeatDecision(now, lastActive, lastPong time.Time, st heartbeatState, cfg PoolConfig,
+	randDur func(min, max time.Duration) time.Duration) (heartbeatAction, heartbeatState) {
+
+	// A heartbeat is outstanding: either the pong arrived or the session is dead.
+	if !st.awaitingSince.IsZero() {
+		if lastPong.After(st.awaitingSince) {
+			st.awaitingSince = time.Time{}
+			st.nextPing = scheduleNextPing(lastActive, now, cfg, randDur)
+			return heartbeatIdle, st
+		}
+		if now.Sub(st.awaitingSince) > cfg.HeartbeatTimeout {
+			return heartbeatClose, st
+		}
+		return heartbeatIdle, st
+	}
+
+	if st.nextPing.IsZero() {
+		// First observation: anchor the schedule to the session's activity.
+		st.nextPing = scheduleNextPing(lastActive, now, cfg, randDur)
+		return heartbeatIdle, st
+	}
+
+	// Any traffic within the last HeartbeatMin pushes the ping out; this is
+	// what keeps the heartbeat from firing while the user is active.
+	if !lastActive.IsZero() && now.Sub(lastActive) < cfg.HeartbeatMin {
+		st.nextPing = lastActive.Add(randDur(cfg.HeartbeatMin, cfg.HeartbeatMax))
+		return heartbeatIdle, st
+	}
+
+	if now.Before(st.nextPing) {
+		return heartbeatIdle, st
+	}
+
+	st.awaitingSince = now
+	st.nextPing = now.Add(randDur(cfg.HeartbeatMin, cfg.HeartbeatMax))
+	return heartbeatSend, st
+}
+
+// heartbeatLoop runs the single keep-alive scheduler goroutine.
 func (p *Pool) heartbeatLoop() {
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(heartbeatTickInterval(p.config))
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-p.stopCh:
 			return
-		case <-ticker.C:
-			p.sendHeartbeats()
-			p.cleanupDead()
+		case now := <-ticker.C:
+			if p.stopped.Load() {
+				return
+			}
+			p.runHeartbeat(now)
 		}
 	}
 }
 
-// sendHeartbeats sends a heartbeat ping to all active sessions.
-func (p *Pool) sendHeartbeats() {
+// runHeartbeat advances the keep-alive state of every session, then performs
+// the resulting sends and closes outside the pool lock.
+func (p *Pool) runHeartbeat(now time.Time) {
+	var sends, closes []*protocol.Session
+
 	p.mu.Lock()
-	snapshot := make([]*protocol.Session, 0, len(p.sessions))
+
+	kept := make([]*protocol.Session, 0, len(p.sessions))
 	for _, s := range p.sessions {
-		if !s.IsClosed() {
-			snapshot = append(snapshot, s)
+		if s.IsClosed() {
+			delete(p.heartbeatState, s)
+			continue
+		}
+
+		st := p.heartbeatState[s]
+		action, next := heartbeatDecision(now, s.LastActive(), s.LastPong(), st, p.config, p.randDuration)
+		switch action {
+		case heartbeatSend:
+			sends = append(sends, s)
+			p.heartbeatState[s] = next
+			kept = append(kept, s)
+		case heartbeatClose:
+			closes = append(closes, s)
+			delete(p.heartbeatState, s)
+		default:
+			p.heartbeatState[s] = next
+			kept = append(kept, s)
 		}
 	}
+
+	// Drop keep-alive state for sessions that are no longer in the pool.
+	if len(p.heartbeatState) > 0 {
+		live := make(map[*protocol.Session]struct{}, len(kept))
+		for _, s := range kept {
+			live[s] = struct{}{}
+		}
+		for s := range p.heartbeatState {
+			if _, ok := live[s]; !ok {
+				delete(p.heartbeatState, s)
+			}
+		}
+	}
+	p.sessions = kept
 	p.mu.Unlock()
 
-	for _, s := range snapshot {
-		if err := s.SendHeartbeat(); err != nil {
+	// Session writes/closes can block on the connection: never hold the pool
+	// mutex while doing them.
+	for _, s := range sends {
+		if err := s.SendHeartbeat(); err != nil && !errors.Is(err, protocol.ErrSessionClosed) {
 			log.Printf("tsunami: heartbeat send failed session=%d: %v", s.Seq(), err)
 		}
 	}
-}
-
-// cleanupDead closes sessions that have not responded to heartbeats within the timeout.
-func (p *Pool) cleanupDead() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	remaining := make([]*protocol.Session, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		if s.IsClosed() {
-			continue
-		}
-		if !s.IsAlive(heartbeatTimeout) {
-			log.Printf("tsunami: closing dead session %d (no heartbeat response for %v)", s.Seq(), heartbeatTimeout)
-			s.Close()
-			continue
-		}
-		remaining = append(remaining, s)
+	for _, s := range closes {
+		log.Printf("tsunami: closing unresponsive session %d (no heartbeat response within %v)", s.Seq(), p.config.HeartbeatTimeout)
+		_ = s.Close()
 	}
-	p.sessions = remaining
-}
-
-// cleanupIdle removes sessions that have been idle too long.
-func (p *Pool) cleanupIdle() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	now := time.Now()
-	idleCount := 0
-
-	// First pass: count idle sessions
-	for _, s := range p.sessions {
-		if !s.IsClosed() && s.IsIdle() {
-			idleCount++
-		}
-	}
-
-	// Second pass: close old idle sessions (keep minIdleSession alive)
-	remaining := make([]*protocol.Session, 0, len(p.sessions))
-	closeable := idleCount - p.config.MinIdleSession
-
-	for _, s := range p.sessions {
-		if s.IsClosed() {
-			continue // skip already closed
-		}
-
-		if s.IsIdle() && closeable > 0 {
-			idleSince := s.IdleSince()
-			if !idleSince.IsZero() && now.Sub(idleSince) > p.config.IdleTimeout {
-				s.Close()
-				closeable--
-				continue
-			}
-		}
-
-		remaining = append(remaining, s)
-	}
-
-	p.sessions = remaining
 }
 
 // CloseIdleSessions closes sessions idle longer than the given duration,
 // keeping at least minKeep sessions alive. Used by Surge controller for
 // proactive downgrade.
 func (p *Pool) CloseIdleSessions(idleDuration time.Duration, minKeep int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	now := time.Now()
-	activeCount := 0
 
-	// Count non-closed sessions
+	p.mu.Lock()
+
+	activeCount := 0
 	for _, s := range p.sessions {
 		if !s.IsClosed() {
 			activeCount++
@@ -327,40 +606,46 @@ func (p *Pool) CloseIdleSessions(idleDuration time.Duration, minKeep int) {
 	}
 
 	remaining := make([]*protocol.Session, 0, len(p.sessions))
+	closing := make([]*protocol.Session, 0)
 	for _, s := range p.sessions {
 		if s.IsClosed() {
+			delete(p.heartbeatState, s)
 			continue
 		}
-
-		// Close idle sessions if we have more than minKeep
 		if s.IsIdle() && activeCount > minKeep {
 			idleSince := s.IdleSince()
 			if !idleSince.IsZero() && now.Sub(idleSince) > idleDuration {
-				s.Close()
+				closing = append(closing, s)
+				delete(p.heartbeatState, s)
 				activeCount--
 				continue
 			}
 		}
-
 		remaining = append(remaining, s)
 	}
-
 	p.sessions = remaining
+	p.mu.Unlock()
+
+	for _, s := range closing {
+		_ = s.Close()
+	}
 }
 
-// Close closes all sessions in the pool and stops the idle checker.
+// Close closes all sessions in the pool, clears the keep-alive state and stops
+// the background goroutines. It is safe to call more than once.
 func (p *Pool) Close() {
-	if p.stopped.Load() {
+	if !p.stopped.CompareAndSwap(false, true) {
 		return
 	}
-	p.stopped.Store(true)
 	close(p.stopCh)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, s := range p.sessions {
-		s.Close()
-	}
+	sessions := p.sessions
 	p.sessions = nil
+	p.heartbeatState = make(map[*protocol.Session]heartbeatState)
+	p.mu.Unlock()
+
+	for _, s := range sessions {
+		_ = s.Close()
+	}
 }

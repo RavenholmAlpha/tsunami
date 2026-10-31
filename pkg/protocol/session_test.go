@@ -102,3 +102,97 @@ func TestStreamWriteBatchesPaddingFrames(t *testing.T) {
 		t.Fatalf("batched frame count = %d, want 2", frameCount)
 	}
 }
+
+func TestSessionOnStreamClosedHook(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	stream := newStream(7, session)
+	session.streams[stream.id] = stream
+
+	closed := make(chan uint32, 1)
+	session.SetOnStreamClosed(func(id uint32) {
+		closed <- id
+	})
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+
+	select {
+	case id := <-closed:
+		if id != 7 {
+			t.Fatalf("closed stream id = %d, want 7", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("onStreamClosed was not called for a locally closed stream")
+	}
+	if got := session.ActiveStreamCount(); got != 0 {
+		t.Fatalf("active streams = %d, want 0", got)
+	}
+}
+
+func TestSessionOnStreamClosedHookOnRemoteFIN(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	stream := newStream(9, session)
+	session.streams[9] = stream
+
+	closed := make(chan uint32, 1)
+	session.SetOnStreamClosed(func(id uint32) {
+		closed <- id
+	})
+
+	if err := session.handleFrame(NewFrame(CmdFIN, 9, nil)); err != nil {
+		t.Fatalf("handle FIN: %v", err)
+	}
+
+	select {
+	case id := <-closed:
+		if id != 9 {
+			t.Fatalf("closed stream id = %d, want 9", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("onStreamClosed was not called for a remote FIN")
+	}
+	if got := session.ActiveStreamCount(); got != 0 {
+		t.Fatalf("active streams = %d, want 0", got)
+	}
+}
+
+func TestSessionOnStreamClosedHookRunsOutsideStreamLock(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	stream := newStream(3, session)
+	session.streams[3] = stream
+
+	done := make(chan struct{})
+	session.SetOnStreamClosed(func(id uint32) {
+		// These callbacks take streamMu; they would deadlock if the hook ran
+		// while removeStream still held the lock.
+		if count := session.ActiveStreamCount(); count != 0 {
+			t.Errorf("active streams inside callback = %d, want 0", count)
+		}
+		session.IsIdle()
+		close(done)
+	})
+
+	go func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("close stream: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onStreamClosed callback deadlocked on streamMu")
+	}
+}
+
+func TestSessionWithoutOnStreamClosedHook(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	stream := newStream(5, session)
+	session.streams[5] = stream
+
+	// No hook set: closing must not panic.
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+}

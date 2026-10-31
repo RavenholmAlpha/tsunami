@@ -94,7 +94,7 @@ type Server struct {
 	scheme     *padding.Scheme
 	listener   net.Listener
 	httpSrv    *http.Server
-	decoy      *httputil.ReverseProxy
+	site       http.Handler
 	traffic    control.TrafficPolicy
 	frontKeys  [][32]byte
 	nonceCache *fronting.NonceCache
@@ -137,11 +137,14 @@ func New(config Config) (*Server, error) {
 	}
 
 	config.Fronting.Normalize()
+	if err := config.Fronting.SiteError(); err != nil {
+		return nil, fmt.Errorf("tsunami fronting: site camouflage: %w", err)
+	}
 	frontKeys, err := buildFrontingKeys(config)
 	if err != nil {
 		return nil, err
 	}
-	decoyProxy, err := buildFrontingDecoyProxy(config.Fronting.DecoyProxy, config.Fronting.ServerHeader)
+	siteHandler, err := newFrontingSiteHandler(config.Fronting)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +174,7 @@ func New(config Config) (*Server, error) {
 		auth:        auth,
 		fallback:    fb,
 		scheme:      scheme,
-		decoy:       decoyProxy,
+		site:        siteHandler,
 		traffic:     config.Traffic,
 		frontKeys:   frontKeys,
 		nonceCache:  fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
@@ -393,10 +396,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	})
 
 	// Wire padding system into session write path
-	pw := padding.NewWriter(conn, s.scheme)
-	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
-		return pw.WriteFramesWithPadding(frames)
-	})
+	pw := padding.NewWriterForRole(conn, s.scheme, padding.RoleServer)
+	bindServerPadding(session, pw)
 
 	// Determine if shaping should be activated (both sides must agree)
 	shapingEnabled := s.config.Shaping != nil && clientSettings != nil && clientSettings.Shaping
@@ -419,15 +420,21 @@ func (s *Server) handleConn(conn net.Conn) {
 	if shapingEnabled {
 		shaped := shaping.Wrap(conn, *s.config.Shaping)
 		session.ReplaceConn(shaped)
-		pw = padding.NewWriter(shaped, s.scheme)
-		session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
-			return pw.WriteFramesWithPadding(frames)
-		})
+		pw = padding.NewWriterForRole(shaped, s.scheme, padding.RoleServer)
+		bindServerPadding(session, pw)
 		log.Printf("tsunami server: traffic shaping enabled for user '%s'", user.Name)
 	}
 
-	// Push padding scheme if client's version differs
-	if clientSettings != nil && clientSettings.PaddingMD5 != "" && clientSettings.PaddingMD5 != s.scheme.MD5() {
+	// Push the padding scheme when the client's version differs. Clients that
+	// do not advertise padding-v2 support cannot parse the v2 syntax (`~`
+	// pad-to segments, ctl/stream_bytes/c<n>/s<n> keys) and would fail the
+	// scheme update and close the session, so they are never pushed it. The
+	// tunnel stays functional either way: padding only adds cmdWaste frames,
+	// which the peer discards regardless of which scheme it runs.
+	if clientSettings != nil && !clientSettings.PaddingV2 && clientSettings.PaddingMD5 != "" && clientSettings.PaddingMD5 != s.scheme.MD5() {
+		log.Printf("tsunami server: client predates padding-v2; not pushing scheme (client md5=%s, server md5=%s)",
+			clientSettings.PaddingMD5, s.scheme.MD5())
+	} else if clientSettings != nil && clientSettings.PaddingMD5 != "" && clientSettings.PaddingMD5 != s.scheme.MD5() {
 		log.Printf("tsunami server: pushing updated padding scheme to client (client md5=%s, server md5=%s)",
 			clientSettings.PaddingMD5, s.scheme.MD5())
 		schemeData := []byte(s.scheme.Encode())
@@ -457,6 +464,19 @@ func (s *Server) handleConn(conn net.Conn) {
 	if err := session.RunEventLoop(); err != nil {
 		log.Printf("tsunami server: session error for user '%s': %v", user.Name, err)
 	}
+}
+
+// bindServerPadding wires a padding writer into a session: frame writes go
+// through the writer and closed streams drop their per-stream padding state.
+// The writer is passed as a parameter (not captured from a variable) so that
+// re-wrapping the connection later only rebinds the current writer.
+func bindServerPadding(session *protocol.Session, pw *padding.Writer) {
+	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+		return pw.WriteFramesWithPadding(frames)
+	})
+	session.SetOnStreamClosed(func(id uint32) {
+		pw.ForgetStream(id)
+	})
 }
 
 func (s *Server) startLeaseRenewal(session *protocol.Session, user *protocol.UserInfo, lease control.SessionLease) func() {
@@ -688,10 +708,12 @@ func (s *Server) doFallback(conn net.Conn, reason string, preReadData []byte, ca
 
 func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 	cfg := s.config.Fronting
-	cfg.Normalize()
 
 	w.Header().Set("Server", cfg.ServerHeader)
 
+	// The authenticated tunnel always wins: only requests that fail the
+	// fronting HMAC (or use an unsupported method/protocol) reach the site
+	// handler below.
 	if r.URL.Path == cfg.Path && fronting.VerifyRequest(r, s.frontKeys, time.Now(), fronting.ClockSkew, s.nonceCache) {
 		switch {
 		case r.Method == http.MethodPost:
@@ -708,12 +730,12 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 	// based on time-to-first-byte.
 	time.Sleep(fronting.AuthJitter())
 
-	s.serveFrontingDecoy(w, r)
+	s.site.ServeHTTP(w, r)
 }
 
 func (s *Server) handleFrontingHTTP2(w http.ResponseWriter, r *http.Request) {
 	if r.ProtoMajor < 2 {
-		s.serveFrontingDecoy(w, r)
+		s.site.ServeHTTP(w, r)
 		return
 	}
 
@@ -732,20 +754,194 @@ func (s *Server) handleFrontingWebSocket(w http.ResponseWriter, r *http.Request)
 	conn, err := fronting.UpgradeServer(w, r, s.config.Fronting.ServerHeader)
 	if err != nil {
 		log.Printf("tsunami fronting: websocket upgrade failed remote=%s err=%v", r.RemoteAddr, err)
-		s.serveFrontingDecoy(w, r)
+		s.site.ServeHTTP(w, r)
 		return
 	}
 	s.handleConn(conn)
 }
 
-func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
-	if s.decoy != nil {
-		s.decoy.ServeHTTP(w, r)
+// Fronting site proxy constants. They mirror Caddy's reverse_proxy defaults
+// closely enough for a camouflage layer while bounding how long a probe can
+// be held open by a broken upstream.
+const (
+	frontingSiteDialTimeout           = 5 * time.Second
+	frontingSiteTLSHandshakeTimeout   = 5 * time.Second
+	frontingSiteResponseHeaderTimeout = 10 * time.Second
+	frontingSiteIdleConnTimeout       = 90 * time.Second
+	frontingSiteMaxIdlePerHost        = 16
+	frontingSiteKeepAlive             = 30 * time.Second
+)
+
+// frontingSiteHandler answers unauthenticated fronting traffic with either the
+// built-in decoy page or a Caddy-like reverse proxy to the configured local or
+// remote upstream.
+type frontingSiteHandler struct {
+	builtin   http.Handler
+	proxy     *httputil.ReverseProxy
+	transport *http.Transport
+}
+
+// ServeHTTP dispatches to the reverse proxy when one is configured.
+func (h *frontingSiteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.proxy != nil {
+		// The fronting entry point already set the Server header for the
+		// tunnel path. httputil.ReverseProxy *copies* upstream headers with
+		// Header.Add, so leaving the pre-set value in place would emit two
+		// Server header lines on proxied responses (Caddy emits one). The
+		// proxy's ModifyResponse sets the single authoritative value.
+		w.Header().Del("Server")
+		h.proxy.ServeHTTP(w, r)
 		return
 	}
+	h.builtin.ServeHTTP(w, r)
+}
 
-	cfg := s.config.Fronting
+// CloseIdleConnections releases idle upstream connections held by the site
+// proxy transport.
+func (h *frontingSiteHandler) CloseIdleConnections() {
+	if h.transport != nil {
+		h.transport.CloseIdleConnections()
+	}
+}
+
+// newFrontingSiteHandler builds the handler for unauthenticated fronting
+// requests: the built-in decoy page (builtin mode) or an httputil.ReverseProxy
+// with Caddy reverse_proxy semantics for local and remote upstreams.
+//
+// The upstream is always operator-configured, never derived from the request,
+// so the proxy does not introduce an SSRF surface.
+func newFrontingSiteHandler(cfg fronting.Config) (http.Handler, error) {
 	cfg.Normalize()
+	if err := cfg.SiteError(); err != nil {
+		return nil, fmt.Errorf("tsunami fronting: site camouflage: %w", err)
+	}
+	handler := &frontingSiteHandler{}
+	handler.builtin = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveBuiltinDecoy(w, r, cfg)
+	})
+	if cfg.Site.Mode != fronting.SiteModeLocal && cfg.Site.Mode != fronting.SiteModeRemote {
+		return handler, nil
+	}
+
+	upstream := cfg.Site.UpstreamURL()
+	if upstream == nil {
+		return nil, fmt.Errorf("tsunami fronting: site mode %q has no upstream", cfg.Site.Mode)
+	}
+	serverHeader := cfg.ServerHeader
+	preserveHost := cfg.Site.PreserveHostEnabled()
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   frontingSiteDialTimeout,
+			KeepAlive: frontingSiteKeepAlive,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   frontingSiteMaxIdlePerHost,
+		IdleConnTimeout:       frontingSiteIdleConnTimeout,
+		TLSHandshakeTimeout:   frontingSiteTLSHandshakeTimeout,
+		ResponseHeaderTimeout: frontingSiteResponseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: cfg.Site.InsecureSkipVerify,
+			MinVersion:         tls.VersionTLS12,
+		},
+	}
+
+	handler.transport = transport
+	handler.proxy = &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			clientHost := req.Host
+			forwardedProto := "http"
+			if req.TLS != nil {
+				forwardedProto = "https"
+			}
+
+			// Caddy sets the forwarding headers itself and ignores inbound
+			// values from untrusted peers, so drop them before ReverseProxy
+			// appends the real client address to X-Forwarded-For.
+			req.Header.Del("X-Forwarded-For")
+			joinSiteUpstreamURL(req.URL, upstream)
+			if !preserveHost {
+				req.Host = upstream.Host
+			}
+			req.Header.Set("X-Forwarded-Proto", forwardedProto)
+			if clientHost != "" {
+				req.Header.Set("X-Forwarded-Host", clientHost)
+			}
+			// Never forward our internal fronting auth metadata.
+			fronting.StripAuthHeaders(req.Header)
+		},
+		Transport:     transport,
+		FlushInterval: -1,
+		ModifyResponse: func(resp *http.Response) error {
+			if serverHeader != "" {
+				resp.Header.Set("Server", serverHeader)
+			}
+			// We do not serve HTTP/3, so advertising h3 via Alt-Svc would be a
+			// fingerprint (and would send probes to a dead endpoint).
+			resp.Header.Del("Alt-Svc")
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("tsunami fronting: site proxy error remote=%s upstream=%s path=%s err=%v",
+				r.RemoteAddr, upstream.Redacted(), r.URL.Path, err)
+			// An unreachable upstream must look like the built-in site, never
+			// like a proxy or an internal wiring failure.
+			time.Sleep(fronting.AuthJitter())
+			writeBuiltinDecoyPage(w, r, cfg, http.StatusOK)
+		},
+	}
+	return handler, nil
+}
+
+// joinSiteUpstreamURL rewrites reqURL to target, joining paths and queries with
+// the same rules as httputil.NewSingleHostReverseProxy. Trailing slashes were
+// already trimmed from the upstream during fronting.Config normalization.
+func joinSiteUpstreamURL(reqURL, upstream *url.URL) {
+	reqURL.Scheme = upstream.Scheme
+	reqURL.Host = upstream.Host
+	reqURL.Path, reqURL.RawPath = joinURLPath(upstream, reqURL)
+	if upstream.RawQuery == "" || reqURL.RawQuery == "" {
+		reqURL.RawQuery = upstream.RawQuery + reqURL.RawQuery
+	} else {
+		reqURL.RawQuery = upstream.RawQuery + "&" + reqURL.RawQuery
+	}
+}
+
+// joinURLPath mirrors net/http/httputil.joinURLPath.
+func joinURLPath(a, b *url.URL) (path, rawpath string) {
+	if a.RawPath == "" && b.RawPath == "" {
+		return singleJoiningSlash(a.Path, b.Path), ""
+	}
+	apath := a.EscapedPath()
+	bpath := b.EscapedPath()
+	aslash := strings.HasSuffix(apath, "/")
+	bslash := strings.HasPrefix(bpath, "/")
+	switch {
+	case aslash && bslash:
+		return a.Path + b.Path[1:], apath + bpath[1:]
+	case !aslash && !bslash:
+		return a.Path + "/" + b.Path, apath + "/" + bpath
+	}
+	return a.Path + b.Path, apath + bpath
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
+}
+
+// serveBuiltinDecoy serves the generated decoy website for the builtin site
+// mode. It is intentionally minimal: a landing page, robots.txt and favicon,
+// with ordinary 404s for everything else.
+func serveBuiltinDecoy(w http.ResponseWriter, r *http.Request, cfg fronting.Config) {
 	w.Header().Set("Server", cfg.ServerHeader)
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -755,28 +951,7 @@ func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
 
 	switch r.URL.Path {
 	case "/", "/index.html":
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "public, max-age=300")
-		body := fmt.Sprintf(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%s</title>
-</head>
-<body>
-<main>
-<h1>%s</h1>
-<p>The site is running.</p>
-</main>
-</body>
-</html>
-`, cfg.SiteName, cfg.SiteName)
-		if r.Method == http.MethodHead {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		_, _ = io.WriteString(w, body)
+		writeBuiltinDecoyPage(w, r, cfg, http.StatusOK)
 	case "/robots.txt":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if r.Method == http.MethodHead {
@@ -791,45 +966,34 @@ func (s *Server) serveFrontingDecoy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func buildFrontingDecoyProxy(rawOrigin, serverHeader string) (*httputil.ReverseProxy, error) {
-	rawOrigin = strings.TrimSpace(rawOrigin)
-	if rawOrigin == "" {
-		return nil, nil
+// writeBuiltinDecoyPage renders the generated decoy landing page with the given
+// status code. It is also the site proxy's upstream-failure fallback, so proxy
+// failures never surface as 502s or internal errors.
+func writeBuiltinDecoyPage(w http.ResponseWriter, r *http.Request, cfg fronting.Config, status int) {
+	w.Header().Set("Server", cfg.ServerHeader)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	body := fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+</head>
+<body>
+<main>
+<h1>%s</h1>
+<p>The site is running.</p>
+</main>
+</body>
+</html>
+`, cfg.SiteName, cfg.SiteName)
+	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
+		return
 	}
-	if !strings.Contains(rawOrigin, "://") {
-		rawOrigin = "http://" + rawOrigin
-	}
-	origin, err := url.Parse(rawOrigin)
-	if err != nil {
-		return nil, fmt.Errorf("tsunami fronting: parse decoy proxy %q: %w", rawOrigin, err)
-	}
-	if origin.Scheme != "http" && origin.Scheme != "https" {
-		return nil, fmt.Errorf("tsunami fronting: decoy proxy must use http or https, got %q", origin.Scheme)
-	}
-	if origin.Host == "" {
-		return nil, fmt.Errorf("tsunami fronting: decoy proxy %q has no host", rawOrigin)
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(origin)
-	director := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		director(req)
-		fronting.StripAuthHeaders(req.Header)
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		if serverHeader != "" {
-			resp.Header.Set("Server", serverHeader)
-		}
-		return nil
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("tsunami fronting: decoy proxy error remote=%s origin=%s err=%v", r.RemoteAddr, origin.Redacted(), err)
-		if serverHeader != "" {
-			w.Header().Set("Server", serverHeader)
-		}
-		http.NotFound(w, r)
-	}
-	return proxy, nil
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
 }
 
 func buildFrontingKeys(config Config) ([][32]byte, error) {
@@ -913,6 +1077,9 @@ func (s *Server) Close() error {
 	}
 	if err := s.closeConnections(); err != nil {
 		errs = append(errs, err)
+	}
+	if closer, ok := s.site.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
 	}
 	return errors.Join(errs...)
 }

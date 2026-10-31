@@ -13,6 +13,11 @@ type ClientSettings struct {
 	PaddingMD5     string
 	SurgeBandwidth int // Mbps, 0 = disabled
 	Shaping        bool
+	// PaddingV2 reports that the client can parse the v2 padding scheme syntax
+	// (`~min-max` pad-to segments, `ctl`, `stream_bytes`, directional rules).
+	// The server must not push v2 scheme text to clients that do not advertise
+	// it: pre-v2 clients reject the pushed text and close the session.
+	PaddingV2 bool
 }
 
 // EncodeClientSettings serializes client settings to the wire format.
@@ -28,6 +33,9 @@ func EncodeClientSettings(s *ClientSettings) []byte {
 	}
 	if s.Shaping {
 		fmt.Fprintf(&b, "shaping=1\n")
+	}
+	if s.PaddingV2 {
+		fmt.Fprintf(&b, "padding-v2=1\n")
 	}
 	return []byte(b.String())
 }
@@ -61,6 +69,8 @@ func DecodeClientSettings(data []byte) (*ClientSettings, error) {
 			s.SurgeBandwidth = bw
 		case "shaping":
 			s.Shaping = val == "1"
+		case "padding-v2":
+			s.PaddingV2 = val == "1"
 		}
 	}
 	return s, nil

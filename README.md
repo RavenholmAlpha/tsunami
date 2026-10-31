@@ -70,7 +70,8 @@ Pure Go + `golang.org/x` + uTLS. Single static binary, cross-compiles everywhere
 
 ### One-Click Deploy
 
-On any Linux server (Ubuntu / Debian / CentOS / RHEL):
+On any Linux server (Ubuntu / Debian / CentOS / RHEL), run the installer from an
+interactive terminal:
 
 ```bash
 # wget
@@ -80,36 +81,78 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
-**Non-interactive with Let's Encrypt:**
+The wizard is short — three questions and one confirmation:
+
+1. **Domain** — must resolve to this server (the machine FQDN is the default).
+2. **TLS mode** — `[1] Let's Encrypt (recommended) [2] existing certificate/key
+   files [3] self-signed (INSECURE, testing only)`.
+3. **Site camouflage** — what unauthenticated visitors see:
+
+| Mode | Behaviour | Use when |
+|:--|:--|:--|
+| `local` | Reverse-proxies to a real site on this server (default `http://127.0.0.1:8080`, auto-detected listeners on ports 80/8080/3000/8000); Host header preserved | You run a real website on the same IP (recommended) |
+| `remote` | Borrows another website's content (Host header rewritten to the upstream) | You do not run a real site locally and accept the origin's terms/availability |
+| `builtin` | Generated placeholder page (least realistic, easiest to cluster) | Quick tests only |
+
+Then press Enter once to install. Everything else is automatic: `:443`, Surge
+defaults, random password, unique fronting path/secret, derived site name, and
+the server's built-in padding scheme. Advanced knobs (listen/fallback/surge/
+custom front path/secret/site name/padding) are only asked with
+`TSUNAMI_ADVANCED=1` or `sudo bash install.sh advanced`. See
+[Built-in Fronting](docs/fronting.md) for the server-side details.
+
+A non-interactive install must choose TLS explicitly (site camouflage defaults
+to the built-in page unless `TSUNAMI_SITE_MODE` is set); there is no silent
+self-signed fallback.
+
+**Non-interactive with Let's Encrypt (replace `example.com` with your real domain):**
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
-  TSUNAMI_PUBLIC_HOST=your-domain.com \
+  TSUNAMI_PUBLIC_HOST=example.com \
   TSUNAMI_LETSENCRYPT=y \
   TSUNAMI_ACME_EMAIL=you@example.com \
+  TSUNAMI_SITE_MODE=local \
+  TSUNAMI_SITE_UPSTREAM=http://127.0.0.1:8080 \
   sudo -E bash
 ```
 
-After install, the script prints a ready-to-use client command:
+**Local testing only (INSECURE self-signed certificate):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
+  sudo env TSUNAMI_ASSUME_YES=1 TSUNAMI_TLS_MODE=self-signed TSUNAMI_DEV=1 \
+  TSUNAMI_PUBLIC_HOST=dev.tsunami.lan TSUNAMI_PASSWORD='change-this-password' bash
+```
+
+The installer validates the hostname (no IPs or placeholder domains such as
+`example.com`), generates a unique fronting path and separate fronting secret,
+derives a site name, and writes the site-camouflage block
+(`fronting.site.mode`/`upstream`/`preserve_host`). After install it prints a
+ready-to-use client command:
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║           TSUNAMI  Deploy Complete ✓                        ║
-╠══════════════════════════════════════════════════════════════╣
-║  Server : example.com:443                                   ║
-║  Password: xK9f2m...8kPq                                   ║
-║  TLS    : Let's Encrypt (auto-renew)                        ║
-║  Status : ● running                                         ║
-╠══════════════════════════════════════════════════════════════╣
-║  Client command:                                            ║
-║  tsunami-client \                                           ║
-║    --server example.com:443 \                               ║
-║    --password '...' \                                       ║
-║    --sni example.com \                                      ║
-║    --socks 127.0.0.1:1080 \                                 ║
-║    --http 127.0.0.1:8080                                    ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║ TSUNAMI Deploy Complete                       ║
+║ Server       : example.com:443                ║
+║ Password     : xK9f2m...8kPq                  ║
+║ TLS          : Let's Encrypt (auto-renew)     ║
+║ Fronting     : enabled                        ║
+║ Front path   : /static/js/main.1a2b3c4d.js    ║
+║ Site         : local -> http://127.0.0.1:8080 ║
+║ Decoy site   : Example                        ║
+║ Status       : running                        ║
+║ Config       : /etc/tsunami/config.json       ║
+╚═══════════════════════════════════════════════╝
+
+Client command (copy-paste, also saved at /etc/tsunami/client-command.txt):
+tsunami-client --server example.com:443 --password '...' --sni example.com --fronting --front-path /static/js/main.1a2b3c4d.js --front-secret '...' --socks 127.0.0.1:1080 --http 127.0.0.1:8080
 ```
+
+`sudo tsunami-manage security` audits the deployment and reports PASS/WARN/FAIL
+for the certificate choice, SNI, fronting settings, site camouflage mode and
+upstream, `--skip-verify` usage, and file permissions. A `builtin` site or a
+`local` site without an upstream is flagged.
 
 ### Service Management
 
@@ -123,10 +166,12 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 sudo tsunami-manage status       # Service status
 sudo tsunami-manage client       # Show connection info
 sudo tsunami-manage update       # Update to latest release
-sudo tsunami-manage config       # Re-configure
+sudo tsunami-manage config       # Re-configure (quick wizard, offers reuse)
+sudo tsunami-manage advanced     # Re-configure with the advanced prompts
 sudo tsunami-manage restart      # Restart service
 sudo tsunami-manage logs         # Follow logs
 sudo tsunami-manage cert         # Let's Encrypt cert status
+sudo tsunami-manage security     # Deployment security self-check
 sudo tsunami-manage uninstall    # Remove everything
 ```
 
@@ -343,12 +388,26 @@ For non-interactive / automated deployment:
 |:---------|:--------|:------------|
 | `TSUNAMI_LISTEN` | `:443` | Server listen address |
 | `TSUNAMI_PASSWORD` | *(auto-generated)* | Client password |
-| `TSUNAMI_PUBLIC_HOST` | *(prompted)* | Server domain / public hostname |
+| `TSUNAMI_PUBLIC_HOST` | *(prompted)* | Real public domain (no IPs or placeholders) |
+| `TSUNAMI_TLS_MODE` | `letsencrypt` | `letsencrypt`, `manual`, or `self-signed` |
+| `TSUNAMI_DEV` | — | `1` required for non-interactive self-signed mode |
 | `TSUNAMI_CERT_FILE` | — | Manual TLS certificate path |
 | `TSUNAMI_KEY_FILE` | — | Manual TLS private key path |
 | `TSUNAMI_FALLBACK` | — | Fallback HTTP backend address |
-| `TSUNAMI_LETSENCRYPT` | *(prompted)* | `y` to auto-approve Let's Encrypt |
+| `TSUNAMI_LETSENCRYPT` | *(prompted)* | `y` to select Let's Encrypt non-interactively |
 | `TSUNAMI_ACME_EMAIL` | — | Email for Let's Encrypt notifications |
+| `TSUNAMI_FRONTING` | `1` | `0` disables fronting (not for public deployments) |
+| `TSUNAMI_FRONT_PATH` | *(generated)* | Fronting HTTP path with a build-hashed name |
+| `TSUNAMI_FRONT_SECRET` | *(generated)* | Separate fronting HMAC secret |
+| `TSUNAMI_SITE_NAME` | *(derived)* | Decoy site name (derived from the domain) |
+| `TSUNAMI_SITE_MODE` | `builtin` (non-interactive) | Site camouflage: `local`, `remote`, or `builtin` |
+| `TSUNAMI_SITE_UPSTREAM` | `http://127.0.0.1:8080` for `local` | Upstream HTTP(S) origin for `local`/`remote` |
+| `TSUNAMI_SITE_PRESERVE_HOST` | `true` for `local` | Preserve the visitor's `Host` header |
+| `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification for an HTTPS upstream |
+| `TSUNAMI_DECOY_PROXY` | — | Legacy alias: maps to `remote` + upstream |
+| `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | TLS SNI used by the client command |
+| `TSUNAMI_PADDING_SCHEME_JSON` | *(server default)* | Override the server default padding scheme |
+| `TSUNAMI_ADVANCED` | — | `1` to ask the advanced prompts in the wizard |
 | `TSUNAMI_VERSION` | `latest` | Release version to install (`v1.2.3`) |
 | `TSUNAMI_ASSUME_YES` | — | `1` to skip all interactive prompts |
 

@@ -305,14 +305,26 @@ func (c *Client) dialFrontedWebSocket(cfg fronting.Config) (net.Conn, error) {
 	return conn, nil
 }
 
+// Authentication padding bounds. The auth padding is intentionally decoupled
+// from the padding scheme: scheme rule 0 now belongs to the first data write of
+// each stream (the SOCKS target address), not to the session handshake.
+const (
+	authPaddingMin = 24
+	authPaddingMax = 88
+)
+
+// authPaddingLen returns a random auth padding length in [authPaddingMin,
+// authPaddingMax]. Kept well below protocol.MaxFrameDataLen.
+func authPaddingLen() int {
+	return padding.RandomInRange(authPaddingMin, authPaddingMax)
+}
+
 func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
-	// Send authentication
+	// Send authentication.
+	// The auth padding is decoupled from the padding scheme rules so the
+	// scheme's early rules can mask each stream's inner TLS handshake.
 	scheme := c.currentPaddingScheme()
-	padding0Size := 30 // default from scheme rule 0
-	if segs := scheme.GetSegments(0); len(segs) > 0 {
-		padding0Size = padding.RandomInRange(segs[0].MinSize, segs[0].MaxSize)
-	}
-	padding0 := make([]byte, padding0Size)
+	padding0 := make([]byte, authPaddingLen())
 	if _, err := rand.Read(padding0); err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("generate auth padding: %w", err)
@@ -327,11 +339,9 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	seq := c.pool.NextSeq()
 	session := protocol.NewSession(tlsConn, seq)
 
-	// Wire padding system into session write path
-	pw := padding.NewWriter(tlsConn, scheme)
-	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
-		return pw.WriteFramesWithPadding(frames)
-	})
+	// Wire padding system into session write path.
+	pw := padding.NewWriterForRole(tlsConn, scheme, padding.RoleClient)
+	bindClientPadding(session, pw)
 	session.SetOnPaddingSchemeUpdate(func(data []byte) error {
 		return c.applyPaddingSchemeUpdate(data, pw)
 	})
@@ -342,6 +352,10 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		Client:     "http-client/1.0",
 		PaddingMD5: scheme.MD5(),
 		Shaping:    c.config.Shaping != nil,
+		// Advertise that this client parses the v2 padding scheme syntax. The
+		// server only pushes scheme text when the client advertises it, so
+		// pre-v2 clients are never sent `~min-max` rules they cannot parse.
+		PaddingV2: true,
 	}
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()
@@ -385,10 +399,8 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	if c.config.Shaping != nil && shapingConfirmed {
 		shaped := shaping.Wrap(tlsConn, *c.config.Shaping)
 		session.ReplaceConn(shaped)
-		pw = padding.NewWriter(shaped, scheme)
-		session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
-			return pw.WriteFramesWithPadding(frames)
-		})
+		pw = padding.NewWriterForRole(shaped, scheme, padding.RoleClient)
+		bindClientPadding(session, pw)
 		log.Printf("tsunami: traffic shaping enabled (frame=%d interval=%v burst=%d)",
 			c.config.Shaping.FrameSize, c.config.Shaping.Interval, c.config.Shaping.BurstSlots)
 	}
@@ -401,6 +413,19 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	}()
 
 	return session, nil
+}
+
+// bindClientPadding wires a padding writer into a session: frame writes go
+// through the writer and closed streams drop their per-stream padding state.
+// The writer is passed as a parameter (not captured from a variable) so that
+// re-wrapping the connection later only rebinds the current writer.
+func bindClientPadding(session *protocol.Session, pw *padding.Writer) {
+	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
+		return pw.WriteFramesWithPadding(frames)
+	})
+	session.SetOnStreamClosed(func(id uint32) {
+		pw.ForgetStream(id)
+	})
 }
 
 func (c *Client) frontingKey(cfg fronting.Config) [32]byte {

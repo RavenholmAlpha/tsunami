@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Site camouflage** for unauthenticated fronting traffic, with the same reverse-proxy semantics as Caddy's `reverse_proxy`: `local` proxies to a local HTTP endpoint (the same IP also serves a real site), `remote` proxies to another website (borrowed content, Host rewritten to the upstream by default), and `builtin` keeps the generated page. Configured with `fronting.site` (`mode`, `upstream`, `preserve_host`, `insecure_skip_verify`) or the new `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` flags. The old `decoy_proxy` key and `--front-decoy-proxy` flag remain as deprecated aliases.
+- Proxied camouflage responses keep the fronting shape: fronting auth headers are stripped, `Server` is forced to the configured value, `Alt-Svc` is removed (no HTTP/3), WebSocket upgrades pass through, and upstream failures fall back to the built-in page with 200 instead of leaking proxy errors.
+- Installer `advanced` command / `TSUNAMI_ADVANCED=1` exposes the detailed prompts (listen, fallback, Surge, custom fronting values, padding scheme) without cluttering the quick flow.
+
+### Changed
+- Padding is applied **per stream** instead of per session. Every proxied stream starts its own padding epoch, so each new inner TLS handshake (client ClientHello, server certificate flight) is masked, not only the first one on a long-lived session.
+- Padding scheme v2 adds `stream_bytes` (per-stream padded-byte budget), `ctl` (rule for control writes, applied for the whole session lifetime), directional `c<idx>`/`s<idx>` overrides, and `~min-max` pad-to segments that emit one record padded to a plausible size instead of splitting it. The new default scheme masks the ClientHello at 0.9–1.2 KiB, the server flight at 2.6–4.2 KiB and control frames at 40–160 B.
+- Clients advertise `padding-v2=1` in their `SETTINGS` frame; servers only push v2 scheme text to clients that advertise support, so mixed-version sessions keep working.
+- The client session pool no longer keeps a permanent idle connection: `MinIdleSession` defaults to 0, idle sessions close after a randomized timeout, and application heartbeats are jittered (25–55 s) and suppressed while traffic flows instead of a fixed 15 s ping.
+- Installer hardening: Let's Encrypt is the default TLS mode, self-signed requires an explicit dev opt-in, hostnames/SNI are validated, and a unique fronting path, separate fronting secret and derived decoy site name are written to both the server config and the client command. The hardcoded padding scheme was removed so the server's built-in default applies.
+- New `security` installer command (menu entry 9) runs a deployment self-check and exits non-zero on unsafe findings.
+- Installer quick wizard: a fresh interactive install now asks only domain → TLS mode → site camouflage and ends with a single "Press Enter to install" confirmation. Existing installs offer to reuse their saved settings, the local real-site upstream is auto-detected from `ss`/`lsof`, and everything else (listen address, Surge limits, fallback, fronting path/secret, decoy site name) is generated. The `security` check also reports the site camouflage mode and upstream.
+- README, deployment and padding docs updated for the new installer flow and the per-stream padding model.
+
+### Fixed
+- The installer can no longer silently produce a self-signed certificate, a placeholder SNI or a `--skip-verify` client command for a public deployment.
+- Padding no longer stops after the first eight writes of a session and leaves later streams' inner TLS handshakes unmasked.
+
 ## [1.2.1] - 2026-06-22
 
 ### Fixed
@@ -66,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform builds (linux/amd64, linux/arm64, windows/amd64, darwin/amd64, darwin/arm64)
 - Integration test suite (E2E, multi-stream, auth failure, session reuse, large data transfer)
 
+[Unreleased]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.1...HEAD
 [1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0

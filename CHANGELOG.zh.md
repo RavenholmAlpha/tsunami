@@ -7,6 +7,27 @@
 本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [未发布]
+
+### 新增
+- **站点伪装**：未认证的 fronting 请求按 Caddy `reverse_proxy` 的语义处理——`local` 反代到本机 HTTP 端点（同一 IP 上同时运行真实站点），`remote` 反代到其他网站（借内容，默认把 Host 改写为上游），`builtin` 保留内置页面。通过 `fronting.site`（`mode`、`upstream`、`preserve_host`、`insecure_skip_verify`）或新增的 `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` 参数配置；旧的 `decoy_proxy` 键与 `--front-decoy-proxy` 参数保留为弃用别名。
+- 反代响应保持前置层形态：剥离 fronting 认证头、强制 `Server` 为配置值、移除 `Alt-Svc`（不提供 HTTP/3）、透传 WebSocket 升级；上游失败时回退到内置页面并返回 200，不泄露代理错误。
+- 安装脚本新增 `advanced` 命令 / `TSUNAMI_ADVANCED=1`，在不干扰快速流程的前提下开放详细配置（监听地址、fallback、Surge、自定义 fronting 值、padding 方案）。
+
+### 变更
+- 填充改为按**每条流**应用，而不是按会话：每条被代理的流都从自己的填充周期开始，因此每个新的内层 TLS 握手（客户端 ClientHello、服务端证书飞行）都会被掩盖，而不再只掩盖长连接上的第一次。
+- 填充方案 v2 新增 `stream_bytes`（每流填充字节预算）、`ctl`（控制写入规则，整个会话生命周期持续生效）、方向性 `c<idx>`/`s<idx>` 覆盖，以及 `~min-max` pad-to 段：把整次写入作为单条记录填充到合理尺寸，而不是拆分。新的默认方案把 ClientHello 填充到 0.9–1.2 KiB、服务端飞行填充到 2.6–4.2 KiB、控制帧填充到 40–160 B。
+- 客户端在 `SETTINGS` 帧中声明 `padding-v2=1`；服务端只向声明该能力的客户端推送 v2 方案文本，因此混合版本会话仍可正常工作。
+- 客户端会话池不再保留永久空闲连接：`MinIdleSession` 默认改为 0，空闲会话在随机化超时后关闭；应用层心跳改为 25–55 秒随机并在有流量时不发送，不再固定 15 秒一次。
+- 安装脚本加固：默认 TLS 模式为 Let's Encrypt；自签证书必须显式开启开发模式；校验域名/SNI；生成唯一的 fronting 路径、独立的 fronting secret 与派生的伪装站点名，并同时写入服务端配置和客户端命令；移除硬编码填充方案，改用服务端内置默认值。
+- 新增 `security` 安装脚本命令（菜单项 9），运行部署安全自检，发现问题时返回非零。
+- 安装脚本快速向导：全新交互式安装只询问"域名 → TLS 模式 → 站点伪装"，并以单次 "Press Enter to install" 确认结束；已有安装会提示复用保存的配置；本地真实站点上游通过 `ss`/`lsof` 自动探测；其余（监听地址、Surge、fallback、fronting path/secret、站点名）全部自动生成。`security` 自检现在也会报告站点伪装模式与上游。
+- README、部署与填充文档已同步更新。
+
+### 修复
+- 安装脚本不再为公网部署静默生成自签证书、占位 SNI 或带 `--skip-verify` 的客户端命令。
+- 填充不再在会话前 8 次写入后停止，导致后续流的内层 TLS 握手失去掩盖。
+
 ## [1.2.1] - 2026-06-22
 
 ### 修复
@@ -66,6 +87,7 @@
 - 跨平台构建（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 集成测试套件（端到端、多流、认证失败、会话重用、大数据传输）
 
+[未发布]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.1...HEAD
 [1.2.1]: https://github.com/RavenholmAlpha/tsunami/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/RavenholmAlpha/tsunami/compare/v1.0.0...v1.1.0

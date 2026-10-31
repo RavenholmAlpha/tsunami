@@ -43,6 +43,8 @@ type Session struct {
 	onStreamOpen          func(s *Stream)         // Called when server receives a new stream
 	onStreamCountChange   func(activeCount int)   // Called when active stream count changes
 	onPaddingSchemeUpdate func(data []byte) error // Called when client receives a padding scheme update
+	onStreamClosed        func(id uint32)         // Called after a stream is removed from the session
+	streamClosedMu        sync.Mutex              // protects onStreamClosed
 
 	// Optional padding-aware write function.
 	// When set, frame writes route through this instead of the raw FrameWriter.
@@ -260,6 +262,10 @@ func (s *Session) removeStream(id uint32) {
 	if count == 0 {
 		s.idleSince.Store(time.Now().UnixNano())
 	}
+
+	// Run the callback after streamMu is released. The padding writer uses this
+	// hook to forget per-stream state; it must never run under the stream lock.
+	s.notifyStreamClosed(id)
 }
 
 // getStream returns the stream with the given ID, or nil.
@@ -278,6 +284,26 @@ func (s *Session) SetOnStreamOpen(fn func(*Stream)) {
 // This is used to drive keepalive active/idle state transitions.
 func (s *Session) SetOnStreamCountChange(fn func(activeCount int)) {
 	s.onStreamCountChange = fn
+}
+
+// SetOnStreamClosed sets the callback invoked after a stream has been removed
+// from the session (local Close or remote FIN). It is used by the padding layer
+// to forget per-stream padding state. The callback runs after streamMu is
+// released, so it may call back into the session without deadlocking.
+func (s *Session) SetOnStreamClosed(fn func(id uint32)) {
+	s.streamClosedMu.Lock()
+	s.onStreamClosed = fn
+	s.streamClosedMu.Unlock()
+}
+
+// notifyStreamClosed invokes the stream-closed callback outside of streamMu.
+func (s *Session) notifyStreamClosed(id uint32) {
+	s.streamClosedMu.Lock()
+	fn := s.onStreamClosed
+	s.streamClosedMu.Unlock()
+	if fn != nil {
+		fn(id)
+	}
 }
 
 // SetOnPaddingSchemeUpdate sets the callback invoked when the remote pushes a

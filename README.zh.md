@@ -70,7 +70,7 @@
 
 ### 一键部署
 
-在任何 Linux 服务器上（Ubuntu / Debian / CentOS / RHEL）：
+在任何 Linux 服务器（Ubuntu / Debian / CentOS / RHEL）上，请从交互式终端运行安装程序：
 
 ```bash
 # wget
@@ -80,36 +80,63 @@ wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 ```
 
-**非交互式 Let's Encrypt 部署：**
+安装向导很短——三个问题加一次确认：
+
+1. **域名** —— 必须解析到本服务器（默认使用机器 FQDN）。
+2. **TLS 模式** —— `[1] Let's Encrypt（推荐）[2] 现有证书/私钥文件 [3] 自签名（不安全，仅测试）`。
+3. **站点伪装** —— 未认证访问者看到的内容：
+
+| 模式 | 行为 | 适用场景 |
+|:--|:--|:--|
+| `local` | 反向代理到本服务器上的真实网站（默认 `http://127.0.0.1:8080`，自动探测 80/8080/3000/8000 端口监听）；保留 Host 头 | 同一 IP 上有真实网站（推荐） |
+| `remote` | 借用其他网站的内容（Host 头重写为上游） | 本地没有真实站点，并接受上游站点的条款与可用性 |
+| `builtin` | 生成的占位页面（最不真实，最容易被聚类识别） | 仅用于快速测试 |
+
+然后按一次 Enter 即可安装。其余配置全部自动完成：`:443`、Surge 默认值、随机密码、唯一的 fronting 路径/密钥、派生的站点名称以及服务端内置填充方案。高级参数（监听地址/回退后端/Surge/自定义 fronting 路径/密钥/站点名/填充方案）只有在 `TSUNAMI_ADVANCED=1` 或执行 `sudo bash install.sh advanced` 时才会询问。服务端细节见 [内置前置层](docs/fronting.md)。
+
+非交互式安装必须显式指定 TLS 方式（站点伪装在未设置 `TSUNAMI_SITE_MODE` 时默认使用内置页面）；安装程序不会静默回退到自签名证书。
+
+**非交互式 Let's Encrypt 部署（请把 `example.com` 替换为真实域名）：**
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
-  TSUNAMI_PUBLIC_HOST=your-domain.com \
+  TSUNAMI_PUBLIC_HOST=example.com \
   TSUNAMI_LETSENCRYPT=y \
   TSUNAMI_ACME_EMAIL=you@example.com \
+  TSUNAMI_SITE_MODE=local \
+  TSUNAMI_SITE_UPSTREAM=http://127.0.0.1:8080 \
   sudo -E bash
 ```
 
-安装完成后，脚本会打印可直接使用的客户端命令：
+**仅限本地测试（不安全的自动签名证书）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | \
+  sudo env TSUNAMI_ASSUME_YES=1 TSUNAMI_TLS_MODE=self-signed TSUNAMI_DEV=1 \
+  TSUNAMI_PUBLIC_HOST=dev.tsunami.lan TSUNAMI_PASSWORD='change-this-password' bash
+```
+
+安装程序会校验主机名（拒绝 IP 和 `example.com` 等占位域名）、生成每个部署唯一的 fronting 路径和独立的 fronting 密钥、从域名派生站点名称，并写入站点伪装配置块（`fronting.site.mode`/`upstream`/`preserve_host`）。安装完成后会打印可直接使用的客户端命令：
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║           TSUNAMI  部署完成 ✓                                ║
-╠══════════════════════════════════════════════════════════════╣
-║  服务器 : example.com:443                                    ║
-║  密码   : xK9f2m...8kPq                                     ║
-║  TLS    : Let's Encrypt（自动续期）                           ║
-║  状态   : ● 运行中                                           ║
-╠══════════════════════════════════════════════════════════════╣
-║  客户端命令：                                                 ║
-║  tsunami-client \                                           ║
-║    --server example.com:443 \                               ║
-║    --password '...' \                                       ║
-║    --sni example.com \                                      ║
-║    --socks 127.0.0.1:1080 \                                 ║
-║    --http 127.0.0.1:8080                                    ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║ TSUNAMI Deploy Complete                       ║
+║ Server       : example.com:443                ║
+║ Password     : xK9f2m...8kPq                  ║
+║ TLS          : Let's Encrypt (auto-renew)     ║
+║ Fronting     : enabled                        ║
+║ Front path   : /static/js/main.1a2b3c4d.js    ║
+║ Site         : local -> http://127.0.0.1:8080 ║
+║ Decoy site   : Example                        ║
+║ Status       : running                        ║
+║ Config       : /etc/tsunami/config.json       ║
+╚═══════════════════════════════════════════════╝
+
+Client command (copy-paste, also saved at /etc/tsunami/client-command.txt):
+tsunami-client --server example.com:443 --password '...' --sni example.com --fronting --front-path /static/js/main.1a2b3c4d.js --front-secret '...' --socks 127.0.0.1:1080 --http 127.0.0.1:8080
 ```
+
+`sudo tsunami-manage security` 会审计部署，并对证书选择、SNI、fronting 配置、站点伪装模式与上游、`--skip-verify` 使用情况和文件权限报告 PASS/WARN/FAIL。`builtin` 站点或没有上游的 `local` 站点会被标记。
 
 ### 服务管理
 
@@ -123,10 +150,12 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 sudo tsunami-manage status       # 服务状态
 sudo tsunami-manage client       # 显示连接信息
 sudo tsunami-manage update       # 更新到最新版本
-sudo tsunami-manage config       # 重新配置
+sudo tsunami-manage config       # 重新配置（快捷向导，可复用现有设置）
+sudo tsunami-manage advanced     # 使用高级提示重新配置
 sudo tsunami-manage restart      # 重启服务
 sudo tsunami-manage logs         # 跟踪日志
 sudo tsunami-manage cert         # Let's Encrypt 证书状态
+sudo tsunami-manage security     # 部署安全自检
 sudo tsunami-manage uninstall    # 删除所有内容
 ```
 
@@ -309,12 +338,26 @@ tsunami/
 |:---------|:--------|:------------|
 | `TSUNAMI_LISTEN` | `:443` | 服务器监听地址 |
 | `TSUNAMI_PASSWORD` | *（自动生成）* | 客户端密码 |
-| `TSUNAMI_PUBLIC_HOST` | *（交互输入）* | 服务器域名/公网主机名 |
+| `TSUNAMI_PUBLIC_HOST` | *（交互输入）* | 真实公网域名（不接受 IP 或占位域名） |
+| `TSUNAMI_TLS_MODE` | `letsencrypt` | `letsencrypt`、`manual` 或 `self-signed` |
+| `TSUNAMI_DEV` | — | 非交互式自签名模式必须设为 `1` |
 | `TSUNAMI_CERT_FILE` | — | 手动 TLS 证书路径 |
 | `TSUNAMI_KEY_FILE` | — | 手动 TLS 私钥路径 |
 | `TSUNAMI_FALLBACK` | — | 回退 HTTP 后端地址 |
-| `TSUNAMI_LETSENCRYPT` | *（交互输入）* | `y` 自动确认 Let's Encrypt |
+| `TSUNAMI_LETSENCRYPT` | *（交互输入）* | `y` 非交互地选择 Let's Encrypt |
 | `TSUNAMI_ACME_EMAIL` | — | Let's Encrypt 通知邮箱 |
+| `TSUNAMI_FRONTING` | `1` | `0` 禁用 fronting（不适合公网部署） |
+| `TSUNAMI_FRONT_PATH` | *（自动生成）* | 带构建哈希的 fronting HTTP 路径 |
+| `TSUNAMI_FRONT_SECRET` | *（自动生成）* | 独立的 fronting HMAC 密钥 |
+| `TSUNAMI_SITE_NAME` | *（自动派生）* | 站点名称（从域名派生） |
+| `TSUNAMI_SITE_MODE` | `builtin`（非交互） | 站点伪装模式：`local`、`remote` 或 `builtin` |
+| `TSUNAMI_SITE_UPSTREAM` | `local` 默认 `http://127.0.0.1:8080` | `local`/`remote` 的上游 HTTP(S) 源站 |
+| `TSUNAMI_SITE_PRESERVE_HOST` | `local` 默认 `true` | 是否保留访问者的 `Host` 头 |
+| `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | 是否跳过 HTTPS 上游的 TLS 校验 |
+| `TSUNAMI_DECOY_PROXY` | — | 旧版别名：映射为 `remote` + 上游 |
+| `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | 客户端命令使用的 TLS SNI |
+| `TSUNAMI_PADDING_SCHEME_JSON` | *（服务端默认值）* | 覆盖服务端默认填充方案 |
+| `TSUNAMI_ADVANCED` | — | `1` 在向导中询问高级参数 |
 | `TSUNAMI_VERSION` | `latest` | 要安装的版本号（`v1.2.3`） |
 | `TSUNAMI_ASSUME_YES` | — | `1` 跳过所有交互提示 |
 
