@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The installer can no longer silently produce a self-signed certificate, a placeholder SNI or a `--skip-verify` client command for a public deployment.
 - Padding no longer stops after the first eight writes of a session and leaves later streams' inner TLS handshakes unmasked.
+- WebSocket fronting now actually advertises only `http/1.1` in the TLS ALPN extension. The uTLS ClientHello patch was silently discarded before the handshake, so clients offered the browser default `h2,http/1.1` and then spoke HTTP/1.1, which broke WebSocket tunnels against HTTP/2-capable servers (including TSUNAMI's own server). Added regression tests for both the WebSocket ALPN override and the normal browser ALPN list.
 
 ## [1.2.1] - 2026-06-22
 

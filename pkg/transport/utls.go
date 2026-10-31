@@ -72,6 +72,13 @@ func DialUTLS(conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
 // overrides the ALPN extension to advertise only the specified protocols.
 // This is needed for WebSocket transport which requires http/1.1 negotiation
 // while still presenting a browser-like ClientHello to defeat TLS fingerprinting.
+//
+// uTLS only honors a custom ClientHelloSpec when the connection is created with
+// utls.HelloCustom (ApplyPreset is documented for that mode). Creating the
+// connection with the real fingerprint ID first and patching afterwards does
+// not work: the handshake rebuilds the fingerprint ClientHello and silently
+// discards the patch, which previously made the WebSocket transport offer the
+// browser ALPN list (h2, http/1.1) while speaking HTTP/1.1 to the server.
 func DialUTLSWithALPN(conn net.Conn, cfg *TLSConfig, alpn []string) (net.Conn, error) {
 	fingerprint := cfg.Fingerprint
 	if fingerprint == "" {
@@ -89,15 +96,18 @@ func DialUTLSWithALPN(conn net.Conn, cfg *TLSConfig, alpn []string) (net.Conn, e
 		MinVersion:         cfg.MinVersion,
 	}
 
-	uconn := utls.UClient(conn, utlsCfg, *helloID)
-
-	// Retrieve the built ClientHelloSpec and patch the ALPN extension
+	// Resolve the fingerprint ClientHelloSpec first, patch its ALPN extension,
+	// then apply it through a HelloCustom connection so the patch survives the
+	// handshake's ClientHello rebuild.
 	spec, err := utls.UTLSIdToSpec(*helloID)
-	if err == nil {
-		patchALPN(&spec, alpn)
-		if err := uconn.ApplyPreset(&spec); err != nil {
-			return nil, fmt.Errorf("tsunami: uTLS apply spec: %w", err)
-		}
+	if err != nil {
+		return nil, fmt.Errorf("tsunami: uTLS resolve spec (%s): %w", fingerprint, err)
+	}
+	patchALPN(&spec, alpn)
+
+	uconn := utls.UClient(conn, utlsCfg, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("tsunami: uTLS apply spec: %w", err)
 	}
 
 	if err := uconn.Handshake(); err != nil {

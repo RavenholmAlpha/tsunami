@@ -18,8 +18,10 @@ For censorship-resistance deployments, treat fronting as required:
 - Use a real domain name and a publicly trusted certificate for that domain.
   Do not expose the auto-generated self-signed certificate on the public
   Internet.
-- Use HTTP/2 fronting as the default transport. WebSocket remains available,
-  but it is not currently browser-identical.
+- Use HTTP/2 fronting as the default transport. WebSocket remains available, but
+  it is not browser-identical: the ClientHello keeps a real browser fingerprint
+  while the ALPN list is restricted to `http/1.1` so the HTTP/1.1 `Upgrade`
+  handshake works (a real browser advertises `h2,http/1.1`, which changes JA4).
 - Serve a real cover website with site camouflage (`local` or `remote` mode;
   see below) instead of the minimal built-in page. The built-in page stays
   available as the zero-dependency default and as the upstream-failure

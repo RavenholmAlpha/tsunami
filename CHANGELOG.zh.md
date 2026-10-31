@@ -27,6 +27,7 @@
 ### 修复
 - 安装脚本不再为公网部署静默生成自签证书、占位 SNI 或带 `--skip-verify` 的客户端命令。
 - 填充不再在会话前 8 次写入后停止，导致后续流的内层 TLS 握手失去掩盖。
+- WebSocket 前置现在确实只在 TLS ALPN 扩展中声明 `http/1.1`。此前 uTLS 的 ClientHello 补丁在握手前被静默丢弃，客户端会发送浏览器默认的 `h2,http/1.1` 却使用 HTTP/1.1，导致面向支持 HTTP/2 的服务端（包括 TSUNAMI 自己的服务端）的 WebSocket 隧道失败。新增了 WebSocket ALPN 覆盖与浏览器默认 ALPN 列表的回归测试。
 
 ## [1.2.1] - 2026-06-22
 
