@@ -117,6 +117,7 @@ type ServerConfig struct {
 		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 		AllowAll      bool   `json:"allow_all" yaml:"allow-all"`
+		MaxStreams    int    `json:"max_streams" yaml:"max-streams"`
 	} `json:"server" yaml:"server"`
 
 	// XBoard is used only by tsunami-node. The panel owns all data-plane
@@ -251,6 +252,7 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 		},
 		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
 		AllowAll:      c.Server.AllowAll,
+		MaxStreams:    c.Server.MaxStreams,
 	}
 
 	// Apply defaults

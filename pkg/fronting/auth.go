@@ -20,21 +20,29 @@ const (
 	headerNonce   = "X-Trace-Id"
 	headerAuth    = "Authorization"
 	authVersion   = "v1"
+
+	// defaultNonceCacheMaxEntries bounds the replay cache. Only requests with
+	// a valid signature are inserted, so the cache normally grows with the
+	// (small) rate of new authenticated tunnels; the cap is a safety net
+	// against a client that holds the fronting secret and floods requests.
+	defaultNonceCacheMaxEntries = 1 << 17
 )
 
 // NonceCache tracks recently seen nonces to prevent replay attacks.
 type NonceCache struct {
-	mu      sync.Mutex
-	entries map[string]time.Time
-	ttl     time.Duration
+	mu         sync.Mutex
+	entries    map[string]time.Time
+	ttl        time.Duration
+	maxEntries int
 }
 
 // NewNonceCache creates a nonce cache with the given TTL and starts a
 // background goroutine to evict expired entries.
 func NewNonceCache(ttl time.Duration) *NonceCache {
 	nc := &NonceCache{
-		entries: make(map[string]time.Time),
-		ttl:     ttl,
+		entries:    make(map[string]time.Time),
+		ttl:        ttl,
+		maxEntries: defaultNonceCacheMaxEntries,
 	}
 	go nc.evictLoop()
 	return nc
@@ -47,8 +55,41 @@ func (nc *NonceCache) Add(nonce string) bool {
 	if _, exists := nc.entries[nonce]; exists {
 		return false
 	}
+	nc.pruneLocked(time.Now())
+	if nc.maxEntries > 0 && len(nc.entries) >= nc.maxEntries {
+		// The cache is a replay-protection aid, not a correctness boundary:
+		// evict a slice of entries rather than growing without bound. This can
+		// only happen when a party that knows a fronting key floods requests.
+		nc.evictOldestLocked(nc.maxEntries / 8)
+	}
 	nc.entries[nonce] = time.Now()
 	return true
+}
+
+// pruneLocked removes expired entries. nc.mu must be held.
+func (nc *NonceCache) pruneLocked(now time.Time) {
+	cutoff := now.Add(-nc.ttl)
+	for k, t := range nc.entries {
+		if t.Before(cutoff) {
+			delete(nc.entries, k)
+		}
+	}
+}
+
+// evictOldestLocked drops roughly count entries. Map order is random, which is
+// acceptable here: the evicted nonces are re-randomized request identifiers,
+// and an attacker who can trigger this path already holds a fronting key.
+func (nc *NonceCache) evictOldestLocked(count int) {
+	if count < 1 {
+		count = 1
+	}
+	for k := range nc.entries {
+		if count == 0 {
+			break
+		}
+		delete(nc.entries, k)
+		count--
+	}
 }
 
 func (nc *NonceCache) evictLoop() {
@@ -56,12 +97,7 @@ func (nc *NonceCache) evictLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		nc.mu.Lock()
-		cutoff := time.Now().Add(-nc.ttl)
-		for k, t := range nc.entries {
-			if t.Before(cutoff) {
-				delete(nc.entries, k)
-			}
-		}
+		nc.pruneLocked(time.Now())
 		nc.mu.Unlock()
 	}
 }
@@ -125,24 +161,34 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 		return false
 	}
 
-	// Replay protection: reject previously seen nonces
+	requestPath := req.URL.EscapedPath()
+	if requestPath == "" {
+		requestPath = req.URL.Path
+	}
+
+	// Verify the MAC before touching the replay cache. A failed signature never
+	// establishes a tunnel, so there is nothing to protect by burning its
+	// nonce; inserting unauthenticated nonces would let any client grow the
+	// cache without bound (memory DoS). Only validated requests take the replay
+	// check, and Add is atomic so concurrent replays still collapse to one.
+	valid := false
+	for _, key := range keys {
+		want := computeMAC(req.Method, requestPath, req.Host, ts, nonce, key)
+		if subtle.ConstantTimeCompare([]byte(strings.ToLower(got)), []byte(want)) == 1 {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return false
+	}
+
 	if len(nonceCache) > 0 && nonceCache[0] != nil {
 		if !nonceCache[0].Add(nonce) {
 			return false
 		}
 	}
-
-	requestPath := req.URL.EscapedPath()
-	if requestPath == "" {
-		requestPath = req.URL.Path
-	}
-	for _, key := range keys {
-		want := computeMAC(req.Method, requestPath, req.Host, ts, nonce, key)
-		if subtle.ConstantTimeCompare([]byte(strings.ToLower(got)), []byte(want)) == 1 {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 func computeMAC(method, requestPath, host, ts, nonce string, key [32]byte) string {

@@ -2,6 +2,7 @@ package uot
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -18,7 +19,7 @@ type mockStream struct {
 
 func (m *mockStream) Close() error { return nil }
 
-func TestRelay_allowAddr(t *testing.T) {
+func TestRelay_resolve(t *testing.T) {
 	// Construct a UoT stream payload:
 	// Packet 1: ATYP=IPv4, IP=127.0.0.1, Port=80, DataLen=5, Data="hello"
 	// Packet 2: ATYP=IPv4, IP=10.0.0.1, Port=80, DataLen=5, Data="world"
@@ -43,18 +44,18 @@ func TestRelay_allowAddr(t *testing.T) {
 	allowedTargets := make(map[string]bool)
 	var mu sync.Mutex
 
-	allowAddr := func(target string) bool {
+	resolve := func(target string) (*net.UDPAddr, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		// Only allow 10.0.0.1:80
+		// Only allow 10.0.0.1:80.
 		if target == "10.0.0.1:80" {
 			allowedTargets[target] = true
-			return true
+			return &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 80}, nil
 		}
-		return false
+		return nil, errors.New("blocked by policy")
 	}
 
-	relay := NewRelay(stream, allowAddr)
+	relay := NewRelay(stream, resolve)
 
 	// Create UDP socket to satisfy Run / streamToUDP (but we just want to run streamToUDP)
 	// Let's listen on UDP port 0 to get a local listener

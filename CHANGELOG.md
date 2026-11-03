@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The installer can no longer silently produce a self-signed certificate, a placeholder SNI or a `--skip-verify` client command for a public deployment.
 - Padding no longer stops after the first eight writes of a session and leaves later streams' inner TLS handshakes unmasked.
 - WebSocket fronting now actually advertises only `http/1.1` in the TLS ALPN extension. The uTLS ClientHello patch was silently discarded before the handshake, so clients offered the browser default `h2,http/1.1` and then spoke HTTP/1.1, which broke WebSocket tunnels against HTTP/2-capable servers (including TSUNAMI's own server). Added regression tests for both the WebSocket ALPN override and the normal browser ALPN list.
+- Fronting replay protection now inserts a nonce only after the request signature is verified, and the replay cache is bounded, so unauthenticated probes can no longer grow it without limit (memory DoS). The server also derives a single fronting key (explicit `fronting.secret`, or the first static user's password as a deprecated fallback) instead of accepting every user password, removing the O(users) HMAC cost per unauthenticated request.
+- Destination policy now resolves the target once and dials the validated IP, and rejects CGNAT/cloud-metadata, benchmarking, multicast, IPv6 zone and unspecified/broadcast ranges; this closes DNS-rebinding/SSRF bypasses. UoT applies the same resolved-address validation.
+- Sessions are limited to 256 concurrent streams by default (`--max-streams` / `max_streams`), per-stream receive queues are bounded to four frames, relay buffers are 64 KiB, and a stream that never sends a destination address is closed after 10 seconds. A peer opening streams without using them can no longer exhaust memory or goroutines.
 
 ## [1.2.1] - 2026-06-22
 

@@ -338,6 +338,9 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	// Create session
 	seq := c.pool.NextSeq()
 	session := protocol.NewSession(tlsConn, seq)
+	// The client is the stream opener; unlimited local concurrency, while the
+	// server still enforces its own per-session limit.
+	session.SetMaxStreams(0)
 
 	// Wire padding system into session write path.
 	pw := padding.NewWriterForRole(tlsConn, scheme, padding.RoleClient)

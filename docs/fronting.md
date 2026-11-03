@@ -234,7 +234,8 @@ Optional flags:
 
 | Flag | Description |
 |:--|:--|
-| `--front-secret` | HTTP-layer HMAC secret. Defaults to the user password for CLI configs. |
+| `--front-secret` | HTTP-layer HMAC secret. Recommended and should be independent of the user password. When omitted, the server derives a single key from the first static user's password (deprecated: it reuses the authentication credential). |
+| `--max-streams` | Maximum concurrent streams per session (default 256). |
 | `--front-site-name` | Title/body text used by the built-in decoy page. |
 | `--front-site-mode` | Site camouflage mode: `builtin`, `local`, or `remote`. |
 | `--front-site-upstream` | Site camouflage upstream URL or `host:port`. |
@@ -280,11 +281,20 @@ Optional flags:
 | Flag | Description |
 |:--|:--|
 | `--front-host` | Overrides the HTTP Host header. Defaults to SNI. |
-| `--front-secret` | HTTP-layer HMAC secret. Defaults to the TSUNAMI password. |
+| `--front-secret` | HTTP-layer HMAC secret. Defaults to the TSUNAMI password; pass the server's separate fronting secret when one is configured. |
 
 ## Notes
 
 - Fronting keeps the original TSUNAMI authentication inside the tunnel.
+- Configure a **separate fronting secret**. If `fronting.secret` is omitted, the
+  server accepts only a key derived from the first static user's password (kept
+  for single-user compatibility but deprecated); the fronting HMAC key would
+  otherwise be identical to the protocol authentication hash.
+- `max_streams` (default 256) bounds concurrent streams per session; requests
+  beyond the limit are rejected with a `SYNACK` error.
+- The server refuses to proxy to private/reserved destinations unless
+  `--allow-all` is set; the policy is applied to the resolved IP, not the
+  hostname, so DNS rebinding cannot bypass it.
 - Invalid or unauthenticated requests are handled as ordinary website traffic.
   The same is true for a request to the fronting path with a bad or replayed
   HMAC signature: it is proxied to the cover site exactly like any other

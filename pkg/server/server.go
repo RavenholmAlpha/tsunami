@@ -84,6 +84,10 @@ type Config struct {
 	// SessionRenewInterval controls the lease refresh cadence. Zero uses 90
 	// seconds, which is comfortably below XBoard's five-minute lease TTL.
 	SessionRenewInterval time.Duration
+
+	// MaxStreams bounds concurrent streams per session. Zero uses
+	// protocol.DefaultMaxStreams.
+	MaxStreams int
 }
 
 // Server is the TSUNAMI proxy server.
@@ -167,6 +171,9 @@ func New(config Config) (*Server, error) {
 	}
 	if config.SessionRenewInterval <= 0 {
 		config.SessionRenewInterval = 90 * time.Second
+	}
+	if config.MaxStreams <= 0 {
+		config.MaxStreams = protocol.DefaultMaxStreams
 	}
 
 	return &Server{
@@ -385,6 +392,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Create session
 	session := protocol.NewSession(conn, 0)
+	session.SetMaxStreams(s.config.MaxStreams)
 	if lease != nil {
 		stopRenewal := s.startLeaseRenewal(session, user, lease)
 		defer stopRenewal()
@@ -597,8 +605,12 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	defer stream.Close()
 
 	// Read the target incrementally so it remains correct across short reads
-	// and PSH frame boundaries.
+	// and PSH frame boundaries. A timer closes the stream if the client opens a
+	// stream but never sends a destination, so idle streams cannot pin a
+	// handler goroutine forever.
+	readTimer := time.AfterFunc(10*time.Second, func() { _ = stream.Close() })
 	target, err := protocol.ReadSocksAddr(stream)
+	readTimer.Stop()
 	if err != nil {
 		log.Printf("tsunami server: decode target addr: %v", err)
 		return
@@ -608,29 +620,23 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	if isUoTTarget(target) {
 		log.Printf("tsunami server: UoT relay for user '%s'", user.Name)
 		relayStream := s.traffic.WrapReadWriteCloser(stream, user)
-		var allowAddr func(string) bool
-		if !s.config.AllowAll {
-			allowAddr = func(addr string) bool {
-				return !isPrivateTarget(addr)
-			}
-		}
-		relay := uot.NewRelay(relayStream, allowAddr)
+		relay := uot.NewRelay(relayStream, func(target string) (*net.UDPAddr, error) {
+			return resolveUDPTarget(context.Background(), target, s.config.AllowAll)
+		})
 		if err := relay.Run(); err != nil {
 			log.Printf("tsunami server: UoT relay error: %v", err)
 		}
 		return
 	}
 
-	// Check private IP blocklist
-	if !s.config.AllowAll && isPrivateTarget(target) {
-		log.Printf("tsunami server: blocked connection to private address %s for user '%s'", target, user.Name)
-		return
-	}
-
-	// Connect to target
-	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	// Resolve once, validate the resolved addresses, and dial the validated IP.
+	targetConn, err := s.dialTarget(context.Background(), target)
 	if err != nil {
-		log.Printf("tsunami server: connect to %s: %v", target, err)
+		if errors.Is(err, errBlockedTarget) {
+			log.Printf("tsunami server: blocked connection to private address %s for user '%s'", target, user.Name)
+		} else {
+			log.Printf("tsunami server: connect to %s: %v", target, err)
+		}
 		return
 	}
 	defer targetConn.Close()
@@ -1000,26 +1006,22 @@ func buildFrontingKeys(config Config) ([][32]byte, error) {
 	if !config.Fronting.Enabled {
 		return nil, nil
 	}
-	var keys [][32]byte
-	seen := make(map[[32]byte]struct{})
-	add := func(key [32]byte) {
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
+	if config.Fronting.Secret != "" {
+		return [][32]byte{fronting.KeyFromSecret(config.Fronting.Secret)}, nil
 	}
 
-	if config.Fronting.Secret != "" {
-		add(fronting.KeyFromSecret(config.Fronting.Secret))
-	}
+	// Compatibility fallback for single-user deployments: derive one key from
+	// the first user with a password/token hash. Do NOT add every user as a
+	// fronting key: VerifyRequest computes one HMAC per key for every probe,
+	// so a large user list turns unauthenticated requests into CPU DoS, and it
+	// widens the fronting credential to every account on the server.
 	for _, user := range config.Users {
 		if user == nil {
 			continue
 		}
 		if user.Password != "" {
-			add(fronting.KeyFromSecret(user.Password))
-			continue
+			log.Printf("tsunami fronting: fronting_secret is not configured; deriving the fronting key from user %q password (deprecated: configure a separate fronting secret)", user.Name)
+			return [][32]byte{fronting.KeyFromSecret(user.Password)}, nil
 		}
 		if user.TokenHash != "" {
 			decoded, err := hex.DecodeString(strings.TrimSpace(user.TokenHash))
@@ -1029,15 +1031,13 @@ func buildFrontingKeys(config Config) ([][32]byte, error) {
 			if len(decoded) != protocol.AuthHashLen {
 				return nil, fmt.Errorf("tsunami fronting: token hash for user %q has length %d", user.Name, len(decoded))
 			}
+			log.Printf("tsunami fronting: fronting_secret is not configured; deriving the fronting key from user %q token hash (deprecated: configure a separate fronting secret)", user.Name)
 			var key [32]byte
 			copy(key[:], decoded)
-			add(key)
+			return [][32]byte{key}, nil
 		}
 	}
-	if len(keys) == 0 {
-		return nil, fmt.Errorf("tsunami fronting: fronting_secret or static users are required")
-	}
-	return keys, nil
+	return nil, fmt.Errorf("tsunami fronting: fronting_secret or a static user with a password is required")
 }
 
 type tcpTuningListener struct {

@@ -45,6 +45,7 @@ func main() {
 		frontPreserve  = newTriStateBool("front-site-preserve-host", "Preserve the client Host header for the site camouflage upstream (default: local=true, remote=false)")
 		frontInsecure  = newTriStateBool("front-site-insecure-skip-verify", "Skip TLS certificate verification for an HTTPS site camouflage upstream")
 		allowAll       = flag.Bool("allow-all", false, "Allow proxying to private/reserved IP addresses")
+		maxStreams     = flag.Int("max-streams", 0, "Max concurrent streams per session (0 = built-in default)")
 		trafficShaping = flag.Bool("traffic-shaping", false, "Enable constant-rate traffic shaping")
 		showVersion    = flag.Bool("version", false, "Print version and exit")
 	)
@@ -109,6 +110,9 @@ func main() {
 			config.Fronting.Site.Mode,
 			frontingUpstreamForLog(config.Fronting.Site),
 			config.Fronting.PreserveHostEnabled())
+	}
+	if *maxStreams > 0 {
+		config.MaxStreams = *maxStreams
 	}
 
 	config.TCP.ForceBBR = *forceBBR
