@@ -27,7 +27,7 @@
 | TLS 上にカスタム暗号化 — 二重のオーバーヘッド、DPI で容易に検出 | **TLS 1.3 のみ** — カスタム暗号なし、HTTPS と同一 |
 | 固定パケットサイズと予測可能なハンドシェイク | **プログラマブルパディング** — サーバープッシュのパケットサイズ分布 |
 | ストリームごとに 1 接続 — 頻繁なハンドシェイク、検出可能なパターン | **強制多重化** — すべてのストリームが 1 つの TLS 接続を共有 |
-| アクティブプロービングでプロトコル識別 | **透過的フォールバック** — 認証失敗時は実際の HTTP バックエンドにプロキシ |
+| アクティブプロービングでプロトコル識別 | **サイトカモフラージュ** — 未認証リクエストには実カバーサイト（local/remote）またはデコイページを表示 |
 
 ## 機能
 
@@ -50,8 +50,8 @@ Chrome / Firefox / Safari の ClientHello を模倣。JA3/JA4 を無効化。
 </td>
 <td width="50%">
 
-🛡️ **フォールバック耐プローブ**
-認証失敗 → 実際の HTTP バックエンドに透過プロキシ。プローバーには通常の Web サイトに見える。
+🛡️ **サイトカモフラージュ耐プローブ**
+未認証トラフィックは実カバーサイト（`local`）、借用サイト（`remote`）、またはデコイページで応答します。raw モードの認証失敗は HTTP バックエンドへフォールバックします。
 
 📐 **プログラマブルパディング**
 サーバープッシュのパディングスキームがパケットサイズとアイドルキープアライブを制御。クライアント更新不要。
@@ -88,7 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 
 | モード | 動作 | 使いどころ |
 |:--|:--|:--|
-| `local` | このサーバー上の実サイトへリバースプロキシ（デフォルト `http://127.0.0.1:8080`、ポート 80/8080/3000/8000 のリスナーを自動検出）。Host ヘッダーを保持 | 同じ IP で実サイトを運用している場合（推奨） |
+| `local` | このサーバー上の実サイトへリバースプロキシ。ウィザードで実サイトの host:port を明示的に入力（自動検出なし）。Host ヘッダーを保持 | 同じ IP で実サイトを運用している場合（推奨） |
 | `remote` | 別の Web サイトのコンテンツを借用（Host ヘッダーを上流に書き換え） | ローカルに実サイトがなく、上流サイトの規約と可用性を許容できる場合 |
 | `builtin` | 生成されたプレースホルダーページ（最も不自然で、クラスタリングされやすい） | 簡単なテスト専用 |
 
@@ -180,18 +180,22 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 
 # 自己署名モードはローカルテスト専用です。公開環境では実ドメイン証明書と fronting を使ってください。
 
-# 公開環境: 実ドメイン証明書 + fronting
+# 公開環境: 実ドメイン証明書 + 同一サーバーの実サイト
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --fronting \
-  --front-decoy-proxy http://127.0.0.1:8080
+  --front-site-mode local \
+  --front-site-upstream http://127.0.0.1:8080
 
 # JSON 設定を使用
 ./tsunami-server --config /etc/tsunami/config.json
 ```
+
+JSON 設定も同じ安全な既定値に従います。`server.fronting.enabled` を省略すると
+fronting が有効になります。生モードは `server` オブジェクトで明示的に有効化する
+必要があります：`"fronting": { "enabled": false }`。
 
 | フラグ | デフォルト | 説明 |
 |:-----|:--------|:------------|
@@ -199,10 +203,16 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--cert` | — | TLS 証明書ファイル（PEM） |
 | `--key` | — | TLS 秘密鍵ファイル（PEM） |
 | `--password` | *（必須）* | 認証パスワード |
-| `--fronting` | `false` | 公開リスナーを HTTPS/HTTP2/WebSocket fronting として動作させる |
-| `--front-decoy-proxy` | — | 未認証 fronting リクエスト用の任意 HTTP(S) デコイ origin |
+| `--fronting` | `true` | 公開リスナーを HTTPS/HTTP2/WebSocket fronting として動作させる。`--fronting=false` は制御された生モード専用 |
+| `--front-path` | `/assets/update` | fronting HTTP パス。インストーラーは一意な名前を生成 |
+| `--front-secret` | *（最初のユーザーパスワード、非推奨）* | fronting HMAC シークレット。パスワードとは独立した値を設定 |
+| `--front-site-mode` | *（自動推論）* | サイトカモフラージュ：`builtin`、`local`、`remote` |
+| `--front-site-upstream` | *（local/remote で必須）* | 上流オリジン（`host:port` または URL） |
+| `--front-decoy-proxy` | — | `--front-site-upstream` の非推奨エイリアス |
+| `--max-streams` | `256` | セッションあたりの最大同時ストリーム数 |
+| `--allow-all` | `false` | プライベート/予約済みターゲットへのプロキシを許可（テスト専用） |
 | `--fallback` | — | フォールバック HTTP バックエンド |
-| `--config` | — | JSON 設定ファイル |
+| `--config` | — | JSON 設定ファイル。`server.fronting.enabled` 省略時は `true` |
 
 </details>
 
@@ -217,6 +227,9 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
   --http 127.0.0.1:8080
 ```
 
+HTTPS/HTTP2 fronting は既定で有効です。`--fronting=false` は制御された生モードの
+サーバーに接続する場合のみ使用してください。
+
 | フラグ | デフォルト | 説明 |
 |:-----|:--------|:------------|
 | `--server` | *（必須）* | サーバーアドレス `host:port` |
@@ -226,6 +239,11 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 | `--fingerprint` | `chrome` | `chrome` / `firefox` / `safari` / `random` / `none` |
 | `--socks` | `127.0.0.1:1080` | ローカル SOCKS5 プロキシアドレス |
 | `--http` | `127.0.0.1:8080` | ローカル HTTP プロキシアドレス |
+| `--fronting` | `true` | HTTPS/HTTP2/WebSocket fronting を使用。`--fronting=false` は制御された生モード専用 |
+| `--front-path` | `/assets/update` | fronting HTTP パス（サーバーと一致させる） |
+| `--front-secret` | *（ユーザーパスワード）* | fronting HMAC シークレット（サーバーと一致させる） |
+| `--front-host` | *（SNI）* | HTTP Host ヘッダーの上書き |
+| `--front-transport` | `h2` | `h2` または `websocket` |
 | `--max-connections` | `4` | 最大 TLS 接続数（Surge） |
 | `--threshold` | `8` | Surge Layer 2 ストリーム閾値 |
 
@@ -266,7 +284,7 @@ curl -x http://127.0.0.1:8080 https://httpbin.org/ip
 |:------|:------|
 | **DPI** | 純粋な TLS 1.3 + ALPN `h2`、ポート 443 |
 | **JA3/JA4 フィンガープリント** | uTLS で実際のブラウザ ClientHello を模倣 |
-| **アクティブプロービング** | 認証失敗時に実際の HTTP バックエンドにフォールバック |
+| **アクティブプロービング** | デコイサイト（`local`/`remote` カバーサイト）または raw モードの HTTP フォールバック |
 | **トラフィック分析** | プログラマブルなサーバープッシュパディング |
 | **タイミング攻撃** | 定時間パスワード比較 |
 | **接続フィンガープリント** | デフォルト単一接続、高負荷時のみ複数接続 |
@@ -326,14 +344,14 @@ tsunami/
 | `TSUNAMI_FRONT_SECRET` | *（自動生成）* | 独立した fronting HMAC シークレット |
 | `TSUNAMI_SITE_NAME` | *（自動導出）* | サイト名（ドメインから導出） |
 | `TSUNAMI_SITE_MODE` | `builtin`（非対話） | サイトカモフラージュ：`local`、`remote`、`builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `local` は `http://127.0.0.1:8080` | `local`/`remote` の上流 HTTP(S) オリジン |
+| `TSUNAMI_SITE_UPSTREAM` | `local`/`remote` で必須 | 上流 HTTP(S) オリジン（host:port） |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `local` は `true` | 訪問者の `Host` ヘッダーを保持するか |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | HTTPS 上流の TLS 検証をスキップするか |
 | `TSUNAMI_DECOY_PROXY` | — | 旧エイリアス：`remote` + 上流にマップ |
 | `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | クライアントコマンドが使う TLS SNI |
 | `TSUNAMI_PADDING_SCHEME_JSON` | *（サーバーデフォルト）* | サーバーのデフォルトパディングスキームを上書き |
 | `TSUNAMI_ADVANCED` | — | `1` でウィザードに詳細プロンプトを表示 |
-| `TSUNAMI_VERSION` | `latest` | インストールするリリースバージョン（`v1.2.3`） |
+| `TSUNAMI_VERSION` | `latest` | インストールするリリースバージョン（`v1.3.1`） |
 | `TSUNAMI_ASSUME_YES` | — | `1` ですべての対話プロンプトをスキップ |
 
 ## ドキュメント
@@ -343,6 +361,7 @@ tsunami/
 | [プロトコル仕様](docs/protocol.ja.md) | ワイヤフォーマット、フレーム、コマンド、認証 |
 | [パディングスキーム](docs/padding.ja.md) | プログラマブルパディングシステムの構文と設定 |
 | [Surge 設計](docs/surge.ja.md) | アダプティブ接続スケーリングアーキテクチャ |
+| [組み込みフロンティング](docs/fronting.md) | Caddy 風 HTTPS/HTTP2/WebSocket フロンティングモード |
 | [デプロイガイド](docs/deployment.ja.md) | ワンクリックインストール、Let's Encrypt、環境変数 |
 | [コントロールプレーン](docs/control-plane.ja.md) | パネルアダプター、ミドルウェア、ユーザーストア |
 | [ビルドシステム](build/README.ja.md) | クロスプラットフォームビルドスクリプト |

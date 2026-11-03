@@ -27,7 +27,7 @@
 | 在 TLS 之上再加自定义加密 — 重复开销，容易被 DPI 识别 | **仅使用 TLS 1.3** — 无自定义加密，与 HTTPS 线路完全一致 |
 | 固定数据包大小和可预测的握手 | **可编程填充** — 服务端推送的每包大小分布 |
 | 每个流一个连接 — 频繁握手，可检测模式 | **强制多路复用** — 所有流共享同一个 TLS 连接 |
-| 主动探测可暴露协议身份 | **透明回退** — 认证失败时代理到真实 HTTP 后端 |
+| 主动探测可暴露协议身份 | **站点伪装** — 未认证请求看到真实封面站点（local/remote）或内置页面 |
 
 ## 特性
 
@@ -50,8 +50,8 @@
 </td>
 <td width="50%">
 
-🛡️ **回退反探测**
-认证失败 → 透明代理到真实 HTTP 后端。主动探测者只能看到正常网站。
+🛡️ **站点伪装反探测**
+未认证流量由真实封面站点（`local`）、借用站点（`remote`）或内置页面承接；raw 模式认证失败仍回退到 HTTP 后端。
 
 📐 **可编程填充**
 服务端推送的填充方案控制数据包大小和空闲保活。无需客户端更新即可更改。
@@ -88,7 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 
 | 模式 | 行为 | 适用场景 |
 |:--|:--|:--|
-| `local` | 反向代理到本服务器上的真实网站（默认 `http://127.0.0.1:8080`，自动探测 80/8080/3000/8000 端口监听）；保留 Host 头 | 同一 IP 上有真实网站（推荐） |
+| `local` | 反向代理到本服务器上的真实网站；向导要求手动填写其 host:port（不再自动探测）；保留 Host 头 | 同一 IP 上有真实网站（推荐） |
 | `remote` | 借用其他网站的内容（Host 头重写为上游） | 本地没有真实站点，并接受上游站点的条款与可用性 |
 | `builtin` | 生成的占位页面（最不真实，最容易被聚类识别） | 仅用于快速测试 |
 
@@ -196,13 +196,14 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 
 # fronting 默认启用。自签名模式仅用于本地测试；公网部署应使用真实域名证书和伪装源站。
 
-# 公网部署：真实域名证书 + 伪装源站
+# 公网部署：真实域名证书 + 本机真实站点
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --front-decoy-proxy http://127.0.0.1:8080
+  --front-site-mode local \
+  --front-site-upstream http://127.0.0.1:8080
 
 # 使用 JSON 配置
 ./tsunami-server --config /etc/tsunami/config.json
@@ -218,7 +219,13 @@ fronting。原始模式必须在 `server` 对象中显式启用：`"fronting": {
 | `--key` | — | TLS 私钥文件（PEM） |
 | `--password` | *（必填）* | 认证密码 |
 | `--fronting` | `true` | 将公网监听器作为 HTTPS/HTTP2/WebSocket 前置层；仅在受控的原始模式网络中使用 `--fronting=false` |
-| `--front-decoy-proxy` | — | 未认证 fronting 请求的可选 HTTP(S) 伪装源站 |
+| `--front-path` | `/assets/update` | fronting HTTP 路径；安装脚本会生成唯一名称 |
+| `--front-secret` | *（第一个用户密码，已弃用）* | fronting HMAC 密钥；请设置与密码无关的独立值 |
+| `--front-site-mode` | *（自动推断）* | 站点伪装：`builtin`、`local` 或 `remote` |
+| `--front-site-upstream` | *（local/remote 必填）* | 上游源站（`host:port` 或 URL） |
+| `--front-decoy-proxy` | — | `--front-site-upstream` 的弃用别名 |
+| `--max-streams` | `256` | 每会话最大并发流数 |
+| `--allow-all` | `false` | 允许代理到私有/保留地址（仅测试） |
 | `--fallback` | — | 回退 HTTP 后端 |
 | `--config` | — | JSON 配置文件；省略 `server.fronting.enabled` 时默认为 `true` |
 
@@ -248,6 +255,10 @@ HTTPS/HTTP2 fronting 默认启用。仅在连接受控的原始模式服务器�
 | `--socks` | `127.0.0.1:1080` | 本地 SOCKS5 代理地址 |
 | `--http` | `127.0.0.1:8080` | 本地 HTTP 代理地址 |
 | `--fronting` | `true` | 使用 HTTPS/HTTP2/WebSocket 前置传输；仅在受控的原始模式网络中使用 `--fronting=false` |
+| `--front-path` | `/assets/update` | fronting HTTP 路径（必须与服务端一致） |
+| `--front-secret` | *（用户密码）* | fronting HMAC 密钥（必须与服务端一致） |
+| `--front-host` | *（SNI）* | 覆盖 HTTP Host 头 |
+| `--front-transport` | `h2` | `h2` 或 `websocket` |
 | `--max-connections` | `4` | 最大 TLS 连接数（Surge） |
 | `--threshold` | `8` | Surge Layer 2 流阈值 |
 
@@ -288,7 +299,7 @@ curl -x http://127.0.0.1:8080 https://httpbin.org/ip
 |:------|:------|
 | **DPI** | 纯 TLS 1.3 + ALPN `h2`，端口 443 |
 | **JA3/JA4 指纹** | uTLS 模拟真实浏览器 ClientHello |
-| **主动探测** | 认证失败时回退到真实 HTTP 后端 |
+| **主动探测** | 伪装站点（`local`/`remote` 封面站点）或 raw 模式 HTTP 回退 |
 | **流量分析** | 可编程的服务端推送填充 |
 | **时序攻击** | 恒定时间密码比较 |
 | **连接指纹** | 默认单连接；仅在负载高时多连接 |
@@ -351,14 +362,14 @@ tsunami/
 | `TSUNAMI_FRONT_SECRET` | *（自动生成）* | 独立的 fronting HMAC 密钥 |
 | `TSUNAMI_SITE_NAME` | *（自动派生）* | 站点名称（从域名派生） |
 | `TSUNAMI_SITE_MODE` | `builtin`（非交互） | 站点伪装模式：`local`、`remote` 或 `builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `local` 默认 `http://127.0.0.1:8080` | `local`/`remote` 的上游 HTTP(S) 源站 |
+| `TSUNAMI_SITE_UPSTREAM` | `local`/`remote` 必填 | 上游 HTTP(S) 源站（host:port） |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `local` 默认 `true` | 是否保留访问者的 `Host` 头 |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | 是否跳过 HTTPS 上游的 TLS 校验 |
 | `TSUNAMI_DECOY_PROXY` | — | 旧版别名：映射为 `remote` + 上游 |
 | `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | 客户端命令使用的 TLS SNI |
 | `TSUNAMI_PADDING_SCHEME_JSON` | *（服务端默认值）* | 覆盖服务端默认填充方案 |
 | `TSUNAMI_ADVANCED` | — | `1` 在向导中询问高级参数 |
-| `TSUNAMI_VERSION` | `latest` | 要安装的版本号（`v1.2.3`） |
+| `TSUNAMI_VERSION` | `latest` | 要安装的版本号（`v1.3.1`） |
 | `TSUNAMI_ASSUME_YES` | — | `1` 跳过所有交互提示 |
 
 ## 文档

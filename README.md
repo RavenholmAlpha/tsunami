@@ -27,7 +27,7 @@
 | Custom encryption on top of TLS — duplicated overhead, easy DPI fingerprints | **TLS 1.3 only** — no custom crypto, wire-identical to HTTPS |
 | Fixed packet sizes and predictable handshakes | **Programmable padding** — server-pushed, per-packet size distributions |
 | One connection per stream — frequent handshakes, detectable patterns | **Mandatory multiplexing** — all streams share one TLS connection |
-| Active probing reveals protocol identity | **Transparent fallback** — failed auth proxies to real HTTP backend |
+| Active probing reveals protocol identity | **Site camouflage** — unauthenticated requests see a real cover site (local/remote) or decoy page |
 
 ## Features
 
@@ -50,8 +50,8 @@ Single connection by default; auto multi-connection under heavy load. No packet 
 </td>
 <td width="50%">
 
-🛡️ **Fallback Anti-Probe**
-Failed auth → transparent proxy to real HTTP backend. Active probers see a normal website.
+🛡️ **Site Camouflage Anti-Probe**
+Unauthenticated traffic is served by a real cover site (`local`), a borrowed site (`remote`), or a decoy page. Raw-mode auth failures still fall back to an HTTP backend.
 
 📐 **Programmable Padding**
 Server-pushed padding schemes control packet sizes and idle keepalives. Changed across all clients without any client update.
@@ -197,13 +197,14 @@ go build -trimpath -ldflags="-s -w" -o tsunami-client ./cmd/tsunami-client/
 # Fronting is enabled by default. Self-signed mode is for local testing only;
 # public deployments should use a real domain certificate and decoy origin.
 
-# Public deployment: real domain certificate + decoy origin
+# Public deployment: real domain certificate + real same-server site
 ./tsunami-server \
   --listen :443 \
   --cert /path/to/cert.pem \
   --key /path/to/key.pem \
   --password "your-strong-password" \
-  --front-decoy-proxy http://127.0.0.1:8080
+  --front-site-mode local \
+  --front-site-upstream http://127.0.0.1:8080
 
 # With JSON config
 ./tsunami-server --config /etc/tsunami/config.json
@@ -220,7 +221,13 @@ opt-in inside the `server` object: `"fronting": { "enabled": false }`.
 | `--key` | — | TLS private key file (PEM) |
 | `--password` | *(required)* | Authentication password |
 | `--fronting` | `true` | Serve the public listener as HTTPS/HTTP2/WebSocket fronting; use `--fronting=false` only for controlled raw-mode networks |
-| `--front-decoy-proxy` | - | Optional HTTP(S) decoy origin for unauthenticated fronting requests |
+| `--front-path` | `/assets/update` | Fronting HTTP path; the installer generates a unique name |
+| `--front-secret` | *(first user password, deprecated)* | Fronting HMAC secret; set a value independent of the password |
+| `--front-site-mode` | *(inferred)* | Site camouflage: `builtin`, `local`, or `remote` |
+| `--front-site-upstream` | *(required for local/remote)* | Upstream origin (`host:port` or URL) |
+| `--front-decoy-proxy` | — | Deprecated alias for `--front-site-upstream` |
+| `--max-streams` | `256` | Max concurrent streams per session |
+| `--allow-all` | `false` | Allow proxying to private/reserved targets (testing only) |
 | `--fallback` | — | Fallback HTTP backend |
 | `--config` | — | JSON configuration file; omitted `server.fronting.enabled` defaults to `true` |
 
@@ -250,6 +257,10 @@ connecting to a controlled raw-mode server.
 | `--socks` | `127.0.0.1:1080` | Local SOCKS5 proxy address |
 | `--http` | `127.0.0.1:8080` | Local HTTP proxy address |
 | `--fronting` | `true` | Use HTTPS/HTTP2/WebSocket fronting; use `--fronting=false` only for controlled raw-mode networks |
+| `--front-path` | `/assets/update` | Fronting HTTP path (must match the server) |
+| `--front-secret` | *(user password)* | Fronting HMAC secret (must match the server) |
+| `--front-host` | *(SNI)* | HTTP Host header override |
+| `--front-transport` | `h2` | `h2` or `websocket` |
 | `--max-connections` | `4` | Max TLS connections (Surge) |
 | `--threshold` | `8` | Stream threshold for Surge Layer 2 |
 
@@ -334,7 +345,7 @@ Client                                     Server
 |:------|:------|
 | **DPI** | Pure TLS 1.3 + ALPN `h2` on port 443 |
 | **JA3/JA4 fingerprinting** | uTLS mimics real browser ClientHello |
-| **Active probing** | Fallback to real HTTP backend on auth failure |
+| **Active probing** | Decoy website (`local`/`remote` cover site) or raw-mode HTTP fallback |
 | **Traffic analysis** | Programmable server-pushed padding |
 | **Timing attacks** | Constant-time password comparison |
 | **Connection fingerprint** | Single connection default; multi only under load |
