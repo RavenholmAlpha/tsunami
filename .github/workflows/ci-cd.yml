@@ -37,7 +37,10 @@ jobs:
 
     - name: golangci-lint
       run: |
-        go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        # Pin the linter: @latest switched major versions before and silently
+        # changed which findings fail the build. v1.64.8 is the last v1 release
+        # and matches the v1-style .golangci.yml in this repository.
+        go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
         golangci-lint run --timeout=5m ./...
 
     - name: Shellcheck
