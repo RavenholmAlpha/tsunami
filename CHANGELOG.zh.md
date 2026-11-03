@@ -7,6 +7,11 @@
 本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [1.3.1] - 2026-11-03
+
+### 变更
+- 安装脚本不再自动探测本机封面站点。`local` 站点伪装现在必须显式填写上游 host:port（向导提示或 `TSUNAMI_SITE_UPSTREAM`），避免静默反代到非预期的本地服务。非交互模式下 `TSUNAMI_SITE_MODE=local` 缺少上游会直接失败，不再默认 `127.0.0.1:8080`。
+
 ## [1.3.0] - 2026-11-03
 
 ### 新增

@@ -56,7 +56,7 @@ Fronting は通常の（未認証の）リクエストに対して `fronting.sit
 
 | モード | 動作 | 使いどころ |
 |:--|:--|:--|
-| `local` | このサーバー上の実サイトへリバースプロキシ。デフォルト上流 `http://127.0.0.1:8080`、ポート 80/8080/3000/8000 のリスナーを自動検出して事前選択。`preserve_host: true` | 同じ IP で実サイトを運用している場合（推奨） |
+| `local` | このサーバー上の実サイトへリバースプロキシ。実サイトの host:port を明示的に入力（自動検出なし）。`preserve_host: true` | 同じ IP で実サイトを運用している場合（推奨） |
 | `remote` | 別の Web サイトのコンテンツを借用。`preserve_host: false` で Host ヘッダーを上流に書き換え | ローカルに実サイトがなく、上流サイトの規約と可用性を許容できる場合 |
 | `builtin` | 生成されたプレースホルダーページ（最も不自然で、クラスタリングされやすい） | 簡単なテスト専用 |
 
@@ -162,7 +162,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 特定のリリースをインストール：
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.1 bash scripts/install.sh
 ```
 
 ソースチェックアウト内で実行する場合、Go が利用可能であれば現在のソースをビルドします。そうでなければ `build/linux-*`（存在する場合）を使用し、GitHub Releases にフォールバックします。
@@ -290,7 +290,7 @@ tsunami-client --server example.com:443 --password '...' --fingerprint none
 | `TSUNAMI_FRONT_SECRET` | *（自動生成）* | 独立した fronting HMAC シークレット |
 | `TSUNAMI_SITE_NAME` | *（自動導出）* | 生成ページに表示するサイト名 |
 | `TSUNAMI_SITE_MODE` | `builtin`（非対話） | サイトカモフラージュ：`local`、`remote`、`builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `local` は `http://127.0.0.1:8080` | `local`/`remote` の上流 HTTP(S) オリジン |
+| `TSUNAMI_SITE_UPSTREAM` | `local`/`remote` で必須 | 上流 HTTP(S) オリジン（host:port） |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `local` は `true` | 訪問者の `Host` ヘッダーを保持するか |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | HTTPS 上流の TLS 検証をスキップするか |
 | `TSUNAMI_DECOY_PROXY` | *（なし）* | 旧エイリアス：`remote` + 上流にマップ |

@@ -35,9 +35,6 @@ fi
 # Server built-in default (pkg/fronting.DefaultPath); only used for reporting.
 SERVER_DEFAULT_FRONT_PATH="/assets/update"
 
-# Local ports probed when suggesting a same-server reverse-proxy upstream.
-LOCAL_SITE_PORTS="80 8080 3000 8000"
-
 # Site-camouflage settings resolved by resolve_site_settings().
 SITE_MODE="builtin"
 SITE_UPSTREAM=""
@@ -388,38 +385,6 @@ is_advanced_mode() {
   normalize_yes "${TSUNAMI_ADVANCED:-}"
 }
 
-# Parses socket-listing text (ss/lsof) and returns the first local HTTP origin
-# found on the probed ports. Returns non-zero when nothing is listening.
-local_site_upstream_from_listing() {
-  local listing="$1"
-  local port
-  for port in $LOCAL_SITE_PORTS; do
-    if printf '%s\n' "$listing" | grep -Eq "(127\.0\.0\.1|0\.0\.0\.0|\[::\]|\[::1\]|\*)[:.]${port}([^0-9]|$)" >/dev/null 2>&1; then
-      printf 'http://127.0.0.1:%s' "$port"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Detects a plausible same-server HTTP site for the site-camouflage default.
-detect_local_site() {
-  local listing=""
-  if has_cmd ss; then
-    listing="$(ss -ltn 2>/dev/null || true)"
-  fi
-  if [ -z "$listing" ] && has_cmd lsof; then
-    listing="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || true)"
-  fi
-  if [ -n "$listing" ]; then
-    if local_site_upstream_from_listing "$listing"; then
-      return 0
-    fi
-  fi
-  printf ''
-  return 0
-}
-
 prompt_choice() {
   local prompt="$1"
   local default="$2"
@@ -515,7 +480,7 @@ resolve_site_settings() {
   fi
 
   local mode="" upstream="" preserve="" insecure=""
-  local detected="" choice="" default_choice="" default_upstream=""
+  local choice="" default_upstream=""
 
   if [ "$reuse" = "1" ]; then
     mode="${TSUNAMI_SITE_MODE:-}"
@@ -549,18 +514,9 @@ resolve_site_settings() {
 
   if [ -z "$mode" ]; then
     if [ "$interactive" = "1" ]; then
-      detected="$(detect_local_site)"
       default_upstream="${TSUNAMI_SITE_UPSTREAM:-}"
-      default_choice="2"
-      if [ -n "$detected" ]; then
-        default_choice="1"
-        default_upstream="$detected"
-      fi
-      if [ -z "$default_upstream" ]; then
-        default_upstream="http://127.0.0.1:8080"
-      fi
-      choice="$(prompt_choice "Site camouflage: what should unauthenticated visitors see?" "$default_choice" \
-        "Local real site on this server (reverse proxy)" \
+      choice="$(prompt_choice "Site camouflage: what should unauthenticated visitors see?" "1" \
+        "Local real site on this server (reverse proxy; enter its host:port)" \
         "Borrow a remote website" \
         "Built-in page (least realistic)")"
       case "$choice" in
@@ -569,7 +525,13 @@ resolve_site_settings() {
         *) mode="builtin" ;;
       esac
       if [ "$mode" = "local" ]; then
-        upstream="$(ask "Local site upstream URL" "$default_upstream")"
+        while :; do
+          upstream="$(ask "Local site upstream (host:port, e.g. http://127.0.0.1:8080)" "$default_upstream")"
+          if [ -n "$upstream" ]; then
+            break
+          fi
+          warn "Local site camouflage requires an explicit upstream; automatic port detection was removed."
+        done
         upstream="$(validate_http_origin "site upstream" "$upstream")"
       elif [ "$mode" = "remote" ]; then
         upstream="$(ask "Remote site upstream URL (e.g. https://www.wikipedia.org, https://news.ycombinator.com, https://example.org; empty = built-in page)" "")"
@@ -590,7 +552,7 @@ resolve_site_settings() {
   case "$mode" in
     local)
       if [ -z "$upstream" ]; then
-        upstream="http://127.0.0.1:8080"
+        die "TSUNAMI_SITE_MODE=local requires TSUNAMI_SITE_UPSTREAM (host:port of the real site; automatic port detection was removed)"
       fi
       upstream="$(validate_http_origin "site upstream" "$upstream")"
       SITE_PRESERVE_HOST="true"
@@ -2026,8 +1988,9 @@ Commands:
   uninstall   Remove binary, service, and optionally config
 
 TLS modes (TSUNAMI_TLS_MODE): letsencrypt (default), manual, self-signed
-Site camouflage modes (TSUNAMI_SITE_MODE): local (default upstream
-http://127.0.0.1:8080), remote (requires TSUNAMI_SITE_UPSTREAM), builtin
+Site camouflage modes (TSUNAMI_SITE_MODE): local (requires
+TSUNAMI_SITE_UPSTREAM with your real site's host:port; no auto-detection),
+remote (requires TSUNAMI_SITE_UPSTREAM), builtin
 
 Environment:
   TSUNAMI_LISTEN=:443
@@ -2041,7 +2004,7 @@ Environment:
   TSUNAMI_LETSENCRYPT=y               Auto-approve Let's Encrypt
   TSUNAMI_ACME_EMAIL=you@example.com  Email for Let's Encrypt notifications
   TSUNAMI_SITE_MODE=local|remote|builtin
-  TSUNAMI_SITE_UPSTREAM=http://127.0.0.1:8080
+  TSUNAMI_SITE_UPSTREAM=<real site host:port; required for local/remote>
   TSUNAMI_SITE_PRESERVE_HOST=true|false
   TSUNAMI_SITE_INSECURE_SKIP_VERIFY=true|false
   TSUNAMI_DECOY_PROXY=<legacy alias for remote + upstream>
@@ -2052,7 +2015,7 @@ Environment:
   TSUNAMI_SNI=<TLS SNI; defaults to TSUNAMI_PUBLIC_HOST>
   TSUNAMI_PADDING_SCHEME_JSON=<override the server default padding scheme>
   TSUNAMI_ADVANCED=1                  Ask the advanced prompts in the wizard
-  TSUNAMI_VERSION=v1.3.0 or latest
+  TSUNAMI_VERSION=v1.3.1 or latest
   TSUNAMI_ASSUME_YES=1
 EOF
 }

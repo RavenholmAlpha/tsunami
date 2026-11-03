@@ -58,7 +58,7 @@ Fronting 会为普通（未认证）请求提供 `fronting.site` 配置块。安
 
 | 模式 | 行为 | 适用场景 |
 |:--|:--|:--|
-| `local` | 反向代理到本服务器上的真实站点；默认上游 `http://127.0.0.1:8080`，会自动预选 80/8080/3000/8000 端口上的监听。`preserve_host: true` | 同一 IP 上有真实网站（推荐） |
+| `local` | 反向代理到本服务器上的真实站点；需要手动填写其 host:port（不再自动探测）。`preserve_host: true` | 同一 IP 上有真实网站（推荐） |
 | `remote` | 借用其他网站的内容；`preserve_host: false` 会把 Host 头重写为上游 | 本地没有真实站点，并接受上游站点的条款与可用性 |
 | `builtin` | 生成的占位页面（最不真实，最容易被聚类识别） | 仅用于快速测试 |
 
@@ -164,7 +164,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 安装特定版本：
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.1 bash scripts/install.sh
 ```
 
 在源码目录内运行时，如果 Go 可用，安装程序会构建当前源码。否则使用 `build/linux-*`（如果存在），然后回退到 GitHub Releases。
@@ -292,7 +292,7 @@ tsunami-client --server example.com:443 --password '...' --fingerprint none
 | `TSUNAMI_FRONT_SECRET` | *（自动生成）* | 独立的 fronting HMAC 密钥 |
 | `TSUNAMI_SITE_NAME` | *（自动派生）* | 生成页面显示的站点名称 |
 | `TSUNAMI_SITE_MODE` | `builtin`（非交互） | 站点伪装：`local`、`remote` 或 `builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `local` 默认 `http://127.0.0.1:8080` | `local`/`remote` 的上游 HTTP(S) 源站 |
+| `TSUNAMI_SITE_UPSTREAM` | `local`/`remote` 必填 | 上游 HTTP(S) 源站（host:port） |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `local` 默认 `true` | 是否保留访问者的 `Host` 头 |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | 是否跳过 HTTPS 上游的 TLS 校验 |
 | `TSUNAMI_DECOY_PROXY` | *（无）* | 旧版别名：映射为 `remote` + 上游 |

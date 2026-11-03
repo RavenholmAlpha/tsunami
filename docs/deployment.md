@@ -85,7 +85,7 @@ The installer writes it automatically from the third wizard question:
 
 | Mode | Behaviour | Use when |
 |:--|:--|:--|
-| `local` | Reverse-proxies to a real site on this server; default upstream `http://127.0.0.1:8080`, detected listeners on ports 80/8080/3000/8000 are pre-selected. `preserve_host: true` | You run a real website on the same IP (recommended) |
+| `local` | Reverse-proxies to a real site on this server; you provide its host:port (no auto-detection). `preserve_host: true` | You run a real website on the same IP (recommended) |
 | `remote` | Borrows another website's content; `preserve_host: false` rewrites the Host header to the upstream | No local real site; accept the origin's terms and availability |
 | `builtin` | Generated placeholder page (least realistic, easiest to cluster) | Quick tests only |
 
@@ -215,7 +215,7 @@ self-signed deployment publicly.
 To install a specific release:
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.1 bash scripts/install.sh
 ```
 
 When run inside a source checkout, the installer builds the current source if
@@ -357,7 +357,7 @@ tsunami-client --server example.com:443 --password '...' --fingerprint none
 | `TSUNAMI_FRONT_SECRET` | *(generated)* | Separate fronting HMAC secret |
 | `TSUNAMI_SITE_NAME` | *(derived)* | Site name shown by the generated page |
 | `TSUNAMI_SITE_MODE` | `builtin` (non-interactive) | Site camouflage: `local`, `remote`, or `builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `http://127.0.0.1:8080` for `local` | Upstream HTTP(S) origin for `local`/`remote` |
+| `TSUNAMI_SITE_UPSTREAM` | required for `local`/`remote` | Upstream HTTP(S) origin (host:port) |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `true` for `local` | Preserve the visitor's `Host` header |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification for an HTTPS upstream |
 | `TSUNAMI_DECOY_PROXY` | *(none)* | Legacy alias: maps to `remote` + upstream |

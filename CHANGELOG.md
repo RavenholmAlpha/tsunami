@@ -7,6 +7,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-03
+
+### Changed
+- The installer no longer auto-detects a local cover site. `local` site camouflage now requires an explicit upstream host:port (wizard prompt or `TSUNAMI_SITE_UPSTREAM`), so it cannot silently reverse-proxy to an unintended local service. Non-interactive `TSUNAMI_SITE_MODE=local` without an upstream now fails instead of defaulting to `127.0.0.1:8080`.
+
 ## [1.3.0] - 2026-11-03
 
 ### Added

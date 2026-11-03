@@ -953,13 +953,13 @@ test_quick_wizard_single_confirm() {
   is_interactive() { return 0; }
   obtain_letsencrypt_cert() { printf 'certbot-stub\n'; }
   write_certbot_hooks() { :; }
-  detect_local_site() { printf 'http://127.0.0.1:3000'; }
   # ask prompts are not visible when stdin is a pipe; mark them explicitly.
   ask() { printf 'ASK:%s\n' "$1" >&2; printf '%s' "$2"; }
   confirm() { printf 'CONFIRM:%s\n' "$1"; return 0; }
 
   export TSUNAMI_PUBLIC_HOST="cdn.tsunami.dev"
   export TSUNAMI_PASSWORD="test-password-123456"
+  export TSUNAMI_SITE_UPSTREAM="http://127.0.0.1:3000"
 
   # TLS Enter (default) and site Enter (local default); ask() supplies the rest.
   output="$(printf '\n\n' | write_config 2>&1)"
@@ -977,7 +977,7 @@ test_quick_wizard_single_confirm() {
   TESTS_RUN=$((TESTS_RUN + 8))
 
   assert_file_contains "$CONFIG_FILE" '"mode": "local"' "quick wizard writes local site mode"
-  assert_file_contains "$CONFIG_FILE" '"upstream": "http://127.0.0.1:3000"' "quick wizard uses the detected local upstream"
+  assert_file_contains "$CONFIG_FILE" '"upstream": "http://127.0.0.1:3000"' "quick wizard uses the configured local upstream"
   assert_file_contains "$CONFIG_FILE" '"preserve_host": true' "local site preserves the Host header"
   assert_file_contains "$CONFIG_FILE" '"cert": "/etc/letsencrypt/live/cdn.tsunami.dev/fullchain.pem"' "LE certificate path written"
   assert_file_contains "$CLIENT_FILE" "--front-path" "quick wizard client command carries front path"
@@ -1036,8 +1036,11 @@ test_write_config_site_modes_json() {
 
   export TSUNAMI_SITE_MODE=local
   unset TSUNAMI_SITE_UPSTREAM
-  write_config 2>/dev/null
-  assert_file_contains "$CONFIG_FILE" '"upstream": "http://127.0.0.1:8080"' "local site defaults to 127.0.0.1:8080"
+  set +e
+  ( write_config 2>/dev/null >/dev/null )
+  status=$?
+  set -e
+  assert_eq "1" "$status" "local site mode requires an explicit upstream"
 
   export TSUNAMI_SITE_MODE=remote
   export TSUNAMI_SITE_UPSTREAM="https://www.wikipedia.org"
@@ -1178,31 +1181,6 @@ test_reuse_existing_settings_skips_prompts() {
   rm -rf "$tmp_dir"
 }
 
-test_local_site_detection_helper() {
-  local tmp_dir listing
-  tmp_dir="$(mktemp -d)"
-  source_installer "$tmp_dir"
-
-  listing="State Recv-Q Send-Q Local Address:Port Peer Address:Port
-LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:*"
-  assert_eq "http://127.0.0.1:8080" "$(local_site_upstream_from_listing "$listing")" "detection finds 127.0.0.1:8080"
-
-  listing="LISTEN 0 511 *:3000 *:*"
-  assert_eq "http://127.0.0.1:3000" "$(local_site_upstream_from_listing "$listing")" "detection finds wildcard :3000"
-
-  listing="LISTEN 0 4096 0.0.0.0:80 0.0.0.0:*"
-  assert_eq "http://127.0.0.1:80" "$(local_site_upstream_from_listing "$listing")" "detection finds port 80"
-
-  assert_failure "detection ignores unlisted ports" local_site_upstream_from_listing "LISTEN 0 4096 127.0.0.1:8081 0.0.0.0:*"
-  assert_failure "detection ignores loopback SSH" local_site_upstream_from_listing "LISTEN 0 4096 127.0.0.1:22 0.0.0.0:*"
-
-  # With neither ss nor lsof the detector returns an empty (successful) result.
-  has_cmd() { case "$1" in ss | lsof) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
-  assert_eq "" "$(detect_local_site)" "detection returns empty without ss/lsof"
-
-  rm -rf "$tmp_dir"
-}
-
 test_security_check_site_mode_branches() {
   local tmp_dir output status
   tmp_dir="$(mktemp -d)"
@@ -1312,7 +1290,6 @@ test_interactive_remote_empty_upstream_falls_back
 test_advanced_prompts_only_with_flag
 test_main_advanced_command_enables_flag
 test_reuse_existing_settings_skips_prompts
-test_local_site_detection_helper
 test_security_check_site_mode_branches
 
 printf 'ok - %s install script tests\n' "$TESTS_RUN"

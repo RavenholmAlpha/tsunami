@@ -90,7 +90,7 @@ The wizard is short — three questions and one confirmation:
 
 | Mode | Behaviour | Use when |
 |:--|:--|:--|
-| `local` | Reverse-proxies to a real site on this server (default `http://127.0.0.1:8080`, auto-detected listeners on ports 80/8080/3000/8000); Host header preserved | You run a real website on the same IP (recommended) |
+| `local` | Reverse-proxies to a real site on this server; the wizard asks for that site's explicit host:port (no auto-detection). Host header preserved | You run a real website on the same IP (recommended) |
 | `remote` | Borrows another website's content (Host header rewritten to the upstream) | You do not run a real site locally and accept the origin's terms/availability |
 | `builtin` | Generated placeholder page (least realistic, easiest to cluster) | Quick tests only |
 
@@ -401,14 +401,14 @@ For non-interactive / automated deployment:
 | `TSUNAMI_FRONT_SECRET` | *(generated)* | Separate fronting HMAC secret |
 | `TSUNAMI_SITE_NAME` | *(derived)* | Decoy site name (derived from the domain) |
 | `TSUNAMI_SITE_MODE` | `builtin` (non-interactive) | Site camouflage: `local`, `remote`, or `builtin` |
-| `TSUNAMI_SITE_UPSTREAM` | `http://127.0.0.1:8080` for `local` | Upstream HTTP(S) origin for `local`/`remote` |
+| `TSUNAMI_SITE_UPSTREAM` | required for `local`/`remote` | Upstream HTTP(S) origin (host:port) |
 | `TSUNAMI_SITE_PRESERVE_HOST` | `true` for `local` | Preserve the visitor's `Host` header |
 | `TSUNAMI_SITE_INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification for an HTTPS upstream |
 | `TSUNAMI_DECOY_PROXY` | — | Legacy alias: maps to `remote` + upstream |
 | `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | TLS SNI used by the client command |
 | `TSUNAMI_PADDING_SCHEME_JSON` | *(server default)* | Override the server default padding scheme |
 | `TSUNAMI_ADVANCED` | — | `1` to ask the advanced prompts in the wizard |
-| `TSUNAMI_VERSION` | `latest` | Release version to install (`v1.3.0`) |
+| `TSUNAMI_VERSION` | `latest` | Release version to install (`v1.3.1`) |
 | `TSUNAMI_ASSUME_YES` | — | `1` to skip all interactive prompts |
 
 ## Documentation
