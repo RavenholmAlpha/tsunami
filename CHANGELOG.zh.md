@@ -7,7 +7,7 @@
 本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
-## [未发布]
+## [1.3.0] - 2026-11-03
 
 ### 新增
 - **站点伪装**：未认证的 fronting 请求按 Caddy `reverse_proxy` 的语义处理——`local` 反代到本机 HTTP 端点（同一 IP 上同时运行真实站点），`remote` 反代到其他网站（借内容，默认把 Host 改写为上游），`builtin` 保留内置页面。通过 `fronting.site`（`mode`、`upstream`、`preserve_host`、`insecure_skip_verify`）或新增的 `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` 参数配置；旧的 `decoy_proxy` 键与 `--front-decoy-proxy` 参数保留为弃用别名。

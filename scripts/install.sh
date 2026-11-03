@@ -2052,7 +2052,7 @@ Environment:
   TSUNAMI_SNI=<TLS SNI; defaults to TSUNAMI_PUBLIC_HOST>
   TSUNAMI_PADDING_SCHEME_JSON=<override the server default padding scheme>
   TSUNAMI_ADVANCED=1                  Ask the advanced prompts in the wizard
-  TSUNAMI_VERSION=v1.2.3 or latest
+  TSUNAMI_VERSION=v1.3.0 or latest
   TSUNAMI_ASSUME_YES=1
 EOF
 }

@@ -162,7 +162,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 特定のリリースをインストール：
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.2.3 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
 ```
 
 ソースチェックアウト内で実行する場合、Go が利用可能であれば現在のソースをビルドします。そうでなければ `build/linux-*`（存在する場合）を使用し、GitHub Releases にフォールバックします。

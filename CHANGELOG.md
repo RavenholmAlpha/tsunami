@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-11-03
 
 ### Added
 - **Site camouflage** for unauthenticated fronting traffic, with the same reverse-proxy semantics as Caddy's `reverse_proxy`: `local` proxies to a local HTTP endpoint (the same IP also serves a real site), `remote` proxies to another website (borrowed content, Host rewritten to the upstream by default), and `builtin` keeps the generated page. Configured with `fronting.site` (`mode`, `upstream`, `preserve_host`, `insecure_skip_verify`) or the new `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` flags. The old `decoy_proxy` key and `--front-decoy-proxy` flag remain as deprecated aliases.

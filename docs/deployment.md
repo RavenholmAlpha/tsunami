@@ -215,7 +215,7 @@ self-signed deployment publicly.
 To install a specific release:
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.2.3 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
 ```
 
 When run inside a source checkout, the installer builds the current source if

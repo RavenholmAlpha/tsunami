@@ -164,7 +164,7 @@ curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts
 安装特定版本：
 
 ```bash
-sudo env TSUNAMI_VERSION=v1.2.3 bash scripts/install.sh
+sudo env TSUNAMI_VERSION=v1.3.0 bash scripts/install.sh
 ```
 
 在源码目录内运行时，如果 Go 可用，安装程序会构建当前源码。否则使用 `build/linux-*`（如果存在），然后回退到 GitHub Releases。

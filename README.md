@@ -408,7 +408,7 @@ For non-interactive / automated deployment:
 | `TSUNAMI_SNI` | `TSUNAMI_PUBLIC_HOST` | TLS SNI used by the client command |
 | `TSUNAMI_PADDING_SCHEME_JSON` | *(server default)* | Override the server default padding scheme |
 | `TSUNAMI_ADVANCED` | — | `1` to ask the advanced prompts in the wizard |
-| `TSUNAMI_VERSION` | `latest` | Release version to install (`v1.2.3`) |
+| `TSUNAMI_VERSION` | `latest` | Release version to install (`v1.3.0`) |
 | `TSUNAMI_ASSUME_YES` | — | `1` to skip all interactive prompts |
 
 ## Documentation

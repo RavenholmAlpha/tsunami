@@ -7,7 +7,7 @@
 本フォーマットは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に基づいており、
 本プロジェクトは [セマンティックバージョニング](https://semver.org/lang/ja/spec/v2.0.0.html) に準拠しています。
 
-## [未リリース]
+## [1.3.0] - 2026-11-03
 
 ### 追加
 - **サイトカモフラージュ**：未認証の fronting リクエストを Caddy の `reverse_proxy` と同じ意味論で処理します。`local` はローカル HTTP エンドポイントへ（同一 IP で実サイトも稼働）、`remote` は他の Web サイトへ（コンテンツを借り、既定で Host を上流に書き換え）、`builtin` は生成ページを維持します。`fronting.site`（`mode`、`upstream`、`preserve_host`、`insecure_skip_verify`）または新しい `--front-site-mode` / `--front-site-upstream` / `--front-site-preserve-host` / `--front-site-insecure-skip-verify` で設定します。旧 `decoy_proxy` キーと `--front-decoy-proxy` は非推奨の別名として残ります。
