@@ -148,7 +148,7 @@ bash build/checksums.sh dist
 `SOURCE_DATE_EPOCH` fixes every timestamp. With the same commit, Go toolchain and
 zlib, packaging twice produces identical archives. The smoke test runs
 `--version` when the host can run the binary (natively or through
-`qemu-user-static` for ARM) and otherwise checks contents and architecture only.
+`qemu-user` for ARM) and otherwise checks contents and architecture only.
 
 ## Acknowledgments
 

@@ -145,7 +145,7 @@ bash build/smoke.sh -t openwrt-aarch64 -v v1.2.3 dist/tsunami-v1.2.3-openwrt-aar
 bash build/checksums.sh dist
 ```
 
-`SOURCE_DATE_EPOCH` 固定所有时间戳。提交、Go 工具链和 zlib 相同时，重复打包得到的压缩包逐字节一致。宿主机能运行二进制时（原生运行，或 ARM 目标通过 `qemu-user-static`），冒烟测试会执行 `--version`，否则只检查内容和架构。
+`SOURCE_DATE_EPOCH` 固定所有时间戳。提交、Go 工具链和 zlib 相同时，重复打包得到的压缩包逐字节一致。宿主机能运行二进制时（原生运行，或 ARM 目标通过 `qemu-user`），冒烟测试会执行 `--version`，否则只检查内容和架构。
 
 ## 鸣谢
 

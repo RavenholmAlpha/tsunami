@@ -140,7 +140,7 @@ bash build/smoke.sh -t openwrt-aarch64 -v v1.2.3 dist/tsunami-v1.2.3-openwrt-aar
 bash build/checksums.sh dist
 ```
 
-`SOURCE_DATE_EPOCH` がすべてのタイムスタンプを固定します。コミット、Go ツールチェーン、zlib が同じなら、2 回パッケージングしても同一のアーカイブになります。ホストがバイナリを実行できる場合（ネイティブ、または ARM を `qemu-user-static` 経由で）、スモークテストは `--version` を実行します。それ以外は内容とアーキテクチャのみを確認します。
+`SOURCE_DATE_EPOCH` がすべてのタイムスタンプを固定します。コミット、Go ツールチェーン、zlib が同じなら、2 回パッケージングしても同一のアーカイブになります。ホストがバイナリを実行できる場合（ネイティブ、または ARM を `qemu-user` 経由で）、スモークテストは `--version` を実行します。それ以外は内容とアーキテクチャのみを確認します。
 
 ## 謝辞
 

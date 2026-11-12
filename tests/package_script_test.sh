@@ -336,7 +336,82 @@ test_checksums_have_no_escape_prefix_for_backslash_paths() {
   assert_eq "$(sha256_of "$dir/$name")" "$expected" "installer lookup works under a backslash path"
 }
 
+# ── Emulation ────────────────────────────────────────────────────────────
+# make_stub DIR NAME BODY writes an executable stand-in for a command.
+make_stub() {
+  mkdir -p "$1"
+  printf '#!/usr/bin/env bash\n%s\n' "$3" >"$1/$2"
+  chmod +x "$1/$2"
+}
+
+# Ubuntu 26.04 has no qemu-user-static package: its qemu-user installs
+# qemu-aarch64 and qemu-arm. Ubuntu 24.04's qemu-user-static installs the same
+# emulators with a -static suffix. A lookup that knows one spelling either fails
+# the ARM smoke tests or lets them pass without running anything.
+test_find_emulator_knows_both_package_layouts() {
+  # shellcheck source-path=SCRIPTDIR/../build
+  # shellcheck source=targets.sh
+  source "$TARGETS_FILE"
+  local plain="$WORK/emu-plain" static="$WORK/emu-static" none="$WORK/emu-none"
+  make_stub "$plain" qemu-aarch64 'exit 0'
+  make_stub "$plain" qemu-arm 'exit 0'
+  make_stub "$static" qemu-aarch64-static 'exit 0'
+  make_stub "$static" qemu-arm-static 'exit 0'
+  mkdir -p "$none"
+
+  assert_eq "qemu-aarch64" "$(PATH="$plain" find_emulator arm64)" "arm64 emulator from qemu-user"
+  assert_eq "qemu-arm" "$(PATH="$plain" find_emulator arm)" "arm emulator from qemu-user"
+  assert_eq "qemu-aarch64-static" "$(PATH="$static" find_emulator arm64)" "arm64 emulator from qemu-user-static"
+  assert_eq "qemu-arm-static" "$(PATH="$static" find_emulator arm)" "arm emulator from qemu-user-static"
+
+  TESTS_RUN=$((TESTS_RUN + 2))
+  if PATH="$none" find_emulator arm64 >/dev/null; then
+    fail "find_emulator reported an arm64 emulator on an empty PATH"
+  fi
+  if PATH="$plain" find_emulator amd64 >/dev/null; then
+    fail "find_emulator reported an emulator for amd64, which has none"
+  fi
+}
+
+# smoke.sh reads the host from uname, so stand-ins on PATH present an x86-64
+# Linux host with a qemu-user emulator on whatever machine runs this test.
+test_smoke_runs_arm_binaries_through_the_emulator() {
+  local stubs="$WORK/linux-host" log="$WORK/emulator.log" out
+  local archive="$WORK/owrt-a/tsunami-$VERSION-openwrt-aarch64.tar.gz"
+  # shellcheck disable=SC2016  # the stub body is written out literally
+  make_stub "$stubs" uname 'case "$1" in -m) echo x86_64 ;; *) echo Linux ;; esac'
+  make_stub "$stubs" qemu-aarch64 "printf '%s\\n' \"\$*\" >>'$log'
+printf '%s\\n' 'tsunami-client $VERSION (commit=stub, built=stub)'"
+
+  if ! out="$(PATH="$stubs:$PATH" SMOKE_RUN=always bash "$SMOKE" -t openwrt-aarch64 -v "$VERSION" "$archive" 2>&1)"; then
+    fail "smoke test did not run the arm64 binary through qemu-aarch64: $out"
+  fi
+  assert_contains "smoke.sh: openwrt-aarch64: OK" "$out" "arm64 binary executed through the emulator"
+  assert_eq "x/usr/bin/tsunami-client --version" "$(cat "$log")" "the emulator was handed the client binary"
+}
+
+# CI relies on SMOKE_RUN=always to prove a binary really ran.
+test_smoke_always_fails_when_the_host_cannot_execute() {
+  local stubs="$WORK/darwin-host" out
+  local archive="$WORK/owrt-a/tsunami-$VERSION-openwrt-aarch64.tar.gz"
+  # shellcheck disable=SC2016  # the stub body is written out literally
+  make_stub "$stubs" uname 'case "$1" in -m) echo arm64 ;; *) echo Darwin ;; esac'
+
+  assert_fails_with "always on a host that cannot run the target" "cannot execute" \
+    env PATH="$stubs:$PATH" SMOKE_RUN=always bash "$SMOKE" -t openwrt-aarch64 -v "$VERSION" "$archive"
+  out="$(PATH="$stubs:$PATH" SMOKE_RUN=auto bash "$SMOKE" -t openwrt-aarch64 -v "$VERSION" "$archive")"
+  assert_contains "not executed on darwin/arm64" "$out" "auto reports that nothing was executed"
+}
+
 # ── Workflow ─────────────────────────────────────────────────────────────
+# With SMOKE_RUN=auto a missing emulator only skips execution, so the ARM jobs
+# would pass without running their binaries. The workflow has to demand it.
+test_workflow_requires_execution() {
+  TESTS_RUN=$((TESTS_RUN + 1))
+  grep -Eq "^ +SMOKE_RUN: .*'always'" "$WORKFLOW" ||
+    fail "the workflow's smoke test does not set SMOKE_RUN to 'always'"
+}
+
 # Every file a `shellcheck` command in the workflow names must exist. A stray
 # character in a run block, such as a literal \n where a line break was meant,
 # turns one path into a missing file; the Lint job then fails and skips every
@@ -363,6 +438,7 @@ test_workflow_builds_every_target() {
 }
 
 test_workflow_shellcheck_targets_exist
+test_find_emulator_knows_both_package_layouts
 test_rejects_unknown_target
 test_rejects_malformed_versions
 test_target_mapping
@@ -374,8 +450,11 @@ test_smoke_rejects_wrong_architecture
 test_smoke_rejects_wrong_contents
 test_smoke_rejects_wrong_version
 test_smoke_rejects_crlf_init_script
+test_smoke_runs_arm_binaries_through_the_emulator
+test_smoke_always_fails_when_the_host_cannot_execute
 test_checksums
 test_checksums_have_no_escape_prefix_for_backslash_paths
 test_workflow_builds_every_target
+test_workflow_requires_execution
 
 printf 'OK: %s assertions\n' "$TESTS_RUN"
