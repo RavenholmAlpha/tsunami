@@ -337,6 +337,24 @@ test_checksums_have_no_escape_prefix_for_backslash_paths() {
 }
 
 # ── Workflow ─────────────────────────────────────────────────────────────
+# Every file a `shellcheck` command in the workflow names must exist. A stray
+# character in a run block, such as a literal \n where a line break was meant,
+# turns one path into a missing file; the Lint job then fails and skips every
+# job after it, including packaging and the release.
+test_workflow_shellcheck_targets_exist() {
+  local line word missing=""
+  while IFS= read -r line; do
+    for word in $line; do
+      case "$word" in
+        shellcheck | -*) continue ;;
+      esac
+      [ -f "$ROOT_DIR/$word" ] || missing="$missing $word"
+    done
+  done < <(sed -e ':join' -e '/\\$/N; s/\\\n//; tjoin' "$WORKFLOW" | grep -E '^[[:space:]]*shellcheck ')
+  TESTS_RUN=$((TESTS_RUN + 1))
+  [ -z "$missing" ] || fail "workflow shellcheck names files that do not exist:$missing"
+}
+
 test_workflow_builds_every_target() {
   local from_table from_workflow
   from_table="$(bash -c "source '$TARGETS_FILE' && printf '%s\n' \$ALL_TARGETS" | sort | tr '\n' ' ')"
@@ -344,6 +362,7 @@ test_workflow_builds_every_target() {
   assert_eq "$from_table" "$from_workflow" "workflow matrix lists exactly the targets in build/targets.sh"
 }
 
+test_workflow_shellcheck_targets_exist
 test_rejects_unknown_target
 test_rejects_malformed_versions
 test_target_mapping

@@ -47,7 +47,8 @@ jobs:
     - name: Shellcheck
       run: |
         shellcheck -x scripts/install.sh scripts/install-node.sh
-        shellcheck -x build/package.sh build/smoke.sh build/checksums.sh build/targets.sh \n          build/openwrt/tsunami.init tests/package_script_test.sh tests/openwrt_init_test.sh
+        shellcheck -x build/package.sh build/smoke.sh build/checksums.sh build/targets.sh \
+          build/openwrt/tsunami.init tests/package_script_test.sh tests/openwrt_init_test.sh
 
   # ── Stage 2: Test ────────────────────────────────────────────────────
   test:
