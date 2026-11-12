@@ -216,7 +216,7 @@ test_main_default_pipe_path() {
   rm -rf "$tmp_dir"
 }
 
-test_load_state_defaults_reuses_previous_values() {
+test_load_saved_settings_reads_previous_values() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   mkdir -p "$tmp_dir/etc/tsunami"
@@ -237,32 +237,43 @@ TSUNAMI_SITE_MODE=local
 TSUNAMI_SITE_UPSTREAM=http://127.0.0.1:3000
 TSUNAMI_SITE_PRESERVE_HOST=true
 TSUNAMI_SITE_INSECURE_SKIP_VERIFY=false
+TSUNAMI_FALLBACK=127.0.0.1:8080
+TSUNAMI_MAX_CONNECTIONS=6
+TSUNAMI_THRESHOLD=12
+TSUNAMI_PADDING_SCHEME_JSON=$'stop=2\nc0=~80-200'
 STATE
   source_installer "$tmp_dir"
 
-  load_state_defaults
+  load_saved_settings
 
-  assert_eq ":8443" "$TSUNAMI_LISTEN" "state default listen"
-  assert_eq "secret-value" "$TSUNAMI_PASSWORD" "state default password"
-  assert_eq "alice" "$TSUNAMI_USER" "state default user"
-  assert_eq "edge.tsunami.io" "$TSUNAMI_PUBLIC_HOST" "state default public host"
-  assert_eq "letsencrypt" "$TSUNAMI_TLS_MODE" "state default TLS mode"
-  assert_eq "0" "$TSUNAMI_DEV" "state default dev flag"
-  assert_eq "true" "$TSUNAMI_FRONTING" "state default fronting flag"
-  assert_eq "/static/js/main.deadbeef.js" "$TSUNAMI_FRONT_PATH" "state default front path"
-  assert_eq "front-secret-value" "$TSUNAMI_FRONT_SECRET" "state default front secret"
-  assert_eq "Edge" "$TSUNAMI_SITE_NAME" "state default site name"
-  assert_eq "" "$TSUNAMI_DECOY_PROXY" "state default decoy proxy"
-  assert_eq "edge.tsunami.io" "$TSUNAMI_SNI" "state default SNI"
-  assert_eq "local" "$TSUNAMI_SITE_MODE" "state default site mode"
-  assert_eq "http://127.0.0.1:3000" "$TSUNAMI_SITE_UPSTREAM" "state default site upstream"
-  assert_eq "true" "$TSUNAMI_SITE_PRESERVE_HOST" "state default site preserve_host"
-  assert_eq "false" "$TSUNAMI_SITE_INSECURE_SKIP_VERIFY" "state default site insecure_skip_verify"
+  assert_eq ":8443" "$(saved_setting TSUNAMI_LISTEN)" "saved listen"
+  assert_eq "secret-value" "$(saved_setting TSUNAMI_PASSWORD)" "saved password"
+  assert_eq "alice" "$(saved_setting TSUNAMI_USER)" "saved user"
+  assert_eq "edge.tsunami.io" "$(saved_setting TSUNAMI_PUBLIC_HOST)" "saved public host"
+  assert_eq "letsencrypt" "$(saved_setting TSUNAMI_TLS_MODE)" "saved TLS mode"
+  assert_eq "0" "$(saved_setting TSUNAMI_DEV)" "saved dev flag"
+  assert_eq "true" "$(saved_setting TSUNAMI_FRONTING)" "saved fronting flag"
+  assert_eq "/static/js/main.deadbeef.js" "$(saved_setting TSUNAMI_FRONT_PATH)" "saved front path"
+  assert_eq "front-secret-value" "$(saved_setting TSUNAMI_FRONT_SECRET)" "saved front secret"
+  assert_eq "Edge" "$(saved_setting TSUNAMI_SITE_NAME)" "saved site name"
+  assert_eq "" "$(saved_setting TSUNAMI_DECOY_PROXY)" "saved decoy proxy"
+  assert_eq "edge.tsunami.io" "$(saved_setting TSUNAMI_SNI)" "saved SNI"
+  assert_eq "local" "$(saved_setting TSUNAMI_SITE_MODE)" "saved site mode"
+  assert_eq "http://127.0.0.1:3000" "$(saved_setting TSUNAMI_SITE_UPSTREAM)" "saved site upstream"
+  assert_eq "true" "$(saved_setting TSUNAMI_SITE_PRESERVE_HOST)" "saved site preserve_host"
+  assert_eq "false" "$(saved_setting TSUNAMI_SITE_INSECURE_SKIP_VERIFY)" "saved site insecure_skip_verify"
+  assert_eq "127.0.0.1:8080" "$(saved_setting TSUNAMI_FALLBACK)" "saved fallback"
+  assert_eq "6" "$(saved_setting TSUNAMI_MAX_CONNECTIONS)" "saved Surge max connections"
+  assert_eq "12" "$(saved_setting TSUNAMI_THRESHOLD)" "saved Surge threshold"
+  assert_eq $'stop=2\nc0=~80-200' "$(saved_setting TSUNAMI_PADDING_SCHEME_JSON)" "saved multi-line padding scheme"
 
   rm -rf "$tmp_dir"
 }
 
-test_load_state_defaults_preserves_env_values() {
+# Saved settings are read into SAVED_* only. They must never appear as
+# TSUNAMI_* variables, where they would look like operator overrides, and an
+# operator's own value must be left alone.
+test_load_saved_settings_leaves_the_environment_alone() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   mkdir -p "$tmp_dir/etc/tsunami"
@@ -276,17 +287,19 @@ STATE
   source_installer "$tmp_dir"
 
   TSUNAMI_PUBLIC_HOST=env.tsunami.io
-  TSUNAMI_FRONT_PATH=/env/path.22222222.js
-  TSUNAMI_FRONT_SECRET=env-secret
-  TSUNAMI_SITE_MODE=remote
-  TSUNAMI_SITE_UPSTREAM=https://www.wikipedia.org
-  load_state_defaults
+  load_saved_settings
 
-  assert_eq "env.tsunami.io" "$TSUNAMI_PUBLIC_HOST" "environment public host wins over state"
-  assert_eq "/env/path.22222222.js" "$TSUNAMI_FRONT_PATH" "environment front path wins over state"
-  assert_eq "env-secret" "$TSUNAMI_FRONT_SECRET" "environment front secret wins over state"
-  assert_eq "remote" "$TSUNAMI_SITE_MODE" "environment site mode wins over state"
-  assert_eq "https://www.wikipedia.org" "$TSUNAMI_SITE_UPSTREAM" "environment site upstream wins over state"
+  assert_eq "env.tsunami.io" "$TSUNAMI_PUBLIC_HOST" "the operator's value is untouched"
+  assert_eq "state.tsunami.io" "$(saved_setting TSUNAMI_PUBLIC_HOST)" "the saved value is read separately"
+  assert_eq "unset" "${TSUNAMI_SITE_MODE-unset}" "a saved site mode does not become an environment variable"
+  assert_eq "unset" "${TSUNAMI_FRONT_PATH-unset}" "a saved front path does not become an environment variable"
+  assert_failure "a saved-only setting is not an operator override" operator_set TSUNAMI_SITE_MODE
+  assert_success "an environment setting is an operator override" operator_set TSUNAMI_PUBLIC_HOST
+
+  # Showing the client information must not load saved settings either.
+  print_connection_info >/dev/null 2>&1
+  assert_eq "unset" "${TSUNAMI_SITE_MODE-unset}" "showing client info does not set environment variables"
+  assert_eq "env.tsunami.io" "$TSUNAMI_PUBLIC_HOST" "showing client info does not overwrite the operator's value"
 
   rm -rf "$tmp_dir"
 }
@@ -1056,10 +1069,9 @@ test_write_config_site_modes_json() {
   assert_file_contains "$CONFIG_FILE" '"upstream": ""' "builtin site has empty upstream"
 
   # State round-trip for the new site fields.
-  unset TSUNAMI_SITE_MODE TSUNAMI_SITE_UPSTREAM
-  load_state_defaults
-  assert_eq "builtin" "$TSUNAMI_SITE_MODE" "state round-trips site mode"
-  assert_eq "" "$TSUNAMI_SITE_UPSTREAM" "state round-trips empty site upstream"
+  load_saved_settings
+  assert_eq "builtin" "$(saved_setting TSUNAMI_SITE_MODE)" "state round-trips site mode"
+  assert_eq "" "$(saved_setting TSUNAMI_SITE_UPSTREAM)" "state round-trips empty site upstream"
 
   rm -rf "$tmp_dir"
 }
@@ -1141,42 +1153,359 @@ test_main_advanced_command_enables_flag() {
   rm -rf "$tmp_dir"
 }
 
-test_reuse_existing_settings_skips_prompts() {
-  local tmp_dir output path_before secret_before
-  tmp_dir="$(mktemp -d)"
+# ── Reconfigure wizard ───────────────────────────────────────────────────
+
+# Writes a first deployment non-interactively. Extra NAME=VALUE arguments
+# override or add settings.
+seed_deployment() {
+  local tmp_dir="$1"
+  shift
   source_installer "$tmp_dir"
   make_cert_files "$tmp_dir/certs"
-
   export TSUNAMI_ASSUME_YES=1
   export TSUNAMI_TLS_MODE=manual
   export TSUNAMI_CERT_FILE="$tmp_dir/certs/fullchain.pem"
   export TSUNAMI_KEY_FILE="$tmp_dir/certs/privkey.pem"
   export TSUNAMI_PUBLIC_HOST="edge.tsunami.io"
-  export TSUNAMI_PASSWORD="test-password-123456"
-  export TSUNAMI_SITE_MODE=local
-  export TSUNAMI_SITE_UPSTREAM="http://127.0.0.1:3000"
-  write_config 2>/dev/null
+  export TSUNAMI_PASSWORD="first-password-123456"
+  export TSUNAMI_SITE_MODE=remote
+  export TSUNAMI_SITE_UPSTREAM="https://www.wikipedia.org"
+  local assignment
+  for assignment in "$@"; do
+    export "${assignment?}"
+  done
+  write_config >/dev/null 2>&1
+}
+
+# Starts an interactive session with a clean environment, the way a later
+# `tsunami-manage config` run starts. PROMPT_LOG collects every question; each
+# one is answered by the next line on stdin.
+PROMPT_LOG=""
+begin_reconfigure() {
+  local tmp_dir="$1"
+  source_installer "$tmp_dir"
+  PROMPT_LOG="$tmp_dir/prompts.log"
+  : >"$PROMPT_LOG"
+  is_interactive() { return 0; }
+  read_prompt() {
+    printf '%s\n' "$1" >>"$PROMPT_LOG"
+    local answer
+    IFS= read -r answer || return 1
+    printf '%s' "$answer"
+  }
+  # Record which menu is shown and which entry is preselected, then run the
+  # real menu.
+  eval "real_$(declare -f prompt_choice)"
+  prompt_choice() {
+    printf 'MENU:%s default=%s\n' "$1" "$2" >>"$PROMPT_LOG"
+    real_prompt_choice "$@"
+  }
+}
+
+prompt_count() {
+  grep -Fc -- "$1" "$PROMPT_LOG" || true
+}
+
+config_value() {
+  sed -n "s/^ *\"$1\": *//p" "$CONFIG_FILE" | sed -n '1p' | sed 's/,$//'
+}
+
+# A re-run must never be all-or-nothing: every setting is offered with its
+# current value, and pressing Enter throughout changes nothing.
+test_reconfigure_enter_keeps_every_setting() {
+  local tmp_dir path_before secret_before
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
   path_before="$(state_value TSUNAMI_FRONT_PATH)"
   secret_before="$(state_value TSUNAMI_FRONT_SECRET)"
 
-  # Re-run interactively: accept reuse, then the single install confirmation.
-  unset TSUNAMI_ASSUME_YES
-  is_interactive() { return 0; }
-  confirm() { printf 'CONFIRM:%s\n' "$1"; return 0; }
-  ask() { printf 'UNEXPECTED-ASK\n'; printf '%s' "$2"; }
-  prompt_choice() { printf 'UNEXPECTED-PROMPT-CHOICE\n'; printf '%s' "$1"; }
+  begin_reconfigure "$tmp_dir"
+  printf '\n\n\n\n\n\n\n\n' | write_config >/dev/null 2>&1
 
-  output="$(write_config 2>&1)"
+  assert_eq "0" "$(prompt_count 'Reuse them')" "no all-or-nothing reuse question"
+  assert_eq "1" "$(prompt_count 'Public domain')" "the domain is offered"
+  assert_file_contains "$PROMPT_LOG" "[edge.tsunami.io]" "the current domain is the default"
+  assert_eq "1" "$(prompt_count 'MENU:TLS mode default=2')" "the TLS step is offered with the current mode (manual) preselected"
+  assert_file_contains "$PROMPT_LOG" "TLS certificate file (fullchain.pem) [$tmp_dir/certs/fullchain.pem]" "the current certificate is the default"
+  assert_file_contains "$PROMPT_LOG" "TLS private key file (privkey.pem) [$tmp_dir/certs/privkey.pem]" "the current key is the default"
+  assert_eq "1" "$(prompt_count 'MENU:Site camouflage: what should unauthenticated visitors see? default=2')" "the site step is offered with the current mode (remote) preselected"
+  assert_file_contains "$PROMPT_LOG" "[https://www.wikipedia.org]" "the current site upstream is the default"
+  assert_eq "1" "$(prompt_count 'Press Enter to install')" "one final confirmation"
 
-  assert_eq "2" "$(text_count "$output" 'CONFIRM:')" "reuse path asks exactly reuse + install confirmation"
-  case "$output" in *"CONFIRM:Existing TSUNAMI settings found. Reuse them?"*) ;; *) fail "reuse prompt missing: $output" ;; esac
-  case "$output" in *"CONFIRM:Press Enter to install"*) ;; *) fail "install confirmation missing on reuse: $output" ;; esac
-  case "$output" in *"UNEXPECTED"*) fail "reuse path prompted for settings: $output" ;; esac
-  TESTS_RUN=$((TESTS_RUN + 4))
+  assert_eq "edge.tsunami.io" "$(state_value TSUNAMI_PUBLIC_HOST)" "Enter keeps the domain"
+  assert_eq "manual" "$(state_value TSUNAMI_TLS_MODE)" "Enter keeps the TLS mode"
+  assert_eq "$tmp_dir/certs/fullchain.pem" "$(state_value TSUNAMI_CERT_FILE)" "Enter keeps the certificate"
+  assert_eq "remote" "$(state_value TSUNAMI_SITE_MODE)" "Enter keeps the site mode"
+  assert_eq "https://www.wikipedia.org" "$(state_value TSUNAMI_SITE_UPSTREAM)" "Enter keeps the site upstream"
+  assert_eq "$path_before" "$(state_value TSUNAMI_FRONT_PATH)" "Enter keeps the fronting path"
+  assert_eq "$secret_before" "$(state_value TSUNAMI_FRONT_SECRET)" "Enter keeps the fronting secret"
+  assert_eq "first-password-123456" "$(state_value TSUNAMI_PASSWORD)" "Enter keeps the password"
+  assert_file_contains "$CLIENT_FILE" "--front-path $path_before" "the client command is unchanged"
 
-  assert_eq "$path_before" "$(state_value TSUNAMI_FRONT_PATH)" "reuse keeps the generated front path"
-  assert_eq "$secret_before" "$(state_value TSUNAMI_FRONT_SECRET)" "reuse keeps the generated front secret"
-  assert_eq "local" "$(state_value TSUNAMI_SITE_MODE)" "reuse keeps the site mode"
+  rm -rf "$tmp_dir"
+}
+
+test_reconfigure_can_change_the_site_and_keep_the_rest() {
+  local tmp_dir path_before
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
+  path_before="$(state_value TSUNAMI_FRONT_PATH)"
+
+  begin_reconfigure "$tmp_dir"
+  # domain, TLS, certificate, key: Enter. Site 1 (local), new upstream, install.
+  printf '\n\n\n\n1\n127.0.0.1:9000\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "local" "$(state_value TSUNAMI_SITE_MODE)" "site mode changed"
+  assert_eq "http://127.0.0.1:9000" "$(state_value TSUNAMI_SITE_UPSTREAM)" "site upstream changed"
+  assert_file_contains "$CONFIG_FILE" '"preserve_host": true' "the Host default follows the new mode"
+  assert_eq "edge.tsunami.io" "$(state_value TSUNAMI_PUBLIC_HOST)" "domain kept"
+  assert_eq "manual" "$(state_value TSUNAMI_TLS_MODE)" "TLS mode kept"
+  assert_eq "$path_before" "$(state_value TSUNAMI_FRONT_PATH)" "fronting path kept"
+
+  rm -rf "$tmp_dir"
+}
+
+test_reconfigure_can_change_the_domain_and_tls_mode() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
+
+  begin_reconfigure "$tmp_dir"
+  obtain_letsencrypt_cert() { printf 'certbot:%s\n' "$1" >>"$PROMPT_LOG"; }
+  write_certbot_hooks() { :; }
+  # new domain, TLS 1 (Let's Encrypt), site Enter, upstream Enter, install Enter.
+  printf 'new.tsunami.io\n1\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "new.tsunami.io" "$(state_value TSUNAMI_PUBLIC_HOST)" "domain changed"
+  assert_eq "new.tsunami.io" "$(state_value TSUNAMI_SNI)" "SNI follows the new domain"
+  assert_eq "letsencrypt" "$(state_value TSUNAMI_TLS_MODE)" "TLS mode changed"
+  assert_file_contains "$PROMPT_LOG" "certbot:new.tsunami.io" "the certificate is requested for the new domain"
+  assert_eq "/etc/letsencrypt/live/new.tsunami.io/fullchain.pem" "$(state_value TSUNAMI_CERT_FILE)" "certificate path follows the new domain"
+  assert_file_contains "$CONFIG_FILE" '"site_name": "New"' "the derived site name follows the new domain"
+  assert_eq "remote" "$(state_value TSUNAMI_SITE_MODE)" "site mode kept"
+  assert_file_contains "$CLIENT_FILE" "--sni new.tsunami.io" "the client command uses the new domain"
+
+  rm -rf "$tmp_dir"
+}
+
+# A site name the operator chose must survive a domain change; a derived one
+# must not pin the old domain's name.
+test_reconfigure_keeps_a_custom_site_name_across_a_domain_change() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir" TSUNAMI_SITE_NAME="My Shop"
+
+  begin_reconfigure "$tmp_dir"
+  printf 'new.tsunami.io\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "new.tsunami.io" "$(state_value TSUNAMI_PUBLIC_HOST)" "domain changed"
+  assert_file_contains "$CONFIG_FILE" '"site_name": "My Shop"' "the custom site name is kept"
+
+  rm -rf "$tmp_dir"
+}
+
+# The management menu sources the state file into the running shell when it
+# shows the client information. Those values are saved settings, not operator
+# overrides, so the wizard must still ask.
+test_reconfigure_asks_after_the_menu_showed_client_info() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
+
+  begin_reconfigure "$tmp_dir"
+  print_connection_info >/dev/null 2>&1
+  # domain, TLS, certificate, key: Enter. Site 3 (built-in), install.
+  printf '\n\n\n\n3\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "1" "$(prompt_count 'MENU:TLS mode')" "TLS is still offered after client info was shown"
+  assert_eq "1" "$(prompt_count 'MENU:Site camouflage')" "the site is still offered after client info was shown"
+  assert_eq "builtin" "$(state_value TSUNAMI_SITE_MODE)" "the site can still be changed from the menu"
+
+  rm -rf "$tmp_dir"
+}
+
+# Settings fixed on the command line are honoured without a question.
+test_reconfigure_env_override_wins_without_asking() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
+
+  begin_reconfigure "$tmp_dir"
+  export TSUNAMI_SITE_MODE=builtin
+  printf '\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "0" "$(prompt_count 'MENU:Site camouflage')" "an explicit TSUNAMI_SITE_MODE skips the site question"
+  assert_eq "0" "$(prompt_count 'site upstream')" "no upstream question for an explicit builtin site"
+  assert_eq "builtin" "$(state_value TSUNAMI_SITE_MODE)" "the environment value wins over the saved one"
+  assert_eq "1" "$(prompt_count 'MENU:TLS mode default=2')" "TLS is still offered"
+
+  rm -rf "$tmp_dir"
+}
+
+# Fallback, Surge and the padding scheme used to be dropped by any re-run
+# because they were never written to the state file.
+test_reconfigure_preserves_fallback_surge_and_padding() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir" TSUNAMI_FALLBACK=127.0.0.1:8080 TSUNAMI_MAX_CONNECTIONS=6 \
+    TSUNAMI_THRESHOLD=12 TSUNAMI_LISTEN=:8443 "TSUNAMI_PADDING_SCHEME_JSON=stop=2
+c0=~80-200"
+
+  assert_eq '"127.0.0.1:8080"' "$(config_value fallback)" "seed wrote the fallback"
+
+  begin_reconfigure "$tmp_dir"
+  printf '\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq '":8443"' "$(config_value listen)" "the listen address survives a re-run"
+  assert_eq '"127.0.0.1:8080"' "$(config_value fallback)" "the fallback survives a re-run"
+  assert_eq "6" "$(config_value max_connections)" "Surge max connections survive a re-run"
+  assert_eq "12" "$(config_value threshold)" "the Surge threshold survives a re-run"
+  assert_file_contains "$CONFIG_FILE" 'stop=2\nc0=~80-200' "the padding scheme survives a re-run"
+
+  # And a second re-run still has them: they are stored, not just carried once.
+  begin_reconfigure "$tmp_dir"
+  printf '\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+  assert_eq "6" "$(config_value max_connections)" "Surge max connections survive two re-runs"
+  assert_file_contains "$CONFIG_FILE" 'stop=2\nc0=~80-200' "the padding scheme survives two re-runs"
+
+  rm -rf "$tmp_dir"
+}
+
+# json_unescape must reverse json_escape exactly: a recovered padding scheme is
+# written back to config.json, so any drift would corrupt it a little more on
+# every re-run.
+test_json_unescape_reverses_json_escape() {
+  local tmp_dir value backslash
+  backslash="$(printf '\134')"
+  tmp_dir="$(mktemp -d)"
+  source_installer "$tmp_dir"
+
+  for value in 'plain' $'two\nlines' 'quote " inside' 'back\slash' \
+    'backslash-n \n that is not a newline' $'mixed \\" and \\\\ and\nnewline' \
+    "trailing backslash$backslash" 'percent %s and %b' ''; do
+    assert_eq "$value" "$(json_unescape "$(json_escape "$value")")" "round trip of <$value>"
+  done
+
+  rm -rf "$tmp_dir"
+}
+
+# Deployments written before those settings were stored only have them in
+# config.json; the first re-run must pick them up from there.
+test_reconfigure_recovers_settings_from_a_legacy_state_file() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir" TSUNAMI_FALLBACK=127.0.0.1:8080 TSUNAMI_MAX_CONNECTIONS=6 TSUNAMI_THRESHOLD=12 \
+    "TSUNAMI_PADDING_SCHEME_JSON=stop=2
+c0=~80-200"
+  # Drop the entries an older installer never wrote. The padding value is one
+  # line in the state file because printf %q quotes the newline as $'...'.
+  sed -i -e '/^TSUNAMI_FALLBACK=/d' -e '/^TSUNAMI_MAX_CONNECTIONS=/d' -e '/^TSUNAMI_THRESHOLD=/d' \
+    -e '/^TSUNAMI_PADDING_SCHEME_JSON=/d' "$STATE_FILE"
+  assert_file_not_contains "$STATE_FILE" "80-200" "the legacy state file has no padding entry"
+
+  begin_reconfigure "$tmp_dir"
+  printf '\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq '"127.0.0.1:8080"' "$(config_value fallback)" "fallback recovered from config.json"
+  assert_eq "6" "$(config_value max_connections)" "Surge max connections recovered from config.json"
+  assert_eq "12" "$(config_value threshold)" "Surge threshold recovered from config.json"
+  assert_eq "6" "$(state_value TSUNAMI_MAX_CONNECTIONS)" "the recovered value is now stored in the state file"
+  assert_file_contains "$CONFIG_FILE" 'stop=2\nc0=~80-200' "the padding scheme is recovered from config.json"
+
+  # A second re-run reads the now-complete state file and changes nothing.
+  begin_reconfigure "$tmp_dir"
+  printf '\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+  assert_file_contains "$CONFIG_FILE" 'stop=2\nc0=~80-200' "the recovered padding scheme is stable across re-runs"
+  assert_eq "1" "$(grep -c '"padding_scheme"' "$CONFIG_FILE")" "exactly one padding_scheme entry"
+
+  rm -rf "$tmp_dir"
+}
+
+# With no usable upstream and no more input, the local-site prompt used to
+# repeat forever. It must give up with an error.
+test_local_site_upstream_prompt_gives_up() {
+  local tmp_dir status pid waited=0
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir" TSUNAMI_SITE_MODE=builtin TSUNAMI_SITE_UPSTREAM=
+
+  begin_reconfigure "$tmp_dir"
+  set +e
+  # domain, TLS, certificate, key: Enter. Site 1 (local), then the input ends.
+  ( printf '\n\n\n\n1\n' | write_config >/dev/null 2>"$tmp_dir/err.txt" ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    set -e
+    fail "the local site upstream prompt did not give up within 10 seconds"
+  fi
+  wait "$pid"
+  status=$?
+  set -e
+
+  assert_ne "0" "$status" "an unanswered upstream prompt is an error"
+  assert_file_contains "$tmp_dir/err.txt" "too many" "the error explains why it gave up"
+  assert_eq "builtin" "$(state_value TSUNAMI_SITE_MODE)" "the saved configuration is untouched"
+
+  rm -rf "$tmp_dir"
+}
+
+# An answer that is not a valid domain must not turn a real deployment into the
+# self-signed test mode: the next attempt still offers the current domain, and
+# clearing the domain on an existing deployment has to be confirmed.
+test_reconfigure_invalid_domain_answer_keeps_the_current_default() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir"
+
+  begin_reconfigure "$tmp_dir"
+  # A typo ("n"), then Enter at every question.
+  printf 'n\n\n\n\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "2" "$(prompt_count 'Public domain for this server')" "the domain is asked again after an invalid answer"
+  assert_eq "2" "$(prompt_count '[edge.tsunami.io]')" "the retry still offers the current domain"
+  assert_eq "edge.tsunami.io" "$(state_value TSUNAMI_PUBLIC_HOST)" "the domain is kept"
+  assert_eq "manual" "$(state_value TSUNAMI_TLS_MODE)" "the TLS mode is kept"
+  assert_eq "0" "$(prompt_count 'self-signed certificate?')" "the wizard never drifts into the self-signed flow"
+
+  rm -rf "$tmp_dir"
+}
+
+# The first-install wizard still treats an empty domain as the self-signed test
+# deployment; that shortcut is unchanged.
+test_first_install_empty_domain_still_selects_self_signed() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  begin_reconfigure "$tmp_dir"
+  default_public_domain() { printf ''; }
+  # empty domain, yes to the self-signed warning, site 3 (built-in), install.
+  printf '\ny\n3\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_eq "self-signed" "$(state_value TSUNAMI_TLS_MODE)" "an empty domain on a first install selects self-signed"
+  assert_eq "dev.tsunami.lan" "$(state_value TSUNAMI_PUBLIC_HOST)" "the placeholder test host is used"
+  assert_eq "1" "$(prompt_count 'self-signed certificate?')" "the self-signed warning is confirmed once"
+
+  rm -rf "$tmp_dir"
+}
+
+test_advanced_reconfigure_defaults_to_current_values() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  seed_deployment "$tmp_dir" TSUNAMI_FALLBACK=127.0.0.1:8080 TSUNAMI_MAX_CONNECTIONS=6 TSUNAMI_THRESHOLD=12
+
+  begin_reconfigure "$tmp_dir"
+  export TSUNAMI_ADVANCED=1
+  printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | write_config >/dev/null 2>&1
+
+  assert_file_contains "$PROMPT_LOG" "Fallback backend, empty to use built-in page [127.0.0.1:8080]" "advanced fallback default is the current value"
+  assert_file_contains "$PROMPT_LOG" "Surge max connections [6]" "advanced Surge default is the current value"
+  assert_file_contains "$PROMPT_LOG" "Surge threshold [12]" "advanced threshold default is the current value"
+  assert_eq "6" "$(config_value max_connections)" "advanced Enter keeps Surge max connections"
+  assert_eq "remote" "$(state_value TSUNAMI_SITE_MODE)" "advanced Enter keeps the site mode"
 
   rm -rf "$tmp_dir"
 }
@@ -1259,8 +1588,8 @@ test_main_piped_with_prompt_tty_opens_menu
 test_prompt_choice_defaults_and_retries
 test_ask_reads_input_when_prompt_tty_exists
 test_confirm_defaults_and_assume_yes
-test_load_state_defaults_reuses_previous_values
-test_load_state_defaults_preserves_env_values
+test_load_saved_settings_reads_previous_values
+test_load_saved_settings_leaves_the_environment_alone
 test_config_summary_masks_password
 test_menu_first_entry_is_quick_install
 test_menu_action_dispatches_existing_commands
@@ -1289,7 +1618,19 @@ test_write_config_site_modes_json
 test_interactive_remote_empty_upstream_falls_back
 test_advanced_prompts_only_with_flag
 test_main_advanced_command_enables_flag
-test_reuse_existing_settings_skips_prompts
+test_reconfigure_enter_keeps_every_setting
+test_reconfigure_can_change_the_site_and_keep_the_rest
+test_reconfigure_can_change_the_domain_and_tls_mode
+test_reconfigure_keeps_a_custom_site_name_across_a_domain_change
+test_reconfigure_asks_after_the_menu_showed_client_info
+test_reconfigure_env_override_wins_without_asking
+test_reconfigure_preserves_fallback_surge_and_padding
+test_json_unescape_reverses_json_escape
+test_reconfigure_recovers_settings_from_a_legacy_state_file
+test_local_site_upstream_prompt_gives_up
+test_reconfigure_invalid_domain_answer_keeps_the_current_default
+test_first_install_empty_domain_still_selects_self_signed
+test_advanced_reconfigure_defaults_to_current_values
 test_security_check_site_mode_branches
 
 printf 'ok - %s install script tests\n' "$TESTS_RUN"

@@ -37,7 +37,11 @@ sudo bash scripts/install.sh
 3. **站点伪装** —— 未认证访问者看到的内容（见下一节）。
 4. **按 Enter 安装** —— 唯一的确认步骤，随后打印客户端面板。
 
-其余全部自动完成：监听 `:443`、Surge 默认值（4/8）、随机密码、空回退后端、生成的 fronting 路径/密钥/站点名，以及服务端内置填充方案。如果存在上一次部署的 `install.env`，向导会先提供 **复用现有设置** 并跳过问题。
+其余全部自动完成：监听 `:443`、Surge 默认值（4/8）、随机密码、空回退后端、生成的 fronting 路径/密钥/站点名，以及服务端内置填充方案。
+
+**再次运行向导**（`tsunami-manage config`，或菜单里的“重新配置”）会问同样的问题，每一项都以当前值作为默认：按 Enter 保留，输入新值就修改。不会整体复用或跳过。密码、fronting 路径和 fronting 密钥会保留，已经发出去的客户端命令仍然可用。只有高级提示才会问的设置（监听地址、回退后端、Surge 上限、填充方案）同样保留；要修改它们请运行 `tsunami-manage advanced`。通过环境变量传入的设置（例如 `TSUNAMI_SITE_MODE=builtin`）会直接生效，不再提问。
+
+非交互式运行（`TSUNAMI_ASSUME_YES=1`，或没有终端的管道方式）不会读取上一次部署，只由环境变量决定。
 
 安装程序**绝不会静默回退到自签名证书**。Let's Encrypt 模式在域名校验通过后使用 certbot 申请证书；手动模式使用你提供的证书路径；自签名模式会打印明确警告（“可被轻易识别、不提供 MITM 防护”）并要求确认。非交互运行时，自签名模式还额外要求 `TSUNAMI_TLS_MODE=self-signed TSUNAMI_DEV=1`。
 
@@ -184,7 +188,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 ```bash
 sudo tsunami-manage           # 打开交互式菜单
 sudo tsunami-manage status
-sudo tsunami-manage config     # 快捷向导（可复用现有设置）
+sudo tsunami-manage config     # 快捷向导（按 Enter 保留每项当前设置）
 sudo tsunami-manage advanced   # 高级提示
 sudo tsunami-manage update
 sudo tsunami-manage restart

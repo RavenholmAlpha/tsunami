@@ -150,7 +150,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 sudo tsunami-manage status       # 服务状态
 sudo tsunami-manage client       # 显示连接信息
 sudo tsunami-manage update       # 更新到最新版本
-sudo tsunami-manage config       # 重新配置（快捷向导，可复用现有设置）
+sudo tsunami-manage config       # 重新配置（快捷向导，按 Enter 保留每项设置）
 sudo tsunami-manage advanced     # 使用高级提示重新配置
 sudo tsunami-manage restart      # 重启服务
 sudo tsunami-manage logs         # 跟踪日志

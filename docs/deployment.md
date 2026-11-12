@@ -52,9 +52,21 @@ A fresh interactive install is three questions and one confirmation:
 
 Everything else is automatic: listen `:443`, Surge defaults (4/8), random
 password, empty fallback, generated fronting path/secret/site name, and the
-server's built-in padding scheme. If an `install.env` from a previous deployment
-exists, the wizard first offers to **reuse the existing settings** and skips the
-questions.
+server's built-in padding scheme.
+
+**Re-running the wizard** (`tsunami-manage config`, or the menu's "Reconfigure")
+asks the same questions, each with the current value as its default: press
+Enter to keep a setting, or type a new value to change it. Nothing is reused or
+skipped as a block. The password, fronting path and fronting secret are kept,
+so client commands you already handed out keep working. Settings that only the
+advanced prompts ask about (listen address, fallback, Surge limits, padding
+scheme) are kept as well; run `tsunami-manage advanced` to change them. A
+setting passed in the environment, for example `TSUNAMI_SITE_MODE=builtin`, is
+applied without a question.
+
+Non-interactive runs (`TSUNAMI_ASSUME_YES=1`, or piped without a terminal) do
+not read the previous deployment: they are defined by their environment
+variables alone.
 
 The installer **never falls back to a self-signed certificate silently**.
 Let's Encrypt mode requests a certificate with certbot after the domain has
@@ -237,7 +249,7 @@ Then use it:
 ```bash
 sudo tsunami-manage           # open interactive menu
 sudo tsunami-manage status
-sudo tsunami-manage config     # quick wizard (offers to reuse settings)
+sudo tsunami-manage config     # quick wizard (Enter keeps each current setting)
 sudo tsunami-manage advanced   # advanced prompts
 sudo tsunami-manage update
 sudo tsunami-manage restart

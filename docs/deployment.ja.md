@@ -35,7 +35,11 @@ sudo bash scripts/install.sh
 3. **サイトカモフラージュ** — 未認証の訪問者に見える内容（次節）。
 4. **Enter でインストール** — 唯一の確認。その後クライアントパネルを表示します。
 
-その他はすべて自動です：リッスン `:443`、Surge デフォルト（4/8）、ランダムパスワード、空のフォールバック、生成された fronting パス/シークレット/サイト名、サーバー内蔵パディングスキーム。前回デプロイの `install.env` がある場合、ウィザードは最初に **既存設定の再利用** を提案し、質問をスキップします。
+その他はすべて自動です：リッスン `:443`、Surge デフォルト（4/8）、ランダムパスワード、空のフォールバック、生成された fronting パス/シークレット/サイト名、サーバー内蔵パディングスキーム。
+
+**ウィザードを再実行すると**（`tsunami-manage config`、またはメニューの「再設定」）、同じ質問が現在の値を既定値として表示されます。Enter でその設定を維持し、新しい値を入力すれば変更できます。まとめて再利用したりスキップしたりはしません。パスワード、fronting パス、fronting シークレットは維持されるため、配布済みのクライアントコマンドは引き続き使えます。詳細プロンプトだけが尋ねる設定（リッスンアドレス、フォールバック、Surge の上限、パディングスキーム）も維持されます。変更するには `tsunami-manage advanced` を実行してください。環境変数で渡した設定（例：`TSUNAMI_SITE_MODE=builtin`）は質問なしで適用されます。
+
+非対話実行（`TSUNAMI_ASSUME_YES=1`、または端末のないパイプ実行）は前回のデプロイを読み込みません。環境変数だけで決まります。
 
 インストーラーは**自己署名証明書へ暗黙にフォールバックしません**。Let's Encrypt モードではドメイン検証後に certbot で証明書を取得し、手動モードでは指定した証明書パスを使用し、自己署名モードでは明確な警告（「容易に検出され、MITM 保護を提供しない」）を表示して確認を求めます。非対話実行では、自己署名モードに加えて `TSUNAMI_TLS_MODE=self-signed TSUNAMI_DEV=1` が必要です。
 
@@ -182,7 +186,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 ```bash
 sudo tsunami-manage           # 対話型メニューを開く
 sudo tsunami-manage status
-sudo tsunami-manage config     # クイックウィザード（既存設定の再利用可）
+sudo tsunami-manage config     # クイックウィザード（Enter で各設定を維持）
 sudo tsunami-manage advanced   # 詳細プロンプト
 sudo tsunami-manage update
 sudo tsunami-manage restart

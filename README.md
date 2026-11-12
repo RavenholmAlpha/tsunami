@@ -166,7 +166,7 @@ sudo wget -qO /usr/local/bin/tsunami-manage \
 sudo tsunami-manage status       # Service status
 sudo tsunami-manage client       # Show connection info
 sudo tsunami-manage update       # Update to latest release
-sudo tsunami-manage config       # Re-configure (quick wizard, offers reuse)
+sudo tsunami-manage config       # Re-configure (quick wizard; Enter keeps each setting)
 sudo tsunami-manage advanced     # Re-configure with the advanced prompts
 sudo tsunami-manage restart      # Restart service
 sudo tsunami-manage logs         # Follow logs

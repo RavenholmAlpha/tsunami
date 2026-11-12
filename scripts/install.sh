@@ -7,6 +7,7 @@
 # Remote install (curl):  curl -fsSL https://raw.githubusercontent.com/RavenholmAlpha/tsunami/main/scripts/install.sh | sudo bash
 #
 # The interactive wizard is quick: domain -> TLS mode -> site camouflage -> confirm.
+# Re-running it offers every setting with its current value: Enter keeps it.
 # A public deployment needs an explicit TLS choice. Recommended:
 #   curl -fsSL https://...install.sh | TSUNAMI_PUBLIC_HOST=<your-domain> TSUNAMI_LETSENCRYPT=y sudo -E bash
 #
@@ -294,6 +295,8 @@ ask_domain() {
 }
 
 # Like ask_domain, but an empty answer is allowed (self-signed test flow).
+# The default survives an invalid answer: after a typo, Enter must still mean
+# "keep the offered domain", not "no domain".
 ask_domain_optional() {
   local prompt="$1"
   local default="${2:-}"
@@ -312,11 +315,31 @@ ask_domain_optional() {
       if ! is_interactive; then
         die "$prompt: $reason"
       fi
-      default=""
       continue
     fi
     printf '%s' "$answer"
     return 0
+  done
+}
+
+# Prompts until a non-empty value is entered. Gives up after ten empty answers
+# so a closed or exhausted input cannot loop forever.
+ask_required() {
+  local prompt="$1"
+  local default="${2:-}"
+  local empty_hint="$3"
+  local answer attempts=0
+  while true; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -gt 10 ]; then
+      die "$prompt: too many empty entries"
+    fi
+    answer="$(ask "$prompt" "$default")"
+    if [ -n "$answer" ]; then
+      printf '%s' "$answer"
+      return 0
+    fi
+    warn "$empty_hint"
   done
 }
 
@@ -458,17 +481,25 @@ confirm() {
 }
 
 # Resolves the site-camouflage settings and stores them in the SITE_* globals.
-# Arguments: interactive reuse fronting explicit_mode explicit_upstream
-#            explicit_preserve explicit_insecure explicit_decoy
+#
+# Arguments: interactive fronting
+#            explicit_mode explicit_upstream explicit_preserve explicit_insecure
+#            explicit_decoy   values the operator fixed for this run (no prompt)
+#            saved_mode saved_upstream saved_preserve saved_insecure saved_decoy
+#                             the previous deployment, used as prompt defaults
 resolve_site_settings() {
   local interactive="$1"
-  local reuse="$2"
-  local fronting="$3"
-  local explicit_mode="$4"
-  local explicit_upstream="$5"
-  local explicit_preserve="$6"
-  local explicit_insecure="$7"
-  local explicit_decoy="$8"
+  local fronting="$2"
+  local explicit_mode="$3"
+  local explicit_upstream="$4"
+  local explicit_preserve="$5"
+  local explicit_insecure="$6"
+  local explicit_decoy="$7"
+  local saved_mode="${8:-}"
+  local saved_upstream="${9:-}"
+  local saved_preserve="${10:-}"
+  local saved_insecure="${11:-}"
+  local saved_decoy="${12:-}"
 
   SITE_MODE="builtin"
   SITE_UPSTREAM=""
@@ -480,14 +511,21 @@ resolve_site_settings() {
   fi
 
   local mode="" upstream="" preserve="" insecure=""
-  local choice="" default_upstream=""
+  local choice="" default_choice="1" default_upstream=""
 
-  if [ "$reuse" = "1" ]; then
-    mode="${TSUNAMI_SITE_MODE:-}"
-    upstream="${TSUNAMI_SITE_UPSTREAM:-}"
-    preserve="${TSUNAMI_SITE_PRESERVE_HOST:-}"
-    insecure="${TSUNAMI_SITE_INSECURE_SKIP_VERIFY:-}"
-  elif [ -n "$explicit_mode" ]; then
+  # Legacy state written before site camouflage existed.
+  if [ -z "$saved_mode" ] && [ -n "$saved_decoy" ]; then
+    saved_mode="remote"
+    saved_upstream="${saved_upstream:-$saved_decoy}"
+  fi
+  case "${saved_mode,,}" in
+    local) saved_mode="local" ;;
+    remote) saved_mode="remote" ;;
+    builtin | built-in | built_in) saved_mode="builtin" ;;
+    *) saved_mode="" ;;
+  esac
+
+  if [ -n "$explicit_mode" ]; then
     mode="$explicit_mode"
     upstream="$explicit_upstream"
     preserve="$explicit_preserve"
@@ -495,12 +533,6 @@ resolve_site_settings() {
   elif [ -n "$explicit_decoy" ]; then
     mode="remote"
     upstream="$explicit_decoy"
-  fi
-
-  # Legacy state written before site camouflage existed.
-  if [ "$reuse" = "1" ] && [ -z "$mode" ] && [ -n "${TSUNAMI_DECOY_PROXY:-}" ]; then
-    mode="remote"
-    upstream="${upstream:-$TSUNAMI_DECOY_PROXY}"
   fi
 
   if [ -n "$mode" ]; then
@@ -514,8 +546,11 @@ resolve_site_settings() {
 
   if [ -z "$mode" ]; then
     if [ "$interactive" = "1" ]; then
-      default_upstream="${TSUNAMI_SITE_UPSTREAM:-}"
-      choice="$(prompt_choice "Site camouflage: what should unauthenticated visitors see?" "1" \
+      case "$saved_mode" in
+        remote) default_choice="2" ;;
+        builtin) default_choice="3" ;;
+      esac
+      choice="$(prompt_choice "Site camouflage: what should unauthenticated visitors see?" "$default_choice" \
         "Local real site on this server (reverse proxy; enter its host:port)" \
         "Borrow a remote website" \
         "Built-in page (least realistic)")"
@@ -524,17 +559,25 @@ resolve_site_settings() {
         2) mode="remote" ;;
         *) mode="builtin" ;;
       esac
+      # The previous upstream is only a sensible default for the same mode: a
+      # remote site's URL is not where a local site listens.
+      default_upstream="$explicit_upstream"
+      if [ -z "$default_upstream" ] && [ "$mode" = "$saved_mode" ]; then
+        default_upstream="$saved_upstream"
+      fi
+      if [ "$mode" = "$saved_mode" ]; then
+        preserve="${explicit_preserve:-$saved_preserve}"
+        insecure="${explicit_insecure:-$saved_insecure}"
+      else
+        preserve="$explicit_preserve"
+        insecure="$explicit_insecure"
+      fi
       if [ "$mode" = "local" ]; then
-        while :; do
-          upstream="$(ask "Local site upstream (host:port, e.g. http://127.0.0.1:8080)" "$default_upstream")"
-          if [ -n "$upstream" ]; then
-            break
-          fi
-          warn "Local site camouflage requires an explicit upstream; automatic port detection was removed."
-        done
+        upstream="$(ask_required "Local site upstream (host:port, e.g. http://127.0.0.1:8080)" "$default_upstream" \
+          "Local site camouflage requires an explicit upstream; automatic port detection was removed.")"
         upstream="$(validate_http_origin "site upstream" "$upstream")"
       elif [ "$mode" = "remote" ]; then
-        upstream="$(ask "Remote site upstream URL (e.g. https://www.wikipedia.org, https://news.ycombinator.com, https://example.org; empty = built-in page)" "")"
+        upstream="$(ask "Remote site upstream URL (e.g. https://www.wikipedia.org, https://news.ycombinator.com, https://example.org; empty = built-in page)" "$default_upstream")"
         if [ -z "$upstream" ]; then
           warn "no remote upstream provided; falling back to the built-in page (easy to cluster)"
           mode="builtin"
@@ -596,66 +639,89 @@ resolve_site_settings() {
   SITE_UPSTREAM="$upstream"
 }
 
-load_state_defaults() {
+# Names of every setting kept in the state file.
+STATE_SETTINGS="TSUNAMI_LISTEN TSUNAMI_PASSWORD TSUNAMI_USER TSUNAMI_PUBLIC_HOST TSUNAMI_SNI
+TSUNAMI_TLS_MODE TSUNAMI_DEV TSUNAMI_CERT_FILE TSUNAMI_KEY_FILE TSUNAMI_FALLBACK
+TSUNAMI_MAX_CONNECTIONS TSUNAMI_THRESHOLD TSUNAMI_PADDING_SCHEME_JSON TSUNAMI_FRONTING
+TSUNAMI_FRONT_PATH TSUNAMI_FRONT_SECRET TSUNAMI_SITE_NAME TSUNAMI_SITE_MODE
+TSUNAMI_SITE_UPSTREAM TSUNAMI_SITE_PRESERVE_HOST TSUNAMI_SITE_INSECURE_SKIP_VERIFY
+TSUNAMI_DECOY_PROXY"
+
+# True when NAME is set in the environment, which means the operator fixed it
+# for this run. Saved settings never reach the environment: every reader of the
+# state file sources it in a subshell.
+operator_set() {
+  [ "${!1+x}" = "x" ]
+}
+
+# Prints the operator's value of a setting, or nothing if it was not set.
+operator_value() {
+  printf '%s' "${!1-}"
+}
+
+# Prints the saved value of a setting, or nothing if it was never saved.
+saved_setting() {
+  local name="SAVED_${1#TSUNAMI_}"
+  printf '%s' "${!name-}"
+}
+
+clear_saved_settings() {
+  local name
+  for name in $STATE_SETTINGS; do
+    unset "SAVED_${name#TSUNAMI_}"
+  done
+}
+
+# Reads a top-level numeric field from the installer-generated config.json.
+config_json_number() {
+  local field="$1"
+  local value=""
+  value="$(grep -E -m1 -o "\"${field}\"[[:space:]]*:[[:space:]]*[0-9]+" "$CONFIG_FILE" 2>/dev/null | sed 's/.*:[[:space:]]*//')" || true
+  printf '%s' "$value"
+}
+
+# Reads the previous deployment into SAVED_* variables. The state file is
+# sourced in a subshell so its values cannot land in the TSUNAMI_* environment.
+#
+# Installers before this version did not store the fallback, the Surge limits
+# or the padding scheme, so those are recovered from config.json when the state
+# file has no entry for them.
+load_saved_settings() {
+  clear_saved_settings
   [ -f "$STATE_FILE" ] || return 0
 
-  local have_listen="${TSUNAMI_LISTEN+x}"
-  local have_password="${TSUNAMI_PASSWORD+x}"
-  local have_user="${TSUNAMI_USER+x}"
-  local have_public_host="${TSUNAMI_PUBLIC_HOST+x}"
-  local have_tls_mode="${TSUNAMI_TLS_MODE+x}"
-  local have_dev="${TSUNAMI_DEV+x}"
-  local have_fronting="${TSUNAMI_FRONTING+x}"
-  local have_front_path="${TSUNAMI_FRONT_PATH+x}"
-  local have_front_secret="${TSUNAMI_FRONT_SECRET+x}"
-  local have_site_name="${TSUNAMI_SITE_NAME+x}"
-  local have_decoy_proxy="${TSUNAMI_DECOY_PROXY+x}"
-  local have_sni="${TSUNAMI_SNI+x}"
-  local have_cert_file="${TSUNAMI_CERT_FILE+x}"
-  local have_key_file="${TSUNAMI_KEY_FILE+x}"
-  local have_site_mode="${TSUNAMI_SITE_MODE+x}"
-  local have_site_upstream="${TSUNAMI_SITE_UPSTREAM+x}"
-  local have_site_preserve_host="${TSUNAMI_SITE_PRESERVE_HOST+x}"
-  local have_site_insecure_skip_verify="${TSUNAMI_SITE_INSECURE_SKIP_VERIFY+x}"
-  local current_listen="${TSUNAMI_LISTEN-}"
-  local current_password="${TSUNAMI_PASSWORD-}"
-  local current_user="${TSUNAMI_USER-}"
-  local current_public_host="${TSUNAMI_PUBLIC_HOST-}"
-  local current_tls_mode="${TSUNAMI_TLS_MODE-}"
-  local current_dev="${TSUNAMI_DEV-}"
-  local current_fronting="${TSUNAMI_FRONTING-}"
-  local current_front_path="${TSUNAMI_FRONT_PATH-}"
-  local current_front_secret="${TSUNAMI_FRONT_SECRET-}"
-  local current_site_name="${TSUNAMI_SITE_NAME-}"
-  local current_decoy_proxy="${TSUNAMI_DECOY_PROXY-}"
-  local current_sni="${TSUNAMI_SNI-}"
-  local current_cert_file="${TSUNAMI_CERT_FILE-}"
-  local current_key_file="${TSUNAMI_KEY_FILE-}"
-  local current_site_mode="${TSUNAMI_SITE_MODE-}"
-  local current_site_upstream="${TSUNAMI_SITE_UPSTREAM-}"
-  local current_site_preserve_host="${TSUNAMI_SITE_PRESERVE_HOST-}"
-  local current_site_insecure_skip_verify="${TSUNAMI_SITE_INSECURE_SKIP_VERIFY-}"
+  local dump=""
+  dump="$(
+    for name in $STATE_SETTINGS; do
+      unset "$name"
+    done
+    # shellcheck disable=SC1090
+    . "$STATE_FILE" 2>/dev/null || true
+    for name in $STATE_SETTINGS; do
+      if [ "${!name+x}" = "x" ]; then
+        printf 'SAVED_%s=%q\n' "${name#TSUNAMI_}" "${!name}"
+      fi
+    done
+  )" || true
+  # Only fixed names and %q-quoted values reach eval.
+  eval "$dump"
 
-  . "$STATE_FILE" 2>/dev/null || true
-
-  [ -z "$have_listen" ] || TSUNAMI_LISTEN="$current_listen"
-  [ -z "$have_password" ] || TSUNAMI_PASSWORD="$current_password"
-  [ -z "$have_user" ] || TSUNAMI_USER="$current_user"
-  [ -z "$have_public_host" ] || TSUNAMI_PUBLIC_HOST="$current_public_host"
-  [ -z "$have_tls_mode" ] || TSUNAMI_TLS_MODE="$current_tls_mode"
-  [ -z "$have_dev" ] || TSUNAMI_DEV="$current_dev"
-  [ -z "$have_fronting" ] || TSUNAMI_FRONTING="$current_fronting"
-  [ -z "$have_front_path" ] || TSUNAMI_FRONT_PATH="$current_front_path"
-  [ -z "$have_front_secret" ] || TSUNAMI_FRONT_SECRET="$current_front_secret"
-  [ -z "$have_site_name" ] || TSUNAMI_SITE_NAME="$current_site_name"
-  [ -z "$have_decoy_proxy" ] || TSUNAMI_DECOY_PROXY="$current_decoy_proxy"
-  [ -z "$have_sni" ] || TSUNAMI_SNI="$current_sni"
-  [ -z "$have_cert_file" ] || TSUNAMI_CERT_FILE="$current_cert_file"
-  [ -z "$have_key_file" ] || TSUNAMI_KEY_FILE="$current_key_file"
-  [ -z "$have_site_mode" ] || TSUNAMI_SITE_MODE="$current_site_mode"
-  [ -z "$have_site_upstream" ] || TSUNAMI_SITE_UPSTREAM="$current_site_upstream"
-  [ -z "$have_site_preserve_host" ] || TSUNAMI_SITE_PRESERVE_HOST="$current_site_preserve_host"
-  [ -z "$have_site_insecure_skip_verify" ] || TSUNAMI_SITE_INSECURE_SKIP_VERIFY="$current_site_insecure_skip_verify"
+  [ -f "$CONFIG_FILE" ] || return 0
+  if [ -z "${SAVED_FALLBACK+x}" ]; then
+    SAVED_FALLBACK="$(config_json_string fallback)"
+  fi
+  if [ -z "${SAVED_MAX_CONNECTIONS+x}" ]; then
+    SAVED_MAX_CONNECTIONS="$(config_json_number max_connections)"
+  fi
+  if [ -z "${SAVED_THRESHOLD+x}" ]; then
+    SAVED_THRESHOLD="$(config_json_number threshold)"
+  fi
+  if [ -z "${SAVED_PADDING_SCHEME_JSON+x}" ]; then
+    # write_config emits the scheme on a single line as the last server field.
+    local escaped=""
+    escaped="$(sed -n 's/^[[:space:]]*"padding_scheme":[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$CONFIG_FILE" 2>/dev/null | sed -n '1p')" || true
+    SAVED_PADDING_SCHEME_JSON="$(json_unescape "$escaped")"
+  fi
 }
 
 mask_secret() {
@@ -811,6 +877,31 @@ json_escape() {
   value="${value//\"/\\\"}"
   value="${value//$'\n'/\\n}"
   printf '%s' "$value"
+}
+
+# Reverses json_escape: \\ becomes a backslash, \" a quote and \n a newline.
+# Read left to right so the escaped backslash in "\\n" is not taken for the
+# start of a newline escape. Any other backslash pair is kept as written.
+json_unescape() {
+  local value="$1"
+  local out="" char=""
+  local i=0 length="${#1}"
+  while [ "$i" -lt "$length" ]; do
+    char="${value:i:1}"
+    if [ "$char" = "\\" ] && [ $((i + 1)) -lt "$length" ]; then
+      case "${value:i+1:1}" in
+        n) out+=$'\n' ;;
+        '"') out+='"' ;;
+        "\\") out+="\\" ;;
+        *) out+="\\${value:i+1:1}" ;;
+      esac
+      i=$((i + 2))
+    else
+      out+="$char"
+      i=$((i + 1))
+    fi
+  done
+  printf '%s' "$out"
 }
 
 shell_escape() {
@@ -1022,27 +1113,47 @@ HOOK
 # ── Configuration ────────────────────────────────────────────────────────
 
 write_config() {
-  # Explicit environment decisions must survive state-file defaults.
-  local env_tls_mode="${TSUNAMI_TLS_MODE:-}"
-  local env_cert="${TSUNAMI_CERT_FILE:-}"
-  local env_key="${TSUNAMI_KEY_FILE:-}"
-  local env_front_path="${TSUNAMI_FRONT_PATH:-}"
-  local env_front_secret="${TSUNAMI_FRONT_SECRET:-}"
-  local env_site_name="${TSUNAMI_SITE_NAME:-}"
-  local env_site_mode="${TSUNAMI_SITE_MODE:-}"
-  local env_site_upstream="${TSUNAMI_SITE_UPSTREAM:-}"
-  local env_site_preserve="${TSUNAMI_SITE_PRESERVE_HOST:-}"
-  local env_site_insecure="${TSUNAMI_SITE_INSECURE_SKIP_VERIFY:-}"
-  local env_decoy="${TSUNAMI_DECOY_PROXY:-}"
-
-  local interactive=0 advanced=0 reuse=0 domain_missing=0
+  local interactive=0 advanced=0 domain_missing=0
   if is_interactive; then
     interactive=1
-    load_state_defaults
   fi
   if is_advanced_mode; then
     advanced=1
   fi
+
+  # An interactive run starts from the previous deployment: every question
+  # defaults to the current value. A non-interactive run is defined by its
+  # environment alone, as before.
+  if [ "$interactive" = "1" ]; then
+    load_saved_settings
+  else
+    clear_saved_settings
+  fi
+
+  # Values the operator fixed for this run. A fixed setting is used as is and
+  # its question is not asked.
+  local env_public_host env_tls_mode env_cert env_key env_sni env_dev
+  local env_front_path env_front_secret env_site_name env_site_mode
+  local env_site_upstream env_site_preserve env_site_insecure env_decoy
+  local env_listen env_fallback env_max_conn env_threshold
+  env_public_host="$(operator_value TSUNAMI_PUBLIC_HOST)"
+  env_tls_mode="$(operator_value TSUNAMI_TLS_MODE)"
+  env_cert="$(operator_value TSUNAMI_CERT_FILE)"
+  env_key="$(operator_value TSUNAMI_KEY_FILE)"
+  env_sni="$(operator_value TSUNAMI_SNI)"
+  env_dev="$(operator_value TSUNAMI_DEV)"
+  env_front_path="$(operator_value TSUNAMI_FRONT_PATH)"
+  env_front_secret="$(operator_value TSUNAMI_FRONT_SECRET)"
+  env_site_name="$(operator_value TSUNAMI_SITE_NAME)"
+  env_site_mode="$(operator_value TSUNAMI_SITE_MODE)"
+  env_site_upstream="$(operator_value TSUNAMI_SITE_UPSTREAM)"
+  env_site_preserve="$(operator_value TSUNAMI_SITE_PRESERVE_HOST)"
+  env_site_insecure="$(operator_value TSUNAMI_SITE_INSECURE_SKIP_VERIFY)"
+  env_decoy="$(operator_value TSUNAMI_DECOY_PROXY)"
+  env_listen="$(operator_value TSUNAMI_LISTEN)"
+  env_fallback="$(operator_value TSUNAMI_FALLBACK)"
+  env_max_conn="$(operator_value TSUNAMI_MAX_CONNECTIONS)"
+  env_threshold="$(operator_value TSUNAMI_THRESHOLD)"
 
   mkdir -p "$CONFIG_DIR"
   chmod 0700 "$CONFIG_DIR"
@@ -1050,48 +1161,63 @@ write_config() {
   local listen fallback max_conn threshold padding
   local domain sni cert key password user_name
   local fronting_enabled="true"
-  local front_path="" front_secret="" site_name=""
+  local front_path="" front_secret="" site_name="" saved_site_name=""
   local custom_front_path="" custom_front_secret="" custom_site_name=""
-  local explicit_mode="" tls_mode="" dev="0"
+  local explicit_mode="" saved_tls_mode="" tls_mode="" dev="0"
   local padding_field="" token_hash=""
-  local default_domain="" choice="" default_choice=""
+  local default_domain="" choice="" default_choice="" fronting_value=""
+  local saved_domain="" saved_cert="" saved_key=""
 
-  password="${TSUNAMI_PASSWORD:-$(random_password)}"
-  user_name="${TSUNAMI_USER:-default}"
+  saved_domain="$(saved_setting TSUNAMI_PUBLIC_HOST)"
+  saved_cert="$(saved_setting TSUNAMI_CERT_FILE)"
+  saved_key="$(saved_setting TSUNAMI_KEY_FILE)"
 
-  # Interactive re-runs can reuse the previous deployment without prompts.
-  if [ "$interactive" = "1" ] && [ "$advanced" = "0" ] && [ -f "$STATE_FILE" ]; then
-    if confirm "Existing TSUNAMI settings found. Reuse them?" "y"; then
-      reuse=1
-    fi
-  fi
+  password="$(operator_value TSUNAMI_PASSWORD)"
+  password="${password:-$(saved_setting TSUNAMI_PASSWORD)}"
+  password="${password:-$(random_password)}"
+  user_name="$(operator_value TSUNAMI_USER)"
+  user_name="${user_name:-$(saved_setting TSUNAMI_USER)}"
+  user_name="${user_name:-default}"
 
-  # ── Advanced prompts (never shown in the quick flow) ──────────────────
-  if [ "$interactive" = "1" ] && [ "$advanced" = "1" ] && [ "$reuse" = "0" ]; then
-    listen="$(ask "Listen address" "${TSUNAMI_LISTEN:-:443}")"
-    fallback="$(ask "Fallback backend, empty to use built-in page" "${TSUNAMI_FALLBACK:-}")"
-    max_conn="$(ask "Surge max connections" "${TSUNAMI_MAX_CONNECTIONS:-4}")"
-    threshold="$(ask "Surge threshold" "${TSUNAMI_THRESHOLD:-8}")"
+  # ── Listen, fallback and Surge: asked only in advanced mode ───────────
+  listen="${env_listen:-$(saved_setting TSUNAMI_LISTEN)}"
+  listen="${listen:-:443}"
+  if operator_set TSUNAMI_FALLBACK; then
+    fallback="$env_fallback"
   else
-    listen="${TSUNAMI_LISTEN:-:443}"
-    fallback="${TSUNAMI_FALLBACK:-}"
-    max_conn="${TSUNAMI_MAX_CONNECTIONS:-4}"
-    threshold="${TSUNAMI_THRESHOLD:-8}"
+    fallback="$(saved_setting TSUNAMI_FALLBACK)"
   fi
-  padding="${TSUNAMI_PADDING_SCHEME_JSON:-}"
+  max_conn="${env_max_conn:-$(saved_setting TSUNAMI_MAX_CONNECTIONS)}"
+  max_conn="${max_conn:-4}"
+  threshold="${env_threshold:-$(saved_setting TSUNAMI_THRESHOLD)}"
+  threshold="${threshold:-8}"
+  if operator_set TSUNAMI_PADDING_SCHEME_JSON; then
+    padding="$(operator_value TSUNAMI_PADDING_SCHEME_JSON)"
+  else
+    padding="$(saved_setting TSUNAMI_PADDING_SCHEME_JSON)"
+  fi
+  if [ "$interactive" = "1" ] && [ "$advanced" = "1" ]; then
+    listen="$(ask "Listen address" "$listen")"
+    fallback="$(ask "Fallback backend, empty to use built-in page" "$fallback")"
+    max_conn="$(ask "Surge max connections" "$max_conn")"
+    threshold="$(ask "Surge threshold" "$threshold")"
+  fi
 
-  cert="${TSUNAMI_CERT_FILE:-}"
-  key="${TSUNAMI_KEY_FILE:-}"
-  domain="${TSUNAMI_PUBLIC_HOST:-}"
-  sni="${TSUNAMI_SNI:-}"
-
-  if normalize_yes "${TSUNAMI_DEV:-0}"; then
+  if [ -n "$env_dev" ]; then
+    if normalize_yes "$env_dev"; then
+      dev="1"
+    fi
+  elif normalize_yes "$(saved_setting TSUNAMI_DEV)"; then
     dev="1"
   fi
+
   if [ -n "$env_tls_mode" ]; then
     if ! explicit_mode="$(normalize_tls_mode "$env_tls_mode")"; then
       die "invalid TSUNAMI_TLS_MODE='$env_tls_mode' (expected letsencrypt, manual or self-signed)"
     fi
+  fi
+  if ! saved_tls_mode="$(normalize_tls_mode "$(saved_setting TSUNAMI_TLS_MODE)")"; then
+    saved_tls_mode=""
   fi
   if [ -n "$env_cert" ] || [ -n "$env_key" ]; then
     if [ -z "$env_cert" ] || [ -z "$env_key" ]; then
@@ -1100,13 +1226,17 @@ write_config() {
     if [ -n "$explicit_mode" ] && [ "$explicit_mode" = "self-signed" ]; then
       die "TSUNAMI_TLS_MODE=self-signed cannot be combined with TSUNAMI_CERT_FILE/TSUNAMI_KEY_FILE"
     fi
-    cert="$env_cert"
-    key="$env_key"
   fi
+  cert="$env_cert"
+  key="$env_key"
 
   # ── Quick flow step 1: public domain ──────────────────────────────────
-  if [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
-    default_domain="$(default_public_domain)"
+  domain="${env_public_host:-$saved_domain}"
+  if [ "$interactive" = "1" ]; then
+    default_domain="$domain"
+    if ! domain_is_valid "$default_domain"; then
+      default_domain="$(default_public_domain)"
+    fi
     domain="$(ask_domain_optional "Public domain for this server (must resolve here; Enter = self-signed test mode)" "$default_domain")"
     if [ -z "$domain" ]; then
       domain_missing=1
@@ -1116,26 +1246,26 @@ write_config() {
     fi
   fi
 
+  # The SNI follows the domain unless the operator fixed it, or the domain was
+  # kept and the previous deployment used a different SNI on purpose.
+  if [ -n "$env_sni" ]; then
+    sni="$env_sni"
+  elif [ "$domain" = "$saved_domain" ]; then
+    sni="$(saved_setting TSUNAMI_SNI)"
+  else
+    sni=""
+  fi
+
   # ── Quick flow step 2: TLS mode ───────────────────────────────────────
   if [ "$domain_missing" = "1" ]; then
     tls_mode="self-signed"
   elif [ -n "$explicit_mode" ]; then
     tls_mode="$explicit_mode"
-  elif [ "$reuse" = "1" ]; then
-    if ! tls_mode="$(normalize_tls_mode "${TSUNAMI_TLS_MODE:-}")"; then
-      if [ -n "$cert" ] && [ -n "$key" ]; then
-        tls_mode="manual"
-      elif [ -n "$domain" ]; then
-        tls_mode="letsencrypt"
-      else
-        tls_mode="self-signed"
-      fi
-    fi
   elif [ -n "$env_cert" ] && [ -n "$env_key" ]; then
     tls_mode="manual"
   elif [ "$interactive" = "1" ]; then
     default_choice="1"
-    case "${TSUNAMI_TLS_MODE:-}" in
+    case "$saved_tls_mode" in
       letsencrypt) default_choice="1" ;;
       manual) default_choice="2" ;;
       self-signed) default_choice="3" ;;
@@ -1162,6 +1292,12 @@ Choose one of:
 The installer never falls back to a self-signed certificate silently."
   fi
 
+  # The self-signed acknowledgement belongs to a self-signed deployment that is
+  # being kept; switching to that mode has to be acknowledged again.
+  if [ "$tls_mode" = "self-signed" ] && [ "$saved_tls_mode" != "self-signed" ] && [ -z "$env_dev" ]; then
+    dev="0"
+  fi
+
   case "$tls_mode" in
     self-signed)
       if [ "$dev" != "1" ]; then
@@ -1185,8 +1321,8 @@ or TSUNAMI_TLS_MODE=manual with TSUNAMI_CERT_FILE and TSUNAMI_KEY_FILE."
       ;;
     letsencrypt)
       dev="0"
-      if [ -z "$domain" ] && [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
-        domain="$(ask_domain "Public domain for Let's Encrypt" "${TSUNAMI_PUBLIC_HOST:-}")"
+      if [ -z "$domain" ] && [ "$interactive" = "1" ]; then
+        domain="$(ask_domain "Public domain for Let's Encrypt" "")"
       fi
       require_domain "TSUNAMI_PUBLIC_HOST" "$domain"
       if [ -n "$env_cert" ] && [ -n "$env_key" ]; then
@@ -1205,17 +1341,23 @@ or TSUNAMI_TLS_MODE=manual with TSUNAMI_CERT_FILE and TSUNAMI_KEY_FILE."
       ;;
     manual)
       dev="0"
-      if [ -z "$cert" ] && [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
-        cert="$(ask "TLS certificate file (fullchain.pem)" "")"
+      # The saved paths are the previous deployment's files only if it was a
+      # manual one; a Let's Encrypt path is not a certificate the operator owns.
+      if [ "$saved_tls_mode" != "manual" ]; then
+        saved_cert=""
+        saved_key=""
       fi
-      if [ -z "$key" ] && [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
-        key="$(ask "TLS private key file (privkey.pem)" "")"
+      if [ -z "$cert" ] && [ "$interactive" = "1" ]; then
+        cert="$(ask "TLS certificate file (fullchain.pem)" "$saved_cert")"
+      fi
+      if [ -z "$key" ] && [ "$interactive" = "1" ]; then
+        key="$(ask "TLS private key file (privkey.pem)" "$saved_key")"
       fi
       if [ -z "$cert" ] || [ -z "$key" ]; then
         die "manual TLS mode requires TSUNAMI_CERT_FILE and TSUNAMI_KEY_FILE"
       fi
-      if [ -z "$domain" ] && [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
-        domain="$(ask_domain "Public hostname for the certificate (SNI)" "${TSUNAMI_PUBLIC_HOST:-}")"
+      if [ -z "$domain" ] && [ "$interactive" = "1" ]; then
+        domain="$(ask_domain "Public hostname for the certificate (SNI)" "")"
       fi
       require_domain "TSUNAMI_PUBLIC_HOST" "$domain"
       ;;
@@ -1226,7 +1368,7 @@ or TSUNAMI_TLS_MODE=manual with TSUNAMI_CERT_FILE and TSUNAMI_KEY_FILE."
 
   # Every mode still needs a hostname for SNI: never emit an IP or placeholder.
   if [ "$domain_missing" != "1" ]; then
-    if [ -z "$domain" ] && [ "$interactive" = "1" ] && [ "$reuse" = "0" ]; then
+    if [ -z "$domain" ] && [ "$interactive" = "1" ]; then
       domain="$(ask_domain "Public server hostname (SNI, for example edge.tsunami.io)" "$default_domain")"
     fi
     require_domain "TSUNAMI_PUBLIC_HOST" "$domain"
@@ -1237,30 +1379,43 @@ or TSUNAMI_TLS_MODE=manual with TSUNAMI_CERT_FILE and TSUNAMI_KEY_FILE."
   require_domain "TSUNAMI_SNI" "$sni"
 
   # ── Fronting switch and quick flow step 3: site camouflage ────────────
-  if [ -n "${TSUNAMI_FRONTING:-}" ]; then
-    if normalize_no "$TSUNAMI_FRONTING"; then
+  if operator_set TSUNAMI_FRONTING; then
+    fronting_value="$(operator_value TSUNAMI_FRONTING)"
+  else
+    fronting_value="$(saved_setting TSUNAMI_FRONTING)"
+  fi
+  if [ -n "$fronting_value" ]; then
+    if normalize_no "$fronting_value"; then
       fronting_enabled="false"
-    elif ! normalize_yes "$TSUNAMI_FRONTING"; then
-      die "TSUNAMI_FRONTING must be 1 or 0 (got '$TSUNAMI_FRONTING')"
+    elif ! normalize_yes "$fronting_value"; then
+      die "TSUNAMI_FRONTING must be 1 or 0 (got '$fronting_value')"
     fi
   fi
 
-  resolve_site_settings "$interactive" "$reuse" "$fronting_enabled" \
-    "$env_site_mode" "$env_site_upstream" "$env_site_preserve" "$env_site_insecure" "$env_decoy"
+  resolve_site_settings "$interactive" "$fronting_enabled" \
+    "$env_site_mode" "$env_site_upstream" "$env_site_preserve" "$env_site_insecure" "$env_decoy" \
+    "$(saved_setting TSUNAMI_SITE_MODE)" "$(saved_setting TSUNAMI_SITE_UPSTREAM)" \
+    "$(saved_setting TSUNAMI_SITE_PRESERVE_HOST)" "$(saved_setting TSUNAMI_SITE_INSECURE_SKIP_VERIFY)" \
+    "$(saved_setting TSUNAMI_DECOY_PROXY)"
 
-  # ── Advanced post-domain prompts (custom fronting/padding values) ─────
-  custom_front_path="$env_front_path"
-  custom_front_secret="$env_front_secret"
-  custom_site_name="$env_site_name"
-  if [ "$reuse" = "1" ]; then
-    custom_front_path="${TSUNAMI_FRONT_PATH:-}"
-    custom_front_secret="${TSUNAMI_FRONT_SECRET:-}"
-    custom_site_name="${TSUNAMI_SITE_NAME:-}"
-  elif [ "$interactive" = "1" ] && [ "$advanced" = "1" ]; then
-    custom_front_path="$(ask "Fronting path override, empty = generated" "${TSUNAMI_FRONT_PATH:-}")"
-    custom_front_secret="$(ask "Fronting secret override, empty = generated" "${TSUNAMI_FRONT_SECRET:-}")"
-    custom_site_name="$(ask "Decoy site name override, empty = derived from domain" "${TSUNAMI_SITE_NAME:-}")"
-    padding="$(ask "Padding scheme JSON override, empty = server default" "${TSUNAMI_PADDING_SCHEME_JSON:-}")"
+  # ── Fronting path, secret and site name ───────────────────────────────
+  # The path and secret are kept across re-runs: changing them breaks every
+  # client command that was already handed out.
+  custom_front_path="${env_front_path:-$(saved_setting TSUNAMI_FRONT_PATH)}"
+  custom_front_secret="${env_front_secret:-$(saved_setting TSUNAMI_FRONT_SECRET)}"
+  # A name the operator chose is carried over; a name that was derived from
+  # the old domain is derived again so it follows a changed domain.
+  saved_site_name="$(saved_setting TSUNAMI_SITE_NAME)"
+  if [ -n "$env_site_name" ]; then
+    custom_site_name="$env_site_name"
+  elif [ -n "$saved_site_name" ] && [ "$saved_site_name" != "$(derive_site_name "$saved_domain")" ]; then
+    custom_site_name="$saved_site_name"
+  fi
+  if [ "$interactive" = "1" ] && [ "$advanced" = "1" ]; then
+    custom_front_path="$(ask "Fronting path override, empty = generated" "$custom_front_path")"
+    custom_front_secret="$(ask "Fronting secret override, empty = generated" "$custom_front_secret")"
+    custom_site_name="$(ask "Decoy site name override, empty = derived from domain" "$custom_site_name")"
+    padding="$(ask "Padding scheme JSON override, empty = server default" "$padding")"
   fi
 
   if [ "$fronting_enabled" = "true" ]; then
@@ -1346,6 +1501,10 @@ TSUNAMI_TLS_MODE=$(shell_escape "$tls_mode")
 TSUNAMI_DEV=$(shell_escape "$dev")
 TSUNAMI_CERT_FILE=$(shell_escape "$cert")
 TSUNAMI_KEY_FILE=$(shell_escape "$key")
+TSUNAMI_FALLBACK=$(shell_escape "$fallback")
+TSUNAMI_MAX_CONNECTIONS=$(shell_escape "$max_conn")
+TSUNAMI_THRESHOLD=$(shell_escape "$threshold")
+TSUNAMI_PADDING_SCHEME_JSON=$(shell_escape "$padding")
 TSUNAMI_FRONTING=$(shell_escape "$fronting_enabled")
 TSUNAMI_FRONT_PATH=$(shell_escape "$front_path")
 TSUNAMI_FRONT_SECRET=$(shell_escape "$front_secret")
@@ -1476,9 +1635,14 @@ print_info_box() {
   printf '%s\n' "${C_BOX}╚${border}╝${C_RESET}"
 }
 
-print_connection_info() {
+# Defined with a subshell body so the state-file values it sources cannot leak
+# into the caller's environment. The management menu calls this before a
+# reconfigure, and a leaked value would look like an operator override and skip
+# that setting's question.
+print_connection_info() (
   # Read state
   [ -f "$STATE_FILE" ] || return 0
+  # shellcheck disable=SC1090
   . "$STATE_FILE" 2>/dev/null || true
 
   local password="${TSUNAMI_PASSWORD:-???}"
@@ -1555,7 +1719,7 @@ print_connection_info() {
     printf '%bNote%b: no site camouflage origin configured. Use a local real site or a remote upstream to reduce the deployment fingerprint.\n' "$C_DIM" "$C_RESET"
     echo ""
   elif [ "$site_mode" = "builtin" ]; then
-    printf '%bNote%b: the built-in page is the easiest deployment to cluster. A local real site or a remote upstream is recommended (run install.sh advanced to change it).\n' "$C_DIM" "$C_RESET"
+    printf '%bNote%b: the built-in page is the easiest deployment to cluster. A local real site or a remote upstream is recommended (run install.sh config to change it).\n' "$C_DIM" "$C_RESET"
     echo ""
   fi
 
@@ -1566,7 +1730,7 @@ print_connection_info() {
     printf 'client command file is missing: %s\n' "$CLIENT_FILE"
   fi
   echo ""
-}
+)
 
 # ── Commands ─────────────────────────────────────────────────────────────
 
@@ -1971,7 +2135,7 @@ Usage:
     sudo bash install.sh              Open interactive menu
     sudo bash install.sh install      Quick install immediately
     sudo bash install.sh advanced    Install with the advanced prompts
-    sudo bash install.sh config      Reconfigure (offers to reuse settings)
+    sudo bash install.sh config      Reconfigure (each setting defaults to its current value)
 
 Commands:
   menu        Open interactive management menu

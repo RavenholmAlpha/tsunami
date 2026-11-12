@@ -7,6 +7,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Re-running the installer wizard (`tsunami-manage config`) could not change anything. It asked "Reuse existing settings?" with yes as the default, and a yes skipped every question, so the domain, TLS mode and site camouflage of the previous deployment were applied unchanged. The wizard now asks each question with the current value as its default: Enter keeps a setting and a new value changes it.
+- Answering no to that question did not help either: the site camouflage menu always preselected "local site" and offered the previous upstream, so pressing Enter turned a remote site into a local one pointing at the remote URL, and the fronting path and secret were regenerated, which broke the client commands already handed out. The menu now preselects the current mode, the upstream default is only offered for the same mode, and the path, secret and password are kept.
+- Any reconfigure reset the fallback backend, the Surge limits and the padding scheme to their defaults, because they were never written to `install.env`. They are now stored, and a deployment written by an older installer has them recovered from `config.json` on its first re-run.
+- Opening the status or client view in the management menu loaded the saved settings into the running shell, where the wizard mistook them for values fixed on the command line and skipped the TLS and site questions. Saved settings are now read separately and only real environment variables skip a question.
+- The local-site upstream prompt repeated forever when its input ended; it now gives up after ten empty answers.
+- After a mistyped domain, the next prompt lost its default, so pressing Enter selected the self-signed test mode. The default is kept.
+
+### Changed
+- A site name you set yourself is kept when the domain changes; a name that was derived from the old domain is derived again from the new one.
+- Non-interactive installs (`TSUNAMI_ASSUME_YES=1`, or piped without a terminal) are unchanged: they do not read the previous deployment.
+
 ## [1.3.1] - 2026-11-03
 
 ### Changed
