@@ -82,16 +82,9 @@ PREFIX=()
 if [ "$T_RUNOS" = "$HOST_OS" ]; then
   if [ "$T_GOARCH" = "$HOST_ARCH" ] || { [ "$HOST_ARCH" = amd64 ] && [ "$T_GOARCH" = 386 ]; }; then
     runnable=1
-  elif [ "$HOST_OS" = linux ]; then
-    emulator=""
-    case "$T_GOARCH" in
-      arm64) emulator=qemu-aarch64-static ;;
-      arm) emulator=qemu-arm-static ;;
-    esac
-    if [ -n "$emulator" ] && command -v "$emulator" >/dev/null 2>&1; then
-      runnable=1
-      PREFIX=("$emulator")
-    fi
+  elif [ "$HOST_OS" = linux ] && emulator="$(find_emulator "$T_GOARCH")"; then
+    runnable=1
+    PREFIX=("$emulator")
   fi
 fi
 if [ "$RUN_MODE" = always ] && [ "$runnable" = 0 ]; then

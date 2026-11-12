@@ -76,3 +76,26 @@ find_python() {
   done
   return 1
 }
+
+# find_emulator GOARCH prints the qemu user-mode emulator on PATH that runs
+# linux binaries of that architecture, or returns 1.
+#
+# The name depends on the package: Ubuntu 26.04's qemu-user installs
+# qemu-aarch64 and qemu-arm and has no qemu-user-static package, while
+# qemu-user-static on Ubuntu 24.04 and Debian installs the same emulators with
+# a -static suffix.
+find_emulator() {
+  local base candidate
+  case "$1" in
+    arm64) base=qemu-aarch64 ;;
+    arm) base=qemu-arm ;;
+    *) return 1 ;;
+  esac
+  for candidate in "$base" "$base-static"; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}

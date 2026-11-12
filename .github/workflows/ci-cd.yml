@@ -158,11 +158,13 @@ jobs:
         cache: true
 
     # Lets the smoke test run arm and arm64 binaries on the x86 runner.
+    # qemu-user exists on Ubuntu 24.04 and 26.04; qemu-user-static was dropped
+    # in 26.04. The Go binaries are static, so no ARM sysroot is needed.
     - name: Install QEMU user emulation
       if: runner.os == 'Linux' && !startsWith(matrix.target, 'darwin') && (contains(matrix.target, 'arm') || contains(matrix.target, 'aarch64'))
       run: |
         sudo apt-get update
-        sudo apt-get install -y qemu-user-static
+        sudo apt-get install -y qemu-user
 
     # Tag builds use the tag. Every other build gets a throwaway
     # pre-release version so the same scripts run on pull requests.
@@ -189,6 +191,10 @@ jobs:
       env:
         VERSION: ${{ steps.version.outputs.value }}
         TARGET: ${{ matrix.target }}
+        # Fail instead of skipping when a binary cannot be executed. macOS
+        # binaries cannot run on the Linux runner, so those are only checked
+        # for contents and architecture.
+        SMOKE_RUN: ${{ startsWith(matrix.target, 'darwin') && 'auto' || 'always' }}
       run: bash build/smoke.sh -t "$TARGET" -v "$VERSION" dist/tsunami-"$VERSION"-"$TARGET".*
 
     - name: Upload archive
