@@ -1,0 +1,56 @@
+#!/bin/sh /etc/rc.common
+# TSUNAMI client service for OpenWrt (procd).
+# Configuration: /etc/config/tsunami (example: /usr/share/tsunami/tsunami.config.example)
+
+# USE_PROCD, START and STOP are read by /etc/rc.common, and OpenWrt's busybox
+# ash supports `local`, which shellcheck's POSIX-sh mode does not know about.
+# shellcheck disable=SC2034,SC3043
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/bin/tsunami-client
+
+start_service() {
+	local enabled server password sni skip_verify socks http fingerprint
+	local front_path front_secret front_transport max_connections
+
+	config_load tsunami
+	config_get_bool enabled main enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get server main server
+	config_get password main password
+	if [ -z "$server" ] || [ -z "$password" ]; then
+		logger -t tsunami "not started: set server and password in /etc/config/tsunami"
+		return 1
+	fi
+	config_get sni main sni
+	config_get_bool skip_verify main skip_verify 0
+	config_get socks main socks "127.0.0.1:1080"
+	config_get http main http "127.0.0.1:8080"
+	config_get fingerprint main fingerprint "chrome"
+	config_get front_path main front_path
+	config_get front_secret main front_secret
+	config_get front_transport main front_transport
+	config_get max_connections main max_connections
+
+	procd_open_instance
+	procd_set_param command "$PROG" --server "$server" --password "$password" \
+		--socks "$socks" --http "$http" --fingerprint "$fingerprint"
+	[ -z "$sni" ] || procd_append_param command --sni "$sni"
+	[ "$skip_verify" -eq 0 ] || procd_append_param command --skip-verify
+	[ -z "$front_path" ] || procd_append_param command --front-path "$front_path"
+	[ -z "$front_secret" ] || procd_append_param command --front-secret "$front_secret"
+	[ -z "$front_transport" ] || procd_append_param command --front-transport "$front_transport"
+	[ -z "$max_connections" ] || procd_append_param command --max-connections "$max_connections"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger tsunami
+}

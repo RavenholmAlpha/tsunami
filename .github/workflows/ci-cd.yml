@@ -6,6 +6,7 @@ on:
     tags: [ "v*.*.*" ]
   pull_request:
     branches: [ "main", "master" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,7 +45,9 @@ jobs:
         golangci-lint run --timeout=5m ./...
 
     - name: Shellcheck
-      run: shellcheck scripts/install.sh scripts/install-node.sh
+      run: |
+        shellcheck -x scripts/install.sh scripts/install-node.sh
+        shellcheck -x build/package.sh build/smoke.sh build/checksums.sh build/targets.sh \n          build/openwrt/tsunami.init tests/package_script_test.sh tests/openwrt_init_test.sh
 
   # ── Stage 2: Test ────────────────────────────────────────────────────
   test:
@@ -70,6 +73,8 @@ jobs:
         go test -v -count=1 -timeout 5m ./tests/...
         bash tests/install_script_test.sh
         bash tests/install_node_script_test.sh
+        bash tests/openwrt_init_test.sh
+        bash tests/package_script_test.sh
 
     - name: Verify Build
       run: |
@@ -104,10 +109,99 @@ jobs:
         go install golang.org/x/vuln/cmd/govulncheck@latest
         govulncheck ./...
 
-  # ── Stage 4: Cross-compile + Release ─────────────────────────────────
+  # ── Stage 4: Package every target ───────────────────────────────────
+  # One job per target. Each job builds, packages and smoke-tests its own
+  # archive, so a target that cannot be built or run blocks the release.
+  # Windows targets build on a Windows runner so their .exe files are the
+  # ones that get executed by the smoke test.
+  package:
+    name: Package ${{ matrix.target }}
+    needs: [ test ]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+          - target: linux-arm64
+            runner: ubuntu-latest
+          - target: linux-386
+            runner: ubuntu-latest
+          - target: linux-armv7
+            runner: ubuntu-latest
+          - target: windows-amd64
+            runner: windows-latest
+          - target: windows-386
+            runner: windows-latest
+          - target: darwin-amd64
+            runner: ubuntu-latest
+          - target: darwin-arm64
+            runner: ubuntu-latest
+          - target: openwrt-x86_64
+            runner: ubuntu-latest
+          - target: openwrt-x86
+            runner: ubuntu-latest
+          - target: openwrt-aarch64
+            runner: ubuntu-latest
+          - target: openwrt-armv7
+            runner: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.25.x'
+        cache: true
+
+    # Lets the smoke test run arm and arm64 binaries on the x86 runner.
+    - name: Install QEMU user emulation
+      if: runner.os == 'Linux' && !startsWith(matrix.target, 'darwin') && (contains(matrix.target, 'arm') || contains(matrix.target, 'aarch64'))
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+
+    # Tag builds use the tag. Every other build gets a throwaway
+    # pre-release version so the same scripts run on pull requests.
+    - name: Resolve version
+      id: version
+      shell: bash
+      run: |
+        if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          version="${GITHUB_REF_NAME}"
+        else
+          version="v0.0.0-dev.${GITHUB_SHA::8}"
+        fi
+        echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+    - name: Build and package
+      shell: bash
+      env:
+        VERSION: ${{ steps.version.outputs.value }}
+        TARGET: ${{ matrix.target }}
+      run: bash build/package.sh -v "$VERSION" -t "$TARGET" -o dist
+
+    - name: Smoke test
+      shell: bash
+      env:
+        VERSION: ${{ steps.version.outputs.value }}
+        TARGET: ${{ matrix.target }}
+      run: bash build/smoke.sh -t "$TARGET" -v "$VERSION" dist/tsunami-"$VERSION"-"$TARGET".*
+
+    - name: Upload archive
+      uses: actions/upload-artifact@v4
+      with:
+        name: package-${{ matrix.target }}
+        path: dist/*
+        if-no-files-found: error
+        retention-days: 14
+
+  # ── Stage 5: Publish the GitHub release (tags only) ──────────────────
   release:
     name: Release
-    needs: [ test, security ]
+    needs: [ test, security, package ]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -115,97 +209,36 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
       with:
-        fetch-depth: 0   # needed for git describe
+        path: dist
+        pattern: package-*
+        merge-multiple: true
 
-    - uses: actions/setup-go@v5
-      with:
-        go-version: '1.25.x'
-        cache: true
-
-    - name: Build All Platforms
+    - name: Generate checksums
       run: |
-        VERSION="${GITHUB_REF_NAME}"
-        COMMIT="${GITHUB_SHA::8}"
-        BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}"
+        bash build/checksums.sh dist
+        cat dist/checksums.sha256
 
-        TARGETS="linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64"
-
-        for target in $TARGETS; do
-          GOOS="${target%/*}"
-          GOARCH="${target#*/}"
-          EXT=""; [ "$GOOS" = "windows" ] && EXT=".exe"
-          DIR="dist/${VERSION}"
-
-          mkdir -p "$DIR"
-
-          echo "::group::Building ${GOOS}/${GOARCH}"
-          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-            go build -trimpath -ldflags="${LDFLAGS}" \
-            -o "$DIR/tsunami-server-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-server/
-
-          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-            go build -trimpath -ldflags="${LDFLAGS}" \
-            -o "$DIR/tsunami-client-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-client/
-
-          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-            go build -trimpath -ldflags="${LDFLAGS}" \
-            -o "$DIR/tsunami-node-${GOOS}-${GOARCH}${EXT}" ./cmd/tsunami-node/
-          echo "::endgroup::"
-        done
-
-    - name: Package Archives
+    - name: Verify release assets
       run: |
-        VERSION="${GITHUB_REF_NAME}"
-        DIR="dist/${VERSION}"
-        ARCHIVES="dist/archives"
-        mkdir -p "$ARCHIVES"
-
-        cd "$DIR"
-
-        for pair in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
-          GOOS="${pair%%-*}"
-          GOARCH="${pair##*-}"
-          ARCHIVE="tsunami-${VERSION}-${pair}.tar.gz"
-          tar -czvf "../../${ARCHIVES}/${ARCHIVE}" \
-            "tsunami-server-${GOOS}-${GOARCH}" \
-            "tsunami-client-${GOOS}-${GOARCH}" \
-            "tsunami-node-${GOOS}-${GOARCH}"
-          echo "Packaged: $ARCHIVE"
+        source build/targets.sh
+        missing=0
+        for target in $ALL_TARGETS; do
+          if ! ls dist/tsunami-"${GITHUB_REF_NAME}"-"${target}".* > /dev/null 2>&1; then
+            echo "::error::missing archive for ${target}"
+            missing=1
+          fi
         done
-
-        ARCHIVE="tsunami-${VERSION}-windows-amd64.zip"
-        zip "../../${ARCHIVES}/${ARCHIVE}" \
-          tsunami-server-windows-amd64.exe \
-          tsunami-client-windows-amd64.exe \
-          tsunami-node-windows-amd64.exe
-        echo "Packaged: $ARCHIVE"
-
-    - name: Generate Checksums
-      run: |
-        cd dist/archives
-        sha256sum *.tar.gz *.zip > checksums.sha256
-        cat checksums.sha256
-
-    - name: Verify Archives
-      run: |
-        echo "::group::Archive contents"
-        for f in dist/archives/*.tar.gz; do
-          echo "--- $f ---"
-          tar -tzf "$f"
-        done
-        for f in dist/archives/*.zip; do
-          echo "--- $f ---"
-          unzip -l "$f"
-        done
-        echo "::endgroup::"
+        [ "$missing" -eq 0 ] || exit 1
+        (cd dist && sha256sum -c checksums.sha256)
+        ls -l dist
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          dist/archives/*.tar.gz
-          dist/archives/*.zip
-          dist/archives/checksums.sha256
+        files: dist/*
+        fail_on_unmatched_files: true
         generate_release_notes: true
+        prerelease: ${{ contains(github.ref_name, '-') }}

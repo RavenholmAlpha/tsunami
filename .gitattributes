@@ -1,1 +1,4 @@
 *.sh text eol=lf
+*.py text eol=lf
+# Shipped to OpenWrt routers: a CR in the interpreter line breaks the script.
+build/openwrt/* text eol=lf

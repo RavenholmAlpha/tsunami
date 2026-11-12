@@ -119,6 +119,29 @@ make VERSION=1.0.0 clean
 | `-c`   | オフ                                                           | ビルド前にクリーン       |
 | `-s`   | オフ                                                           | チェックサム生成をスキップ |
 
+## リリースのパッケージング（CI）
+
+`.github/workflows/ci-cd.yml` は `build/targets.sh` の各ターゲットについて、ビルド、パッケージング、スモークテストを 1 ジョブずつ実行します。`vX.Y.Z` タグをプッシュすると、すべてのアーカイブと `checksums.sha256` を添えた GitHub Release が公開されます。ハイフンを含むタグ（`v1.2.3-rc.1`）はプレリリースになります。プルリクエストと `main` では使い捨てのバージョンで同じジョブを実行し、公開はしません。
+
+| 系統 | ターゲット | アーカイブ |
+|:--|:--|:--|
+| Linux | `linux-amd64`、`linux-arm64`、`linux-386`、`linux-armv7` | `tsunami-<バージョン>-<ターゲット>.tar.gz`（server、client、node） |
+| Windows | `windows-amd64`、`windows-386` | `tsunami-<バージョン>-<ターゲット>.zip`（server、client、node） |
+| macOS | `darwin-amd64`、`darwin-arm64` | `tsunami-<バージョン>-<ターゲット>.tar.gz`（server、client、node） |
+| OpenWrt | `openwrt-x86_64`、`openwrt-x86`、`openwrt-aarch64`、`openwrt-armv7` | `tsunami-<バージョン>-<ターゲット>.tar.gz`（client、procd 起動スクリプト、設定例）。[docs/openwrt.md](../docs/openwrt.md) を参照 |
+
+`linux-amd64` と `linux-arm64` のアーカイブ名は `scripts/install.sh` と `scripts/install-node.sh` がダウンロードに使うため、変更できません。
+
+同じ手順をローカルで実行できます（Bash、Go、Python 3.8 以上が必要です）。
+
+```bash
+bash build/package.sh -v v1.2.3 -t openwrt-aarch64 -o dist
+bash build/smoke.sh -t openwrt-aarch64 -v v1.2.3 dist/tsunami-v1.2.3-openwrt-aarch64.tar.gz
+bash build/checksums.sh dist
+```
+
+`SOURCE_DATE_EPOCH` がすべてのタイムスタンプを固定します。コミット、Go ツールチェーン、zlib が同じなら、2 回パッケージングしても同一のアーカイブになります。ホストがバイナリを実行できる場合（ネイティブ、または ARM を `qemu-user-static` 経由で）、スモークテストは `--version` を実行します。それ以外は内容とアーキテクチャのみを確認します。
+
 ## 謝辞
 
 プロトコル設計は [anytls-go](https://github.com/anytls/anytls-go) にインスパイアされました。
