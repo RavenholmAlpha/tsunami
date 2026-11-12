@@ -124,6 +124,29 @@ make VERSION=1.0.0 clean
 | `-c`   | 关闭                                                           | 构建前清理              |
 | `-s`   | 关闭                                                           | 跳过校验和生成          |
 
+## 发布打包（CI）
+
+`.github/workflows/ci-cd.yml` 为 `build/targets.sh` 中的每个目标各开一个任务，完成构建、打包和冒烟测试。推送 `vX.Y.Z` 标签会发布 GitHub Release，附带全部压缩包和 `checksums.sha256`；标签含连字符（`v1.2.3-rc.1`）时发布为预发布版本。拉取请求和 `main` 会用临时版本号运行同样的任务，但不发布。
+
+| 系列 | 目标 | 压缩包 |
+|:--|:--|:--|
+| Linux | `linux-amd64`、`linux-arm64`、`linux-386`、`linux-armv7` | `tsunami-<版本>-<目标>.tar.gz`，含 server、client、node |
+| Windows | `windows-amd64`、`windows-386` | `tsunami-<版本>-<目标>.zip`，含 server、client、node |
+| macOS | `darwin-amd64`、`darwin-arm64` | `tsunami-<版本>-<目标>.tar.gz`，含 server、client、node |
+| OpenWrt | `openwrt-x86_64`、`openwrt-x86`、`openwrt-aarch64`、`openwrt-armv7` | `tsunami-<版本>-<目标>.tar.gz`，含 client、procd 启动脚本和配置示例，见 [docs/openwrt.md](../docs/openwrt.md) |
+
+`linux-amd64` 和 `linux-arm64` 的压缩包名是 `scripts/install.sh` 与 `scripts/install-node.sh` 的下载依据，不能改动。
+
+在本地执行同样的步骤（需要 Bash、Go 和 Python 3.8+）：
+
+```bash
+bash build/package.sh -v v1.2.3 -t openwrt-aarch64 -o dist
+bash build/smoke.sh -t openwrt-aarch64 -v v1.2.3 dist/tsunami-v1.2.3-openwrt-aarch64.tar.gz
+bash build/checksums.sh dist
+```
+
+`SOURCE_DATE_EPOCH` 固定所有时间戳。提交、Go 工具链和 zlib 相同时，重复打包得到的压缩包逐字节一致。宿主机能运行二进制时（原生运行，或 ARM 目标通过 `qemu-user-static`），冒烟测试会执行 `--version`，否则只检查内容和架构。
+
 ## 鸣谢
 
 协议设计灵感来源于 [anytls-go](https://github.com/anytls/anytls-go)。

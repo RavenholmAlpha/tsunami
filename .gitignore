@@ -7,7 +7,14 @@
 /build/windows-*/
 /build/darwin-*/
 /build/vdev/
-/build
+/build/*
+# Release tooling lives in build/ and is tracked; only output is ignored.
+!/build/*.sh
+!/build/*.py
+!/build/*.ps1
+!/build/*.md
+!/build/Makefile
+!/build/openwrt/
 
 # Binaries
 *.exe
