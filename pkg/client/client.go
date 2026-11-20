@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,11 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 	"golang.org/x/net/http2"
+)
+
+const (
+	tlsHandshakeTimeout = 10 * time.Second
+	authWriteTimeout    = 15 * time.Second
 )
 
 // Config holds the TSUNAMI client configuration.
@@ -46,7 +52,7 @@ type Config struct {
 	// Fronting enables HTTPS/HTTP2/WebSocket application fronting.
 	Fronting fronting.Config
 
-	// Shaping enables constant-rate traffic shaping for anti-traffic-analysis.
+	// Shaping enables traffic shaping for anti-traffic-analysis.
 	Shaping *shaping.Config
 
 	// Enable UDP-over-TCP
@@ -103,6 +109,8 @@ func New(config Config) (*Client, error) {
 
 // OpenStream opens a new proxy stream to the given target address.
 // The target should be in "host:port" format.
+// If an existing pooled session has silently died (e.g., network switch or
+// blackhole), it is evicted and a fresh session is dialed transparently once.
 func (c *Client) OpenStream(target string) (*protocol.Stream, error) {
 	c.mu.Lock()
 	if c.closed {
@@ -111,31 +119,39 @@ func (c *Client) OpenStream(target string) (*protocol.Stream, error) {
 	}
 	c.mu.Unlock()
 
-	// Get session from Surge controller (handles Layer 1/2 logic)
-	session, err := c.surgeCtrl.GetSession()
-	if err != nil {
-		return nil, fmt.Errorf("tsunami: get session: %w", err)
-	}
-
-	// Open stream on the session
-	stream, err := session.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("tsunami: open stream: %w", err)
-	}
-
-	// Send proxy target address as first data
 	addrData, err := encodeSocksAddr(target)
 	if err != nil {
-		stream.Close()
 		return nil, fmt.Errorf("tsunami: encode address: %w", err)
 	}
 
-	if _, err := stream.Write(addrData); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("tsunami: send target addr: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		session, err := c.surgeCtrl.GetSession()
+		if err != nil {
+			return nil, fmt.Errorf("tsunami: get session: %w", err)
+		}
+
+		stream, err := session.OpenStream()
+		if err != nil {
+			if errors.Is(err, protocol.ErrStreamRejected) || errors.Is(err, protocol.ErrTooManyStreams) {
+				return nil, fmt.Errorf("tsunami: open stream: %w", err)
+			}
+			c.pool.RemoveSession(session)
+			lastErr = fmt.Errorf("tsunami: open stream: %w", err)
+			continue
+		}
+
+		if _, err := stream.Write(addrData); err != nil {
+			_ = stream.Close()
+			c.pool.RemoveSession(session)
+			lastErr = fmt.Errorf("tsunami: send target addr: %w", err)
+			continue
+		}
+
+		return stream, nil
 	}
 
-	return stream, nil
+	return nil, lastErr
 }
 
 // OpenUDPStream opens a UDP-over-TCP stream.
@@ -159,28 +175,44 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// dialUTLSConn dials TCP, applies tuning, bounds the TLS handshake with a
+// strict deadline, and clears the deadline once the handshake succeeds.
+func (c *Client) dialUTLSConn(ctx context.Context, network, addr string, tlsCfg transport.TLSConfig, alpnOverride []string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: tlsHandshakeTimeout}
+	tcpConn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, fmt.Errorf("TCP dial: %w", err)
+	}
+
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		_ = c.config.TCP.ApplyTCPOptions(tc)
+	}
+
+	_ = tcpConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+	var tlsConn net.Conn
+	if len(alpnOverride) > 0 {
+		tlsConn, err = transport.DialUTLSWithALPN(tcpConn, &tlsCfg, alpnOverride)
+	} else {
+		tlsConn, err = transport.DialUTLS(tcpConn, &tlsCfg)
+	}
+	if err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+	_ = tcpConn.SetDeadline(time.Time{})
+
+	return tlsConn, nil
+}
+
 // dialSession creates a new TLS connection, authenticates, and returns a Session.
 func (c *Client) dialSession() (*protocol.Session, error) {
 	if c.config.Fronting.Enabled {
 		return c.dialFrontedSession()
 	}
 
-	// TCP dial
-	tcpConn, err := net.DialTimeout("tcp", c.config.ServerAddr, 10*time.Second)
+	tlsConn, err := c.dialUTLSConn(context.Background(), "tcp", c.config.ServerAddr, c.config.TLS, nil)
 	if err != nil {
-		return nil, fmt.Errorf("TCP dial: %w", err)
-	}
-
-	// Apply TCP tuning
-	if tc, ok := tcpConn.(*net.TCPConn); ok {
-		c.config.TCP.ApplyTCPOptions(tc)
-	}
-
-	// TLS handshake (with uTLS fingerprint mimicry when configured)
-	tlsConn, err := transport.DialUTLS(tcpConn, &c.config.TLS)
-	if err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("TLS handshake: %w", err)
+		return nil, err
 	}
 
 	return c.startSession(tlsConn)
@@ -198,8 +230,12 @@ func (c *Client) dialFrontedSession() (*protocol.Session, error) {
 	switch cfg.Transport {
 	case fronting.TransportWebSocket:
 		conn, err = c.dialFrontedWebSocket(cfg)
+	case fronting.TransportH2Stream:
+		conn, err = c.dialFrontedH2Stream(cfg)
+	case fronting.TransportH2, fronting.TransportH2Split, "":
+		conn, err = c.dialFrontedH2Split(cfg)
 	default:
-		conn, err = c.dialFrontedH2(cfg)
+		return nil, fmt.Errorf("fronting: unsupported transport %q", cfg.Transport)
 	}
 	if err != nil {
 		return nil, err
@@ -207,48 +243,82 @@ func (c *Client) dialFrontedSession() (*protocol.Session, error) {
 	return c.startSession(conn)
 }
 
-func (c *Client) dialFrontedH2(cfg fronting.Config) (net.Conn, error) {
+func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
+	endpointURL, err := url.Parse(cfg.URL(c.config.ServerAddr))
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCfg := c.config.TLS
+	tlsCfg.ALPN = []string{"h2"}
+	tlsConn, err := c.dialUTLSConn(context.Background(), "tcp", c.config.ServerAddr, tlsCfg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	h2Transport := &http2.Transport{
+		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
+	}
+	cc, err := h2Transport.NewClientConn(tlsConn)
+	if err != nil {
+		_ = tlsConn.Close()
+		h2Transport.CloseIdleConnections()
+		return nil, fmt.Errorf("fronting: split h2 client conn: %w", err)
+	}
+
+	host := frontingHost(cfg, c.config)
+	conn, err := fronting.NewSplitH2ClientConn(
+		endpointURL,
+		host,
+		c.frontingKey(cfg),
+		c.config.TLS.Fingerprint,
+		cc.RoundTrip,
+		func() {
+			_ = cc.Close()
+			h2Transport.CloseIdleConnections()
+		},
+	)
+	if err != nil {
+		_ = cc.Close()
+		h2Transport.CloseIdleConnections()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 	endpoint := cfg.URL(c.config.ServerAddr)
 	pr, pw := io.Pipe()
 
-	req, err := http.NewRequest(http.MethodPost, endpoint, pr)
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, pr)
 	if err != nil {
+		reqCancel()
 		pw.Close()
 		return nil, err
 	}
 	applyFrontingHost(req, cfg, c.config)
+	fronting.ApplyBrowserHeaders(req.Header, c.config.TLS.Fingerprint)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Cache-Control", "no-store")
-	req.Header.Set("User-Agent", fronting.DefaultUserAgent)
 	if err := fronting.SignRequest(req, c.frontingKey(cfg), time.Now()); err != nil {
+		reqCancel()
 		pw.Close()
 		return nil, err
 	}
 
 	h2Transport := &http2.Transport{
-		TLSClientConfig:  c.config.TLS.BuildClientTLSConfig(),
-		MaxReadFrameSize: fronting.H2MaxFrameSize,
+		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			dialer := &net.Dialer{Timeout: 10 * time.Second}
-			tcpConn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			if tc, ok := tcpConn.(*net.TCPConn); ok {
-				c.config.TCP.ApplyTCPOptions(tc)
-			}
 			tlsCfg := c.config.TLS
 			tlsCfg.ALPN = []string{"h2"}
-			conn, err := transport.DialUTLS(tcpConn, &tlsCfg)
-			if err != nil {
-				tcpConn.Close()
-				return nil, err
-			}
-			return conn, nil
+			return c.dialUTLSConn(ctx, network, addr, tlsCfg, nil)
 		},
 	}
 
 	respCh := make(chan fronting.HTTPResponseResult, 1)
+	conn := fronting.NewPendingHTTPClientConnWithCleanup(respCh, pw, c.config.ServerAddr, reqCancel, h2Transport.CloseIdleConnections)
+
 	go func() {
 		resp, err := h2Transport.RoundTrip(req)
 		if err != nil {
@@ -266,29 +336,23 @@ func (c *Client) dialFrontedH2(cfg fronting.Config) (net.Conn, error) {
 			return
 		}
 		respCh <- fronting.HTTPResponseResult{Response: resp}
+		if conn.IsClosed() {
+			_ = resp.Body.Close()
+		}
 	}()
 
-	return fronting.NewPendingHTTPClientConn(respCh, pw, c.config.ServerAddr), nil
+	return conn, nil
 }
 
 func (c *Client) dialFrontedWebSocket(cfg fronting.Config) (net.Conn, error) {
-	tcpConn, err := net.DialTimeout("tcp", c.config.ServerAddr, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("TCP dial: %w", err)
-	}
-	if tc, ok := tcpConn.(*net.TCPConn); ok {
-		c.config.TCP.ApplyTCPOptions(tc)
-	}
-
 	tlsCfg := c.config.TLS
 	tlsCfg.ALPN = []string{"http/1.1"}
 	// Use a browser-like ClientHello but override ALPN to http/1.1 only,
 	// so the server selects HTTP/1.1 for the WebSocket upgrade while the
 	// TLS fingerprint still looks like a real browser.
-	tlsConn, err := transport.DialUTLSWithALPN(tcpConn, &tlsCfg, []string{"http/1.1"})
+	tlsConn, err := c.dialUTLSConn(context.Background(), "tcp", c.config.ServerAddr, tlsCfg, []string{"http/1.1"})
 	if err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("TLS handshake: %w", err)
+		return nil, err
 	}
 
 	endpointURL, err := url.Parse(cfg.URL(c.config.ServerAddr))
@@ -297,7 +361,8 @@ func (c *Client) dialFrontedWebSocket(cfg fronting.Config) (net.Conn, error) {
 		return nil, err
 	}
 	host := frontingHost(cfg, c.config)
-	conn, err := fronting.ClientWebSocketHandshake(tlsConn, endpointURL, host, c.frontingKey(cfg))
+	ua := fronting.UserAgentForFingerprint(c.config.TLS.Fingerprint)
+	conn, err := fronting.ClientWebSocketHandshakeWithUserAgent(tlsConn, endpointURL, host, c.frontingKey(cfg), ua)
 	if err != nil {
 		tlsConn.Close()
 		return nil, err
@@ -320,9 +385,7 @@ func authPaddingLen() int {
 }
 
 func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
-	// Send authentication.
-	// The auth padding is decoupled from the padding scheme rules so the
-	// scheme's early rules can mask each stream's inner TLS handshake.
+	// Send authentication with bounded write timeout.
 	scheme := c.currentPaddingScheme()
 	padding0 := make([]byte, authPaddingLen())
 	if _, err := rand.Read(padding0); err != nil {
@@ -330,6 +393,7 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		return nil, fmt.Errorf("generate auth padding: %w", err)
 	}
 
+	_ = tlsConn.SetWriteDeadline(time.Now().Add(authWriteTimeout))
 	if err := protocol.EncodeAuthRequest(tlsConn, c.passwordHash, padding0); err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("send auth: %w", err)
@@ -351,25 +415,25 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 
 	// Send client settings
 	settings := &protocol.ClientSettings{
-		Version:    protocol.CurrentVersion,
-		Client:     "http-client/1.0",
-		PaddingMD5: scheme.MD5(),
-		Shaping:    c.config.Shaping != nil,
-		// Advertise that this client parses the v2 padding scheme syntax. The
-		// server only pushes scheme text when the client advertises it, so
-		// pre-v2 clients are never sent `~min-max` rules they cannot parse.
-		PaddingV2: true,
+		Version:      protocol.CurrentVersion,
+		Client:       "http-client/1.0",
+		PaddingMD5:   scheme.MD5(),
+		Shaping:      c.config.Shaping != nil,
+		PaddingV2:    true,
+		FlowControl:  true,
+		StreamWindow: protocol.DefaultStreamWindow,
 	}
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()
 		return nil, fmt.Errorf("send settings: %w", err)
 	}
+	_ = tlsConn.SetWriteDeadline(time.Time{})
 
 	// Wait for auth confirmation: server sends CmdServerSettings on success.
 	// If auth failed, server does fallback/close → we get EOF or non-frame data.
-	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	frame, err := protocol.DecodeFrame(tlsConn)
-	tlsConn.SetReadDeadline(time.Time{})
+	_ = tlsConn.SetReadDeadline(time.Time{})
 	if err != nil {
 		session.Close()
 		authErr := newAuthReadError(c.config.ServerAddr, err)
@@ -397,6 +461,11 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	}
 	log.Printf("tsunami: server version=%d surge-mode=%s", ss.Version, ss.SurgeMode)
 	shapingConfirmed := ss.Shaping
+
+	c.surgeCtrl.ApplyServerSettings(surge.Mode(ss.SurgeMode), ss.MaxConnections, ss.Threshold)
+	if ss.FlowControl {
+		session.EnableFlowControl(protocol.DefaultStreamWindow, protocol.ClampStreamWindow(ss.StreamWindow))
+	}
 
 	// Activate traffic shaping if both sides agreed
 	if c.config.Shaping != nil && shapingConfirmed {

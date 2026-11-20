@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"path"
@@ -17,9 +18,15 @@ import (
 )
 
 const (
-	// TransportH2 carries TSUNAMI over an HTTP/2 POST request/response stream.
+	// TransportH2 carries TSUNAMI over Split-H2 (streaming GET downlink +
+	// finite-Content-Length POST uplinks) on a single HTTP/2 connection.
 	TransportH2 = "h2"
-	// TransportWebSocket carries TSUNAMI over a HTTP/1.1 WebSocket upgrade.
+	// TransportH2Split is an explicit alias for Split-H2 transport.
+	TransportH2Split = "h2-split"
+	// TransportH2Stream carries TSUNAMI over a single full-duplex HTTP/2 POST
+	// request/response stream (legacy mode).
+	TransportH2Stream = "h2-stream"
+	// TransportWebSocket carries TSUNAMI over an HTTP/1.1 WebSocket upgrade.
 	TransportWebSocket = "websocket"
 
 	// DefaultPath is deliberately ordinary-looking, and can be overridden.
@@ -27,21 +34,53 @@ const (
 	// DefaultServerHeader matches Caddy's default HTTP Server header.
 	DefaultServerHeader = "Caddy"
 
-	// DefaultUserAgent mimics a recent Chrome browser to blend with normal traffic.
-	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	// DefaultUserAgent mimics Chrome 133 (matching utls.HelloChrome_Auto).
+	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+	// FirefoxUserAgent mimics Firefox 120 (matching utls.HelloFirefox_Auto).
+	FirefoxUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
+	// SafariUserAgent mimics Safari 16 (matching utls.HelloSafari_Auto).
+	SafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
 
-	// H2FlowControlWindow is set to 4 MiB per stream — within the range real
-	// Go HTTP/2 servers use, while still supporting high throughput on
-	// high-latency links.
-	H2FlowControlWindow int32 = 4 << 20
-	// H2ClientFlowControlWindow matches Go's net/http2 connection-level default.
-	H2ClientFlowControlWindow = 4 << 20
-	// H2MaxFrameSize uses 32 KiB — slightly above Go's 16 KiB default but
-	// within the range CDN-fronted servers commonly use.
-	H2MaxFrameSize uint32 = 32 << 10
-	// HTTPFlushThreshold amortizes h2 flushes without delaying control frames.
+	// H2FlowControlWindow matches Go's net/http2 / stock Caddy default (1 MiB).
+	H2FlowControlWindow int32 = 1 << 20
+	// H2ClientFlowControlWindow matches Go's net/http2 default (1 MiB).
+	H2ClientFlowControlWindow = 1 << 20
+	// H2MaxFrameSize matches Go's net/http2 / stock Caddy default (16 KiB).
+	H2MaxFrameSize uint32 = 16 << 10
+	// HTTPFlushThreshold is retained for compatibility; server fronting writes
+	// now flush immediately so 4096-byte writes never stall in bufio.Writer.
 	HTTPFlushThreshold = 1 << 20
 )
+
+// UserAgentForFingerprint returns an HTTP User-Agent string consistent with the
+// selected uTLS ClientHello fingerprint.
+func UserAgentForFingerprint(fingerprint string) string {
+	switch strings.ToLower(strings.TrimSpace(fingerprint)) {
+	case "firefox":
+		return FirefoxUserAgent
+	case "safari":
+		return SafariUserAgent
+	default:
+		return DefaultUserAgent
+	}
+}
+
+// ApplyBrowserHeaders populates realistic browser request headers consistent
+// with the selected TLS fingerprint.
+func ApplyBrowserHeaders(h http.Header, fingerprint string) {
+	if h == nil {
+		return
+	}
+	fp := strings.ToLower(strings.TrimSpace(fingerprint))
+	h.Set("User-Agent", UserAgentForFingerprint(fp))
+	h.Set("Accept", "*/*")
+	h.Set("Accept-Language", "en-US,en;q=0.9")
+	if fp == "" || fp == "chrome" || fp == "none" || fp == "random" {
+		h.Set("Sec-Fetch-Dest", "empty")
+		h.Set("Sec-Fetch-Mode", "cors")
+		h.Set("Sec-Fetch-Site", "same-origin")
+	}
+}
 
 // Config holds shared fronting settings.
 type Config struct {
@@ -54,7 +93,8 @@ type Config struct {
 	// Secret optionally separates HTTP-layer fronting auth from the TSUNAMI
 	// protocol password. If empty, callers should fall back to the password.
 	Secret string
-	// Transport selects the client tunnel transport: h2 or websocket.
+	// Transport selects the client tunnel transport: h2 (split), h2-split,
+	// h2-stream, or websocket.
 	Transport string
 
 	// ServerHeader is emitted for all HTTP responses. Default: Caddy.
@@ -179,10 +219,6 @@ func (c *Config) ValidateSite() error {
 func (c *Config) normalizeSite() {
 	site := &c.Site
 	if legacy := strings.TrimSpace(c.DecoyProxy); legacy != "" && strings.TrimSpace(site.Upstream) == "" {
-		// The deprecated decoy_proxy key maps onto the same reverse proxy. The
-		// previous implementation used httputil.NewSingleHostReverseProxy,
-		// which forwards the client Host unchanged, so pin preserve_host=true
-		// when migrating to keep existing configurations behaving identically.
 		site.Upstream = legacy
 		if site.PreserveHost == nil {
 			preserve := true
@@ -263,10 +299,8 @@ func parseSiteUpstream(raw string) (*url.URL, error) {
 			return nil, fmt.Errorf("fronting: site upstream %q has invalid port %q", raw, port)
 		}
 	}
-	// Fragments are never forwarded to upstreams.
 	parsed.Fragment = ""
 	parsed.RawFragment = ""
-	// Trim the trailing slash so the Caddy-style path join does not emit "//".
 	if strings.HasSuffix(parsed.Path, "/") {
 		parsed.Path = strings.TrimRight(parsed.Path, "/")
 		parsed.RawPath = ""
@@ -338,19 +372,15 @@ func KeyFromSecret(secret string) [32]byte {
 	return sha256.Sum256([]byte(secret))
 }
 
-// CaddyLikeTLSConfig returns TLS settings matching Caddy's standard Go TLS
-// shape closely enough for this embedded fronting layer.
+// CaddyLikeTLSConfig returns TLS settings matching modern Caddy (Go 1.24+)
+// standard Go TLS defaults, including default curve preferences (X25519MLKEM768)
+// and standard cipher-suite selection.
 func CaddyLikeTLSConfig(certs []tls.Certificate) *tls.Config {
 	return &tls.Config{
 		Certificates: certs,
 		NextProtos:   []string{"h2", "http/1.1"},
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   tls.VersionTLS13,
-		CipherSuites: caddyLikeCipherSuites(),
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-		},
 	}
 }
 
@@ -366,33 +396,21 @@ func CaddyLikeStrictTLSConfig(selector *CertSelector) *tls.Config {
 	return cfg
 }
 
-func caddyLikeCipherSuites() []uint16 {
-	return []uint16{
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-	}
-}
-
 // ClockSkew is the accepted HTTP-layer auth timestamp window.
 const ClockSkew = 2 * time.Minute
 
 // ValidateTransport returns an error for unsupported fronting transports.
 func ValidateTransport(transport string) error {
 	switch transport {
-	case "", TransportH2, TransportWebSocket:
+	case "", TransportH2, TransportH2Split, TransportH2Stream, TransportWebSocket:
 		return nil
 	default:
 		return fmt.Errorf("fronting: unsupported transport %q", transport)
 	}
 }
 
-// AuthJitter returns a random duration between 1-5ms to add to the decoy
-// response path, making it indistinguishable from the authenticated path's
-// time-to-first-byte.
+// AuthJitter returns a random duration between 1-5ms to align timing between
+// authenticated session openings and unauthenticated decoy responses.
 func AuthJitter() time.Duration {
 	var b [2]byte
 	rand.Read(b[:])

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-20
+
+### Added
+- **Split-H2 (`split-h2`) default fronting transport**: pairs an XHTTP/SplitHTTP-style streaming `GET` downlink with pipelined finite-`Content-Length` `POST` uplinks carrying sequenced HMAC-authenticated headers (`X-Session-Id` / `X-Stream-Seq`, stripped before forwarding to cover upstreams); legacy single-stream full-duplex `POST` remains available as `h2-stream`.
+- **Per-stream sliding-window flow control** (`CmdWindowUpdate = 0x0E`, opt-in via `flow-control=1` / `stream-window` in `SETTINGS`) and non-blocking per-stream receive-queue overflow isolation (`ErrStreamRecvOverflow`), preventing a single slow stream from head-of-line blocking the entire multiplexed session.
+- **Strict SNI and `Host` matching** (`fronting.strict_sni` / `--front-strict-sni`, default `true`): only server names present on the server certificate complete the TLS handshake (matching Caddy's TLS `internal_error` alert), and unauthenticated requests whose `Host` is not on the certificate receive an empty `200` (auto-generated self-signed certificates are exempt). Clients must send an SNI on the server certificate unless `strict_sni` is disabled (e.g. for CDNs reaching the origin without SNI). See [Strict SNI and Host matching](docs/fronting.md#strict-sni-and-host-matching).
+
+### Changed
+- **Traffic shaping redesign (`pkg/shaping`)**: switched from a 5 ms constant dummy-packet flood to idle-silent operation with sparse, variable-size random chaff bursts and bounded write-buffer backpressure (`sync.Cond`).
+- **Modern Caddy / Go 1.25 fronting alignment**: `CaddyLikeTLSConfig` uses Go's default `CurvePreferences` and `CipherSuites` (enabling post-quantum `X25519MLKEM768` alongside X25519/ECDSA), stock `&http2.Server{}` defaults (16 KiB frame size / default flow-control windows, removing unencrypted HTTP/2), browser `User-Agent` and `Sec-Fetch-*` headers synchronized with the selected uTLS fingerprint (`Chrome/133`, `Firefox/120`, `Safari/16.0`), symmetric `AuthJitter()` on session-opening requests, and Caddy-compliant empty-body `502 Bad Gateway` responses when a site camouflage upstream fails. Raw TLS mode (`--fronting=false`) is preserved unchanged.
+- Client Surge controller now applies `ServerSettings` Surge limits (`surge_mode`, `surge_rate`, `surge_burst`); HTTP and SOCKS5 relays reuse `RelayBufPool` and perform explicit stream/connection cleanup.
+
+### Fixed
+- **Fronting read/write deadlines & flush stalls**: wired real `http.ResponseController` read/write deadlines on `HTTPServerConn` and timer/context-driven deadlines with leak-free cleanup on `SplitH2ServerConn` and `HTTPClientConn`, enforced a 10 s TLS handshake deadline and 15 s auth write deadline on client dial paths, and fixed the `HTTPServerConn` 4096-byte flush stall when writes landed on an exact `bufio` buffer boundary.
+- Fixed a self-deadlock in `shaping.Conn` `writeLoop` when the underlying connection returned a write error.
+- Improved weak-network and network-switch recovery by immediately evicting dead sessions on `SendHeartbeat` failure (`mux.Pool.RemoveSession`) and transparently retrying `Client.OpenStream`.
+- Fixed IPv6 host/port parsing in `splitHostPort`.
+
+## [1.3.3] - 2026-11-12
+
 ### Fixed
 - Re-running the installer wizard (`tsunami-manage config`) could not change anything. It asked "Reuse existing settings?" with yes as the default, and a yes skipped every question, so the domain, TLS mode and site camouflage of the previous deployment were applied unchanged. The wizard now asks each question with the current value as its default: Enter keeps a setting and a new value changes it.
 - Answering no to that question did not help either: the site camouflage menu always preselected "local site" and offered the previous upstream, so pressing Enter turned a remote site into a local one pointing at the remote URL, and the fronting path and secret were regenerated, which broke the client commands already handed out. The menu now preselects the current mode, the upstream default is only offered for the same mode, and the path, secret and password are kept.
@@ -16,13 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opening the status or client view in the management menu loaded the saved settings into the running shell, where the wizard mistook them for values fixed on the command line and skipped the TLS and site questions. Saved settings are now read separately and only real environment variables skip a question.
 - The local-site upstream prompt repeated forever when its input ended; it now gives up after ten empty answers.
 - After a mistyped domain, the next prompt lost its default, so pressing Enter selected the self-signed test mode. The default is kept.
-- Fronting completed the TLS handshake for any client, including one that sent no SNI (a scan of `https://<ip>/`) or the wrong one, and presented the site certificate, which reveals the domain. A stock Caddy fails those handshakes with the TLS `internal_error` alert. The fronting listener now does the same: only a server name on the certificate completes the handshake.
-- Fronting served the cover website for any `Host` header. A request whose `Host` is not on the certificate now gets an empty `200`, as Caddy does when no site matches. Authenticated tunnels are not affected.
 
 ### Changed
-- Clients must send an SNI that is on the server certificate (`--sni`, which defaults to the server hostname). A deployment where a CDN reaches the server without SNI, or where clients send another name, can restore the old behavior with `"strict_sni": false` under `fronting` or with `--front-strict-sni=false`. The auto-generated self-signed certificate is exempt. See [Strict SNI and Host matching](docs/fronting.md#strict-sni-and-host-matching).
 - A site name you set yourself is kept when the domain changes; a name that was derived from the old domain is derived again from the new one.
 - Non-interactive installs (`TSUNAMI_ASSUME_YES=1`, or piped without a terminal) are unchanged: they do not read the previous deployment.
+
+## [1.3.2] - 2026-11-12
+
+### Added
+- Release archives for OpenWrt (`aarch64`, `armv7`, `x86`, `x86_64`), 32-bit x86 (`linux-386`, `windows-386`), and Linux ARMv7 (`linux-armv7`), verified with QEMU user-mode smoke tests in CI.
 
 ## [1.3.1] - 2026-11-03
 

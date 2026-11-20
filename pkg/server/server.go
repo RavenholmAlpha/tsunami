@@ -16,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,9 +101,10 @@ type Server struct {
 	httpSrv    *http.Server
 	site       http.Handler
 	siteHosts  *fronting.CertSelector // nil unless strict SNI is in force
-	traffic    control.TrafficPolicy
-	frontKeys  [][32]byte
-	nonceCache *fronting.NonceCache
+	traffic       control.TrafficPolicy
+	frontKeys     [][32]byte
+	nonceCache    *fronting.NonceCache
+	splitSessions *fronting.SplitSessionRegistry
 
 	mu     sync.Mutex
 	closed bool
@@ -183,10 +185,11 @@ func New(config Config) (*Server, error) {
 		fallback:    fb,
 		scheme:      scheme,
 		site:        siteHandler,
-		traffic:     config.Traffic,
-		frontKeys:   frontKeys,
-		nonceCache:  fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
-		connections: make(map[net.Conn]struct{}),
+		traffic:       config.Traffic,
+		frontKeys:     frontKeys,
+		nonceCache:    fronting.NewNonceCache(fronting.ClockSkew + 30*time.Second),
+		splitSessions: fronting.NewSplitSessionRegistry(),
+		connections:   make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -269,15 +272,7 @@ func (s *Server) startFronting() error {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
-	httpSrv.Protocols = new(http.Protocols)
-	httpSrv.Protocols.SetHTTP1(true)
-	httpSrv.Protocols.SetUnencryptedHTTP2(true)
-	h2Server := &http2.Server{
-		MaxReadFrameSize:             fronting.H2MaxFrameSize,
-		MaxUploadBufferPerConnection: fronting.H2FlowControlWindow,
-		MaxUploadBufferPerStream:     fronting.H2FlowControlWindow,
-	}
-	if err := http2.ConfigureServer(httpSrv, h2Server); err != nil {
+	if err := http2.ConfigureServer(httpSrv, &http2.Server{}); err != nil {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
 	}
@@ -442,8 +437,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	pw := padding.NewWriterForRole(conn, s.scheme, padding.RoleServer)
 	bindServerPadding(session, pw)
 
-	// Determine if shaping should be activated (both sides must agree)
+	// Determine if shaping and per-stream flow control should be activated
 	shapingEnabled := s.config.Shaping != nil && clientSettings != nil && clientSettings.Shaping
+	flowControlEnabled := clientSettings != nil && clientSettings.FlowControl
+	serverStreamWindow := 0
+	if flowControlEnabled {
+		remoteWindow := protocol.ClampStreamWindow(clientSettings.StreamWindow)
+		session.EnableFlowControl(protocol.DefaultStreamWindow, remoteWindow)
+		serverStreamWindow = protocol.DefaultStreamWindow
+	}
 
 	// Send server settings as auth-success confirmation.
 	// The client blocks waiting for this frame after sending auth+settings.
@@ -453,6 +455,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		MaxConnections: s.config.MaxConnections,
 		Threshold:      s.config.SurgeThreshold,
 		Shaping:        shapingEnabled,
+		FlowControl:    flowControlEnabled,
+		StreamWindow:   serverStreamWindow,
 	}
 	if err := session.SendServerSettings(serverSettings); err != nil {
 		log.Printf("tsunami server: send server settings: %v", err)
@@ -703,6 +707,7 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 		downloadReader := s.traffic.WrapReader(targetConn, user, control.DirectionDownload)
 		io.CopyBuffer(stream, downloadReader, *bufp)
 		protocol.RelayBufPool.Put(bufp)
+		_ = stream.Close()
 	}()
 
 	wg.Wait()
@@ -756,19 +761,28 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 	// fronting HMAC (or use an unsupported method/protocol) reach the site
 	// handler below.
 	if r.URL.Path == cfg.Path && fronting.VerifyRequest(r, s.frontKeys, time.Now(), fronting.ClockSkew, s.nonceCache) {
+		sid := r.Header.Get(fronting.HeaderSessionID)
 		switch {
-		case r.Method == http.MethodPost:
-			s.handleFrontingHTTP2(w, r)
-			return
 		case r.Method == http.MethodGet && fronting.IsWebSocketUpgrade(r):
+			time.Sleep(fronting.AuthJitter())
 			s.handleFrontingWebSocket(w, r)
+			return
+		case r.Method == http.MethodGet && sid != "":
+			time.Sleep(fronting.AuthJitter())
+			s.handleFrontingSplitGET(w, r, sid)
+			return
+		case r.Method == http.MethodPost && sid != "":
+			s.handleFrontingSplitPOST(w, r, sid)
+			return
+		case r.Method == http.MethodPost:
+			time.Sleep(fronting.AuthJitter())
+			s.handleFrontingHTTP2(w, r)
 			return
 		}
 	}
 
-	// Add jitter before serving decoy to align timing with the authenticated
-	// path, preventing an observer from distinguishing auth success vs failure
-	// based on time-to-first-byte.
+	// Add jitter before serving decoy to align timing with authenticated
+	// session-opening paths.
 	time.Sleep(fronting.AuthJitter())
 
 	// A request for a host this site does not serve gets what Caddy sends
@@ -778,6 +792,68 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.site.ServeHTTP(w, r)
+}
+
+func (s *Server) handleFrontingSplitGET(w http.ResponseWriter, r *http.Request, sid string) {
+	if r.ProtoMajor < 2 {
+		s.site.ServeHTTP(w, r)
+		return
+	}
+
+	conn, err := s.splitSessions.AttachDownlink(sid, w, r)
+	if err != nil {
+		log.Printf("tsunami fronting: split downlink attach failed remote=%s err=%v", r.RemoteAddr, err)
+		s.site.ServeHTTP(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	s.handleConn(conn)
+}
+
+func (s *Server) handleFrontingSplitPOST(w http.ResponseWriter, r *http.Request, sid string) {
+	if r.ProtoMajor < 2 {
+		time.Sleep(fronting.AuthJitter())
+		s.site.ServeHTTP(w, r)
+		return
+	}
+
+	seqStr := r.Header.Get(fronting.HeaderStreamSeq)
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if seqStr == "" || err != nil {
+		time.Sleep(fronting.AuthJitter())
+		s.site.ServeHTTP(w, r)
+		return
+	}
+
+	if seq == 0 && !s.splitSessions.HasSession(sid) {
+		time.Sleep(fronting.AuthJitter())
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, fronting.MaxSplitChunkSize+1))
+	if err != nil || len(body) > fronting.MaxSplitChunkSize {
+		http.Error(w, "invalid uplink chunk", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.splitSessions.DeliverUplink(r.Context(), sid, seq, body); err != nil {
+		if seq == 0 {
+			s.site.ServeHTTP(w, r)
+		} else {
+			http.Error(w, "split session closed", http.StatusGone)
+		}
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleFrontingHTTP2(w http.ResponseWriter, r *http.Request) {
@@ -932,10 +1008,13 @@ func newFrontingSiteHandler(cfg fronting.Config) (http.Handler, error) {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("tsunami fronting: site proxy error remote=%s upstream=%s path=%s err=%v",
 				r.RemoteAddr, upstream.Redacted(), r.URL.Path, err)
-			// An unreachable upstream must look like the built-in site, never
-			// like a proxy or an internal wiring failure.
-			time.Sleep(fronting.AuthJitter())
-			writeBuiltinDecoyPage(w, r, cfg, http.StatusOK)
+			// Match Caddy's real upstream-failure response (502 Bad Gateway
+			// with empty body) instead of serving a fake 200 decoy page on
+			// arbitrary paths or leaking Go/proxy error details.
+			if serverHeader != "" {
+				w.Header().Set("Server", serverHeader)
+			}
+			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
 	return handler, nil
@@ -1115,6 +1194,9 @@ func (s *Server) Close() error {
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, err)
 		}
+	}
+	if s.splitSessions != nil {
+		s.splitSessions.CloseAll()
 	}
 	if err := s.closeConnections(); err != nil {
 		errs = append(errs, err)

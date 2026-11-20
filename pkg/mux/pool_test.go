@@ -2,6 +2,8 @@ package mux
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -619,4 +621,86 @@ func TestPoolCloseClosesSessionsAndClearsState(t *testing.T) {
 
 	// Close is idempotent and must not panic or block.
 	pool.Close()
+}
+
+type failingWriteConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newFailingWriteConn() *failingWriteConn {
+	return &failingWriteConn{closed: make(chan struct{})}
+}
+
+func (c *failingWriteConn) Read(p []byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *failingWriteConn) Write(p []byte) (int, error) {
+	return 0, errors.New("broken pipe")
+}
+
+func (c *failingWriteConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestSendHeartbeatErrorEvictsDeadSession(t *testing.T) {
+	conn := newFailingWriteConn()
+	session := protocol.NewSession(conn, 1)
+	go func() { _ = session.RunEventLoop() }()
+
+	pool := NewPool(PoolConfig{
+		HeartbeatMin:     time.Hour,
+		HeartbeatMax:     2 * time.Hour,
+		HeartbeatTimeout: time.Minute,
+	}, func() (*protocol.Session, error) {
+		return session, nil
+	})
+	defer pool.Close()
+
+	got, err := pool.GetOrCreateSession()
+	if err != nil || got != session {
+		t.Fatalf("GetOrCreateSession = (%v, %v)", got, err)
+	}
+
+	future := time.Now().Add(2 * time.Hour)
+	pool.mu.Lock()
+	pool.heartbeatState[session] = heartbeatState{nextPing: future.Add(-time.Second)}
+	pool.mu.Unlock()
+
+	pool.runHeartbeat(future)
+
+	if count := pool.SessionCount(); count != 0 {
+		t.Fatalf("pool SessionCount = %d after failed heartbeat send, want 0", count)
+	}
+	if !session.IsClosed() {
+		t.Fatal("failed session was not closed on eviction")
+	}
+}
+
+func TestRemoveSessionRemovesTargetOnly(t *testing.T) {
+	pool, _ := newPipePool(t, DefaultPoolConfig(), true, nil)
+
+	s1, err := pool.CreateNewSession()
+	if err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	s2, err := pool.CreateNewSession()
+	if err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+
+	pool.RemoveSession(s1)
+
+	if !s1.IsClosed() {
+		t.Fatal("removed session s1 was not closed")
+	}
+	if s2.IsClosed() {
+		t.Fatal("sibling session s2 was unexpectedly closed")
+	}
+	if count := pool.SessionCount(); count != 1 {
+		t.Fatalf("SessionCount = %d, want 1", count)
+	}
 }

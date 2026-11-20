@@ -18,6 +18,10 @@ type ClientSettings struct {
 	// The server must not push v2 scheme text to clients that do not advertise
 	// it: pre-v2 clients reject the pushed text and close the session.
 	PaddingV2 bool
+	// FlowControl enables per-stream sliding-window flow control via CmdWindowUpdate.
+	FlowControl bool
+	// StreamWindow advertises the client's per-stream receive window in bytes.
+	StreamWindow int
 }
 
 // EncodeClientSettings serializes client settings to the wire format.
@@ -36,6 +40,12 @@ func EncodeClientSettings(s *ClientSettings) []byte {
 	}
 	if s.PaddingV2 {
 		fmt.Fprintf(&b, "padding-v2=1\n")
+	}
+	if s.FlowControl {
+		fmt.Fprintf(&b, "flow-control=1\n")
+	}
+	if s.StreamWindow > 0 {
+		fmt.Fprintf(&b, "stream-window=%d\n", s.StreamWindow)
 	}
 	return []byte(b.String())
 }
@@ -71,6 +81,14 @@ func DecodeClientSettings(data []byte) (*ClientSettings, error) {
 			s.Shaping = val == "1"
 		case "padding-v2":
 			s.PaddingV2 = val == "1"
+		case "flow-control":
+			s.FlowControl = val == "1"
+		case "stream-window":
+			w, err := strconv.Atoi(val)
+			if err != nil {
+				return nil, fmt.Errorf("tsunami: invalid stream-window: %w", err)
+			}
+			s.StreamWindow = w
 		}
 	}
 	return s, nil
@@ -91,6 +109,8 @@ type ServerSettings struct {
 	MaxConnections int
 	Threshold      int // concurrent stream threshold for Layer 2 upgrade
 	Shaping        bool
+	FlowControl    bool
+	StreamWindow   int
 }
 
 // EncodeServerSettings serializes server settings to the wire format.
@@ -108,6 +128,12 @@ func EncodeServerSettings(s *ServerSettings) []byte {
 	}
 	if s.Shaping {
 		fmt.Fprintf(&b, "shaping=1\n")
+	}
+	if s.FlowControl {
+		fmt.Fprintf(&b, "flow-control=1\n")
+	}
+	if s.StreamWindow > 0 {
+		fmt.Fprintf(&b, "stream-window=%d\n", s.StreamWindow)
 	}
 	return []byte(b.String())
 }
@@ -145,6 +171,14 @@ func DecodeServerSettings(data []byte) (*ServerSettings, error) {
 			s.Threshold = th
 		case "shaping":
 			s.Shaping = val == "1"
+		case "flow-control":
+			s.FlowControl = val == "1"
+		case "stream-window":
+			w, err := strconv.Atoi(val)
+			if err != nil {
+				return nil, fmt.Errorf("tsunami: invalid stream-window: %w", err)
+			}
+			s.StreamWindow = w
 		}
 	}
 	return s, nil

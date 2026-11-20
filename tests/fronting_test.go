@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"bufio"
 	"crypto/tls"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/server"
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
@@ -502,6 +504,8 @@ func TestFrontingSiteLocalModeProxiesOrigin(t *testing.T) {
 	req.Header.Set("X-Api-Version", "v1")
 	req.Header.Set("X-Date", "1700000000")
 	req.Header.Set("X-Trace-Id", "0123456789abcdef")
+	req.Header.Set("X-Session-Id", "0123456789abcdef0123456789abcdef")
+	req.Header.Set("X-Stream-Seq", "0")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -535,7 +539,7 @@ func TestFrontingSiteLocalModeProxiesOrigin(t *testing.T) {
 	if upstreamRequest.host != serverAddr {
 		t.Fatalf("upstream Host = %q, want preserved client host %q", upstreamRequest.host, serverAddr)
 	}
-	for _, header := range []string{"Authorization", "X-Api-Version", "X-Date", "X-Trace-Id"} {
+	for _, header := range []string{"Authorization", "X-Api-Version", "X-Date", "X-Trace-Id", "X-Session-Id", "X-Stream-Seq"} {
 		if got := upstreamRequest.header.Get(header); got != "" {
 			t.Fatalf("fronting header %s leaked to upstream: %q", header, got)
 		}
@@ -605,7 +609,7 @@ func TestFrontingSiteRemoteModeHostHandling(t *testing.T) {
 	})
 }
 
-func TestFrontingSiteUpstreamFailureServesBuiltinPage(t *testing.T) {
+func TestFrontingSiteUpstreamFailureReturnsCaddy502(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -626,14 +630,11 @@ func TestFrontingSiteUpstreamFailureServesBuiltinPage(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("site failure fallback %s status = %d, want 200", path, resp.StatusCode)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("site failure fallback %s status = %d, want 502", path, resp.StatusCode)
 		}
-		if !strings.Contains(string(body), "Front Site") {
-			t.Fatalf("site failure fallback %s body missing site name: %q", path, string(body))
-		}
-		if strings.Contains(string(body), "502") || strings.Contains(string(body), "Bad Gateway") {
-			t.Fatalf("site failure fallback leaked proxy error: %q", string(body))
+		if len(body) != 0 {
+			t.Fatalf("site failure fallback %s returned body %q, want empty 502 body", path, string(body))
 		}
 		if got := resp.Header.Get("Server"); got != fronting.DefaultServerHeader {
 			t.Fatalf("site failure fallback Server header = %q, want %q", got, fronting.DefaultServerHeader)
@@ -1005,4 +1006,80 @@ func TestFrontingSiteFrontingPathFallbacks(t *testing.T) {
 			t.Fatalf("proxied request URI = %q", proxied.requestURI)
 		}
 	})
+}
+
+func TestFrontingH2StreamLegacyAnd4096ByteEcho(t *testing.T) {
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+
+	serverAddr, stopServer := startFrontingTsunamiServer(t)
+	defer stopServer()
+
+	for _, tr := range []string{fronting.TransportH2, fronting.TransportH2Stream} {
+		t.Run(tr, func(t *testing.T) {
+			c, err := client.New(frontingClientConfig(serverAddr, tr))
+			if err != nil {
+				t.Fatalf("create client: %v", err)
+			}
+			defer c.Close()
+
+			stream, err := c.OpenStream(echoAddr)
+			if err != nil {
+				t.Fatalf("open stream: %v", err)
+			}
+			defer stream.Close()
+
+			// Exercise exact 4096 bytes (previously triggered HTTPServerConn 4096-byte stall)
+			// plus a multi-frame payload.
+			for _, size := range []int{4096, 128 * 1024} {
+				payload := bytes.Repeat([]byte{byte(size % 251)}, size)
+				go func() {
+					_, _ = stream.Write(payload)
+				}()
+				got := make([]byte, size)
+				if _, err := io.ReadFull(stream, got); err != nil {
+					t.Fatalf("read size=%d: %v", size, err)
+				}
+				if !bytes.Equal(got, payload) {
+					t.Fatalf("echo mismatch for size=%d", size)
+				}
+			}
+		})
+	}
+}
+
+func TestFrontingPQCurveNegotiatedWithUTLSChrome(t *testing.T) {
+	serverAddr, stopServer := startFrontingTsunamiServer(t)
+	defer stopServer()
+
+	rawConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial fronting server: %v", err)
+	}
+	defer rawConn.Close()
+
+	cfg := &transport.TLSConfig{
+		ServerName:  "localhost",
+		SkipVerify:  true,
+		Fingerprint: transport.FingerprintChrome,
+		ALPN:        []string{"h2"},
+		MinVersion:  tls.VersionTLS13,
+	}
+	conn, err := transport.DialUTLS(rawConn, cfg)
+	if err != nil {
+		t.Fatalf("DialUTLS: %v", err)
+	}
+	defer conn.Close()
+
+	uconn, ok := conn.(*utls.UConn)
+	if !ok {
+		t.Fatalf("expected *utls.UConn, got %T", conn)
+	}
+	state := uconn.ConnectionState()
+	if state.HandshakeComplete != true {
+		t.Fatal("handshake not complete")
+	}
+	if state.NegotiatedProtocol != "h2" {
+		t.Fatalf("ALPN = %q, want h2", state.NegotiatedProtocol)
+	}
 }

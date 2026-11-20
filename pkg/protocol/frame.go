@@ -34,6 +34,7 @@ var (
 	ErrVersionMismatch     = errors.New("tsunami: version mismatch")
 	ErrStreamRejected      = errors.New("tsunami: stream rejected")
 	ErrTooManyStreams      = errors.New("tsunami: too many concurrent streams")
+	ErrStreamRecvOverflow  = errors.New("tsunami: stream receive buffer overflow")
 )
 
 // frameBufPool reuses frame encode buffers to reduce GC pressure under high throughput.

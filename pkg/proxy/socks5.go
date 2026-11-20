@@ -9,8 +9,10 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/tsunami-protocol/tsunami/pkg/client"
+	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 )
 
 // SOCKS5Server implements a local SOCKS5 proxy that forwards through TSUNAMI.
@@ -194,15 +196,21 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
-		io.CopyBuffer(stream, conn, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(stream, conn, *bufp)
+		protocol.RelayBufPool.Put(bufp)
 		stream.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(conn, stream, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(conn, stream, *bufp)
+		protocol.RelayBufPool.Put(bufp)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}()
 
 	wg.Wait()

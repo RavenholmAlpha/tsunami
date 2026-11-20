@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/padding"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
+	"github.com/tsunami-protocol/tsunami/pkg/surge"
 )
 
 type timeoutError struct{}
@@ -128,4 +133,74 @@ func TestUnexpectedAuthFrameErrorIncludesFrameMetadata(t *testing.T) {
 	if !errors.Is(authErr, protocol.ErrAuthFailed) {
 		t.Fatal("unexpected frame auth error should match protocol.ErrAuthFailed")
 	}
+}
+
+func TestOpenStreamRetriesAndEvictsDeadSession(t *testing.T) {
+	var dials atomic.Int32
+
+	pool := mux.NewPool(mux.DefaultPoolConfig(), func() (*protocol.Session, error) {
+		n := dials.Add(1)
+		cConn, pConn := net.Pipe()
+		sess := protocol.NewSession(cConn, uint64(n))
+
+		if n == 1 {
+			// First session: peer closes immediately on read so OpenStream fails.
+			go func() {
+				buf := make([]byte, 64)
+				_, _ = pConn.Read(buf)
+				_ = pConn.Close()
+			}()
+		} else {
+			// Second session: healthy peer responding with SYNACK.
+			go func() {
+				defer pConn.Close()
+				for {
+					f, err := protocol.DecodeFrame(pConn)
+					if err != nil {
+						return
+					}
+					if f.Command == protocol.CmdSYN {
+						_ = protocol.EncodeFrame(pConn, protocol.NewFrame(protocol.CmdSYNACK, f.StreamID, nil))
+					}
+				}
+			}()
+		}
+		go func() { _ = sess.RunEventLoop() }()
+		return sess, nil
+	})
+	defer pool.Close()
+
+	c := &Client{
+		config:        DefaultConfig(),
+		pool:          pool,
+		surgeCtrl:     surge.NewController(surge.Config{Mode: surge.ModeNone}, pool),
+		paddingScheme: padding.DefaultScheme(),
+	}
+	defer c.Close()
+
+	// Seed the dead first session into the pool.
+	deadSess, err := pool.GetOrCreateSession()
+	if err != nil {
+		t.Fatalf("seed dead session: %v", err)
+	}
+
+	// OpenStream should fail on deadSess, evict it, redial session 2, and succeed!
+	stream, err := c.OpenStream("example.com:443")
+	if err != nil {
+		t.Fatalf("OpenStream should have retried on healthy session, got error: %v", err)
+	}
+	defer stream.Close()
+
+	if !deadSess.IsClosed() {
+		t.Fatal("dead session was not evicted and closed")
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dial count = %d, want 2", got)
+	}
+	if got := pool.SessionCount(); got != 1 {
+		t.Fatalf("SessionCount = %d, want 1", got)
+	}
+
+	// Drain target address bytes written on stream cleanup cleanly.
+	_ = time.Millisecond
 }

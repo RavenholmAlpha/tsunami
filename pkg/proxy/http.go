@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tsunami-protocol/tsunami/pkg/client"
+	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 )
 
 // HTTPProxyServer implements a local HTTP proxy (CONNECT method) that forwards through TSUNAMI.
@@ -112,15 +114,21 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, req *http.Request) {
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024) // 256KB buffer to reduce write syscalls
-		io.CopyBuffer(stream, conn, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(stream, conn, *bufp)
+		protocol.RelayBufPool.Put(bufp)
 		stream.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(conn, stream, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(conn, stream, *bufp)
+		protocol.RelayBufPool.Put(bufp)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}()
 
 	wg.Wait()
@@ -157,14 +165,20 @@ func (h *HTTPProxyServer) handleHTTP(conn net.Conn, br *bufio.Reader, req *http.
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(stream, br, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(stream, br, *bufp)
+		protocol.RelayBufPool.Put(bufp)
 	}()
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 256*1024)
-		io.CopyBuffer(conn, stream, buf)
+		bufp := protocol.RelayBufPool.Get().(*[]byte)
+		io.CopyBuffer(conn, stream, *bufp)
+		protocol.RelayBufPool.Put(bufp)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}()
 
 	wg.Wait()
