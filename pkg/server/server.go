@@ -99,6 +99,7 @@ type Server struct {
 	listener   net.Listener
 	httpSrv    *http.Server
 	site       http.Handler
+	siteHosts  *fronting.CertSelector // nil unless strict SNI is in force
 	traffic    control.TrafficPolicy
 	frontKeys  [][32]byte
 	nonceCache *fronting.NonceCache
@@ -248,6 +249,14 @@ func (s *Server) startFronting() error {
 		return fmt.Errorf("tsunami fronting: build TLS config: %w", err)
 	}
 	tlsCfg := fronting.CaddyLikeTLSConfig(baseTLSCfg.Certificates)
+	siteHosts, err := s.strictSiteHosts(baseTLSCfg.Certificates)
+	if err != nil {
+		return fmt.Errorf("tsunami fronting: %w", err)
+	}
+	if siteHosts != nil {
+		tlsCfg = fronting.CaddyLikeStrictTLSConfig(siteHosts)
+	}
+	s.siteHosts = siteHosts
 
 	ln, err := net.Listen("tcp", s.config.Listen)
 	if err != nil {
@@ -289,6 +298,32 @@ func (s *Server) startFronting() error {
 		return nil
 	}
 	return err
+}
+
+// strictSiteHosts returns the certificate selector that enforces strict SNI
+// and Host matching, or nil when the fronting listener accepts any name.
+func (s *Server) strictSiteHosts(certs []tls.Certificate) (*fronting.CertSelector, error) {
+	if !s.config.Fronting.StrictSNIEnabled() {
+		log.Printf("tsunami fronting: strict SNI is disabled: any server name completes the TLS handshake")
+		return nil, nil
+	}
+	if s.config.TLS.CertFile == "" && s.config.TLS.KeyFile == "" {
+		// The generated test certificate only names localhost, so no remote
+		// client could ever match it.
+		log.Printf("tsunami fronting: strict SNI is not applied to the generated self-signed certificate")
+		return nil, nil
+	}
+	selector, err := fronting.NewCertSelector(certs)
+	if err != nil {
+		return nil, err
+	}
+	names := selector.Names()
+	if len(names) == 0 {
+		log.Printf("tsunami fronting: the certificate names no host, so strict SNI is not applied")
+		return nil, nil
+	}
+	log.Printf("tsunami fronting: strict SNI for %s", strings.Join(names, ", "))
+	return selector, nil
 }
 
 // handleTLSConn performs the TLS handshake and delegates to handleConn.
@@ -735,6 +770,12 @@ func (s *Server) handleFrontingHTTP(w http.ResponseWriter, r *http.Request) {
 	// path, preventing an observer from distinguishing auth success vs failure
 	// based on time-to-first-byte.
 	time.Sleep(fronting.AuthJitter())
+
+	// A request for a host this site does not serve gets what Caddy sends
+	// when no site block matches: 200 with an empty body.
+	if s.siteHosts != nil && !s.siteHosts.MatchHost(r.Host) {
+		return
+	}
 
 	s.site.ServeHTTP(w, r)
 }

@@ -218,6 +218,53 @@ New deployments should use the `site` object.
   fronting path with a valid HMAC are tunnels, and those requests never reach
   the upstream.
 
+## Strict SNI and Host matching
+
+A Caddy that serves `example.com { ... }` holds a certificate for that name
+only, and it answers for that name only. The fronting listener does the same
+for the names on its certificate (DNS and IP SANs; a wildcard such as
+`*.example.com` covers one label):
+
+| Client | Response |
+|:--|:--|
+| The TLS ClientHello names the site | Normal handshake. |
+| The ClientHello has no SNI, as in a scan of `https://<ip>/` | The handshake fails with the TLS `internal_error` alert. It only succeeds when the certificate has an IP SAN for the address the client connected to. |
+| The ClientHello names any other host | The handshake fails with `internal_error`. |
+| The handshake is valid but the HTTP `Host` is another name | `200` with an empty body and the `Server` header, which is what Caddy sends when no site matches. The cover website is not served. |
+
+Without this, a scanner that connects to the bare IP address receives the site
+certificate, and with it the domain name, and a request with any `Host` value
+gets the cover website. A stock Caddy does neither, so both were fingerprints.
+
+The authenticated tunnel is evaluated before the `Host` check, so a client
+that sends another `Host` (`--front-host`) keeps working. The TLS check applies
+to every client: `--sni` must be a name on the certificate. It defaults to the
+server hostname, and `scripts/install.sh` always prints it in the client
+command.
+
+Strict matching is on by default. Turn it off with `"strict_sni": false` in
+the `fronting` object, or with `--front-strict-sni=false`, when:
+
+- a CDN or load balancer connects to this server without SNI, or with a name
+  that is not on the certificate;
+- clients deliberately send an SNI the certificate does not cover.
+
+```json
+{
+  "server": {
+    "fronting": {
+      "enabled": true,
+      "strict_sni": false
+    }
+  }
+}
+```
+
+It is never applied to the auto-generated self-signed certificate, which only
+names `localhost`. A rejected handshake is logged as
+`http: TLS handshake error from <address>: fronting: no certificate available ...`;
+expect one line per scanner that connects by IP address.
+
 ## Server
 
 ```bash
@@ -241,6 +288,7 @@ Optional flags:
 | `--front-site-upstream` | Site camouflage upstream URL or `host:port`. |
 | `--front-site-preserve-host` | Override `preserve_host`. |
 | `--front-site-insecure-skip-verify` | Skip TLS verification of an HTTPS upstream. |
+| `--front-strict-sni` | Strict SNI and Host matching (default `true`). See above. |
 | `--front-decoy-proxy` | Deprecated alias for `--front-site-upstream`. |
 
 `scripts/install.sh` writes all of these into `/etc/tsunami/config.json` with
@@ -280,6 +328,7 @@ Optional flags:
 
 | Flag | Description |
 |:--|:--|
+| `--sni` | TLS server name. Defaults to the server hostname. Must be a name on the server certificate unless the server turns strict SNI off. |
 | `--front-host` | Overrides the HTTP Host header. Defaults to SNI. |
 | `--front-secret` | HTTP-layer HMAC secret. Defaults to the TSUNAMI password; pass the server's separate fronting secret when one is configured. |
 
