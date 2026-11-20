@@ -616,30 +616,6 @@ func (pw *Writer) ControlBytes() int64 {
 	return pw.ctlBytes
 }
 
-// serializeFrames is no longer needed; keep serializeFramesLocked on Writer.
-func serializeFrames(frames []*protocol.Frame) []byte {
-	size := 0
-	for _, f := range frames {
-		size += protocol.FrameHeaderLen + len(f.Data)
-	}
-
-	buf := make([]byte, 0, size)
-	var header [protocol.FrameHeaderLen]byte
-	for _, f := range frames {
-		header[0] = byte(f.Command)
-		header[1] = byte(f.StreamID >> 24)
-		header[2] = byte(f.StreamID >> 16)
-		header[3] = byte(f.StreamID >> 8)
-		header[4] = byte(f.StreamID)
-		header[5] = byte(len(f.Data) >> 8)
-		header[6] = byte(len(f.Data))
-		buf = append(buf, header[:]...)
-		buf = append(buf, f.Data...)
-	}
-
-	return buf
-}
-
 // KeepaliveGenerator sends minimal waste packets during idle periods.
 // Behaves like a TLS heartbeat: 30-60s intervals, 4-8 byte packets.
 // Only active when all Streams in the Session are idle.
