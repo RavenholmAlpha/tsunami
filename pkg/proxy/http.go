@@ -34,7 +34,14 @@ func (h *HTTPProxyServer) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("http proxy: listen %s: %w", addr, err)
 	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	h.listener = ln
+	h.mu.Unlock()
 	log.Printf("http proxy: listening on %s", addr)
 
 	for {
@@ -65,8 +72,11 @@ func (h *HTTPProxyServer) Close() error {
 
 // Addr returns the listener address.
 func (h *HTTPProxyServer) Addr() net.Addr {
-	if h.listener != nil {
-		return h.listener.Addr()
+	h.mu.Lock()
+	ln := h.listener
+	h.mu.Unlock()
+	if ln != nil {
+		return ln.Addr()
 	}
 	return nil
 }

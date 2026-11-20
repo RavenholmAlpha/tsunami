@@ -35,7 +35,14 @@ func (s *SOCKS5Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("socks5: listen %s: %w", addr, err)
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	s.listener = ln
+	s.mu.Unlock()
 	log.Printf("socks5: listening on %s", addr)
 
 	for {
@@ -67,8 +74,11 @@ func (s *SOCKS5Server) Close() error {
 
 // Addr returns the listener address (available after ListenAndServe starts).
 func (s *SOCKS5Server) Addr() net.Addr {
-	if s.listener != nil {
-		return s.listener.Addr()
+	s.mu.Lock()
+	ln := s.listener
+	s.mu.Unlock()
+	if ln != nil {
+		return ln.Addr()
 	}
 	return nil
 }
