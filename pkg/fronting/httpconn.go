@@ -134,16 +134,20 @@ type HTTPClientConn struct {
 	initOnce sync.Once
 	initErr  error
 
-	mu           sync.Mutex
-	closed       bool
-	closedCh     chan struct{}
-	abortErr     error
-	readTimer    *time.Timer
-	writeTimer   *time.Timer
-	readExpired  atomic.Bool
-	writeExpired atomic.Bool
-	closeOnce    sync.Once
-	closeErr     error
+	mu                  sync.Mutex
+	closed              bool
+	closedCh            chan struct{}
+	abortErr            error
+	readTimer           *time.Timer
+	readDeadlineAt      time.Time
+	readDeadlineActive  bool
+	writeTimer          *time.Timer
+	writeDeadlineAt     time.Time
+	writeDeadlineActive bool
+	readExpired         atomic.Bool
+	writeExpired        atomic.Bool
+	closeOnce           sync.Once
+	closeErr            error
 }
 
 // HTTPResponseResult carries a pending HTTP tunnel response.
@@ -232,13 +236,13 @@ func (c *HTTPClientConn) abort(err error) error {
 			err = net.ErrClosed
 		}
 		c.abortErr = err
+		c.readDeadlineActive = false
+		c.writeDeadlineActive = false
 		if c.readTimer != nil {
 			c.readTimer.Stop()
-			c.readTimer = nil
 		}
 		if c.writeTimer != nil {
 			c.writeTimer.Stop()
-			c.writeTimer = nil
 		}
 		reader := c.reader
 		cancel := c.reqCancel
@@ -296,29 +300,48 @@ func (c *HTTPClientConn) SetReadDeadline(t time.Time) error {
 		}
 		return net.ErrClosed
 	}
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
 	if t.IsZero() {
+		c.readDeadlineActive = false
 		c.readExpired.Store(false)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
+		c.readDeadlineActive = false
 		c.readExpired.Store(true)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		_ = c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.readExpired.Store(false)
-	c.readTimer = time.AfterFunc(d, func() {
-		c.readExpired.Store(true)
-		_ = c.abort(os.ErrDeadlineExceeded)
-	})
+	c.readDeadlineAt = t
+	c.readDeadlineActive = true
+	if c.readTimer == nil {
+		c.readTimer = time.AfterFunc(d, c.onReadDeadline)
+	} else {
+		c.readTimer.Reset(d)
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *HTTPClientConn) onReadDeadline() {
+	c.mu.Lock()
+	if c.closed || !c.readDeadlineActive || time.Now().Before(c.readDeadlineAt) {
+		c.mu.Unlock()
+		return
+	}
+	c.readDeadlineActive = false
+	c.readExpired.Store(true)
+	c.mu.Unlock()
+	_ = c.abort(os.ErrDeadlineExceeded)
 }
 
 func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
@@ -334,29 +357,48 @@ func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
 		}
 		return net.ErrClosed
 	}
-	if c.writeTimer != nil {
-		c.writeTimer.Stop()
-		c.writeTimer = nil
-	}
 	if t.IsZero() {
+		c.writeDeadlineActive = false
 		c.writeExpired.Store(false)
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
+		c.writeDeadlineActive = false
 		c.writeExpired.Store(true)
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+		}
 		c.mu.Unlock()
 		_ = c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.writeExpired.Store(false)
-	c.writeTimer = time.AfterFunc(d, func() {
-		c.writeExpired.Store(true)
-		_ = c.abort(os.ErrDeadlineExceeded)
-	})
+	c.writeDeadlineAt = t
+	c.writeDeadlineActive = true
+	if c.writeTimer == nil {
+		c.writeTimer = time.AfterFunc(d, c.onWriteDeadline)
+	} else {
+		c.writeTimer.Reset(d)
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *HTTPClientConn) onWriteDeadline() {
+	c.mu.Lock()
+	if c.closed || !c.writeDeadlineActive || time.Now().Before(c.writeDeadlineAt) {
+		c.mu.Unlock()
+		return
+	}
+	c.writeDeadlineActive = false
+	c.writeExpired.Store(true)
+	c.mu.Unlock()
+	_ = c.abort(os.ErrDeadlineExceeded)
 }
 
 func (c *HTTPClientConn) ensureReader() error {

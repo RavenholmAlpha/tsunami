@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -41,14 +42,16 @@ var (
 var frameBufPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, MaxFrameDataLen+FrameHeaderLen)
-		return buf
+		return &buf
 	},
 }
 
-// RelayBufPool provides 64 KiB buffers for bidirectional relay copies.
+// RelayBufPool provides MaxFrameDataLen-sized (65535 B) buffers for bidirectional
+// relay copies so a full read maps to a single TSUNAMI PSH frame without an extra
+// 1-byte tail frame.
 var RelayBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 64*1024)
+		buf := make([]byte, MaxFrameDataLen)
 		return &buf
 	},
 }
@@ -57,8 +60,66 @@ var RelayBufPool = sync.Pool{
 var writeCoalesceBufPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 128*1024)
-		return buf
+		return &buf
 	},
+}
+
+const (
+	recvPoolSmallCap  = 4 * 1024
+	recvPoolMediumCap = 16 * 1024
+	recvPoolLargeCap  = MaxFrameDataLen
+	maxCoalescePool   = 512 * 1024
+)
+
+var (
+	recvPoolSmall = sync.Pool{
+		New: func() any {
+			buf := make([]byte, recvPoolSmallCap)
+			return &buf
+		},
+	}
+	recvPoolMedium = sync.Pool{
+		New: func() any {
+			buf := make([]byte, recvPoolMediumCap)
+			return &buf
+		},
+	}
+	recvPoolLarge = sync.Pool{
+		New: func() any {
+			buf := make([]byte, recvPoolLargeCap)
+			return &buf
+		},
+	}
+)
+
+func getRecvPayloadBuf(n int) (*[]byte, []byte) {
+	var bufp *[]byte
+	switch {
+	case n <= recvPoolSmallCap:
+		bufp = recvPoolSmall.Get().(*[]byte)
+	case n <= recvPoolMediumCap:
+		bufp = recvPoolMedium.Get().(*[]byte)
+	default:
+		bufp = recvPoolLarge.Get().(*[]byte)
+	}
+	return bufp, (*bufp)[:n]
+}
+
+func putRecvPayloadBuf(bufp *[]byte) {
+	if bufp == nil {
+		return
+	}
+	switch cap(*bufp) {
+	case recvPoolSmallCap:
+		*bufp = (*bufp)[:recvPoolSmallCap]
+		recvPoolSmall.Put(bufp)
+	case recvPoolMediumCap:
+		*bufp = (*bufp)[:recvPoolMediumCap]
+		recvPoolMedium.Put(bufp)
+	case recvPoolLargeCap:
+		*bufp = (*bufp)[:recvPoolLargeCap]
+		recvPoolLarge.Put(bufp)
+	}
 }
 
 // EncodeFrame writes a frame to the writer in TSUNAMI wire format.
@@ -83,8 +144,8 @@ func EncodeFrame(w io.Writer, f *Frame) error {
 	}
 
 	// Data frame — use pooled buffer to avoid per-frame allocation
-	poolBuf := frameBufPool.Get().([]byte)
-	buf := poolBuf[:FrameHeaderLen+dataLen]
+	poolBufp := frameBufPool.Get().(*[]byte)
+	buf := (*poolBufp)[:FrameHeaderLen+dataLen]
 
 	buf[0] = byte(f.Command)
 	binary.BigEndian.PutUint32(buf[1:5], f.StreamID)
@@ -92,7 +153,8 @@ func EncodeFrame(w io.Writer, f *Frame) error {
 	copy(buf[FrameHeaderLen:], f.Data)
 
 	_, err := w.Write(buf)
-	frameBufPool.Put(poolBuf)
+	*poolBufp = (*poolBufp)[:MaxFrameDataLen+FrameHeaderLen]
+	frameBufPool.Put(poolBufp)
 	return err
 }
 
@@ -168,14 +230,15 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 		totalLen += FrameHeaderLen + len(f.Data)
 	}
 
-	buf := writeCoalesceBufPool.Get().([]byte)
+	bufp := writeCoalesceBufPool.Get().(*[]byte)
+	buf := *bufp
 	if cap(buf) < totalLen {
 		buf = make([]byte, 0, totalLen)
 	}
 	buf = buf[:0]
 
+	var header [FrameHeaderLen]byte
 	for _, f := range frames {
-		var header [FrameHeaderLen]byte
 		header[0] = byte(f.Command)
 		binary.BigEndian.PutUint32(header[1:5], f.StreamID)
 		binary.BigEndian.PutUint16(header[5:7], uint16(len(f.Data)))
@@ -186,13 +249,17 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 	}
 
 	_, err := fw.w.Write(buf)
-	writeCoalesceBufPool.Put(buf[:0])
+	if cap(buf) <= maxCoalescePool {
+		*bufp = buf[:0]
+		writeCoalesceBufPool.Put(bufp)
+	}
 	return err
 }
 
 // FrameReader provides frame reading from a connection.
 type FrameReader struct {
-	r io.Reader
+	r     io.Reader
+	waste []byte
 }
 
 // NewFrameReader creates a new FrameReader.
@@ -200,7 +267,56 @@ func NewFrameReader(r io.Reader) *FrameReader {
 	return &FrameReader{r: r}
 }
 
+// NewBufferedFrameReader creates a FrameReader backed by a bufio.Reader of at
+// least bufSize bytes so header+payload reads do not issue two syscalls per frame.
+func NewBufferedFrameReader(r io.Reader, bufSize int) *FrameReader {
+	if _, ok := r.(*bufio.Reader); !ok && bufSize > 0 {
+		r = bufio.NewReaderSize(r, bufSize)
+	}
+	return &FrameReader{r: r}
+}
+
 // ReadFrame reads and decodes the next frame.
 func (fr *FrameReader) ReadFrame() (*Frame, error) {
 	return DecodeFrame(fr.r)
+}
+
+func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
+	var header [FrameHeaderLen]byte
+	if _, err := io.ReadFull(fr.r, header[:]); err != nil {
+		return nil, nil, fmt.Errorf("tsunami: read frame header: %w", err)
+	}
+
+	cmd := Command(header[0])
+	streamID := binary.BigEndian.Uint32(header[1:5])
+	dataLen := int(binary.BigEndian.Uint16(header[5:7]))
+
+	if dataLen == 0 {
+		return &Frame{Command: cmd, StreamID: streamID}, nil, nil
+	}
+
+	if cmd == CmdWaste {
+		if cap(fr.waste) < dataLen {
+			fr.waste = make([]byte, dataLen)
+		}
+		if _, err := io.ReadFull(fr.r, fr.waste[:dataLen]); err != nil {
+			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+		}
+		return &Frame{Command: CmdWaste}, nil, nil
+	}
+
+	if cmd == CmdPSH {
+		bufp, payload := getRecvPayloadBuf(dataLen)
+		if _, err := io.ReadFull(fr.r, payload); err != nil {
+			putRecvPayloadBuf(bufp)
+			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+		}
+		return &Frame{Command: cmd, StreamID: streamID, Data: payload}, bufp, nil
+	}
+
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(fr.r, data); err != nil {
+		return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+	}
+	return &Frame{Command: cmd, StreamID: streamID, Data: data}, nil, nil
 }

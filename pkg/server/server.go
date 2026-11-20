@@ -433,21 +433,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleStream(stream, user)
 	})
 
-	// Wire padding system into session write path
-	pw := padding.NewWriterForRole(conn, s.scheme, padding.RoleServer)
-	bindServerPadding(session, pw)
-
-	// Determine if shaping and per-stream flow control should be activated
+	// Determine if shaping, flow control, and fast-open should be activated
 	shapingEnabled := s.config.Shaping != nil && clientSettings != nil && clientSettings.Shaping
 	flowControlEnabled := clientSettings != nil && clientSettings.FlowControl
+	fastOpenEnabled := clientSettings != nil && clientSettings.FastOpen
 	serverStreamWindow := 0
 	if flowControlEnabled {
 		remoteWindow := protocol.ClampStreamWindow(clientSettings.StreamWindow)
 		session.EnableFlowControl(protocol.DefaultStreamWindow, remoteWindow)
 		serverStreamWindow = protocol.DefaultStreamWindow
 	}
+	if fastOpenEnabled {
+		session.EnableFastOpen()
+	}
 
-	// Send server settings as auth-success confirmation.
+	// Send server settings as auth-success confirmation (unpadded so handshake framing
+	// cleanly separates from post-handshake traffic shaping / padding v2).
 	// The client blocks waiting for this frame after sending auth+settings.
 	serverSettings := &protocol.ServerSettings{
 		Version:        protocol.CurrentVersion,
@@ -457,20 +458,25 @@ func (s *Server) handleConn(conn net.Conn) {
 		Shaping:        shapingEnabled,
 		FlowControl:    flowControlEnabled,
 		StreamWindow:   serverStreamWindow,
+		FastOpen:       fastOpenEnabled,
 	}
 	if err := session.SendServerSettings(serverSettings); err != nil {
 		log.Printf("tsunami server: send server settings: %v", err)
 		return
 	}
 
-	// Activate traffic shaping after settings exchange
+	// Activate traffic shaping after settings exchange and before binding padding.
+	activeConn := conn
 	if shapingEnabled {
 		shaped := shaping.Wrap(conn, *s.config.Shaping)
 		session.ReplaceConn(shaped)
-		pw = padding.NewWriterForRole(shaped, s.scheme, padding.RoleServer)
-		bindServerPadding(session, pw)
+		activeConn = shaped
 		log.Printf("tsunami server: traffic shaping enabled for user '%s'", user.Name)
 	}
+
+	// Wire padding system into session write path on top of the active connection.
+	pw := padding.NewWriterForRole(activeConn, s.scheme, padding.RoleServer)
+	bindServerPadding(session, pw)
 
 	// Push the padding scheme when the client's version differs. Clients that
 	// do not advertise padding-v2 support cannot parse the v2 syntax (`~`
@@ -521,6 +527,7 @@ func bindServerPadding(session *protocol.Session, pw *padding.Writer) {
 	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
 		return pw.WriteFramesWithPadding(frames)
 	})
+	session.SetPaddingPSHWriteFn(pw.WritePSH)
 	session.SetOnStreamClosed(func(id uint32) {
 		pw.ForgetStream(id)
 	})
@@ -836,13 +843,13 @@ func (s *Server) handleFrontingSplitPOST(w http.ResponseWriter, r *http.Request,
 		time.Sleep(fronting.AuthJitter())
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, fronting.MaxSplitChunkSize+1))
-	if err != nil || len(body) > fronting.MaxSplitChunkSize {
+	body, poolBuf, err := fronting.ReadSplitUplinkBody(r.Body, r.ContentLength)
+	if err != nil {
 		http.Error(w, "invalid uplink chunk", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.splitSessions.DeliverUplink(r.Context(), sid, seq, body); err != nil {
+	if err := s.splitSessions.DeliverUplinkPooled(r.Context(), sid, seq, body, poolBuf); err != nil {
 		if seq == 0 {
 			s.site.ServeHTTP(w, r)
 		} else {

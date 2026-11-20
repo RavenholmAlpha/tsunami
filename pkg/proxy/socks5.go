@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -76,6 +77,8 @@ func (s *SOCKS5Server) Addr() net.Addr {
 func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	br := bufio.NewReaderSize(conn, 512)
+
 	// --- SOCKS5 Handshake (RFC 1928) ---
 
 	// 1. Read auth methods
@@ -85,15 +88,15 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	// | 1  |    1     | 1 to 255 |
 	// +----+----------+----------+
 	var header [2]byte
-	if _, err := io.ReadFull(conn, header[:]); err != nil {
+	if _, err := io.ReadFull(br, header[:]); err != nil {
 		return
 	}
 	if header[0] != 0x05 {
 		return // not SOCKS5
 	}
 	nmethods := int(header[1])
-	methods := make([]byte, nmethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
+	var methodsBuf [256]byte
+	if _, err := io.ReadFull(br, methodsBuf[:nmethods]); err != nil {
 		return
 	}
 
@@ -112,7 +115,7 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	// | 1  |  1  | X'00' |  1   | Variable |    2     |
 	// +----+-----+-------+------+----------+----------+
 	var reqHeader [4]byte
-	if _, err := io.ReadFull(conn, reqHeader[:]); err != nil {
+	if _, err := io.ReadFull(br, reqHeader[:]); err != nil {
 		return
 	}
 	if reqHeader[0] != 0x05 {
@@ -131,11 +134,11 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	switch atyp {
 	case 0x01: // IPv4
 		var addr [4]byte
-		if _, err := io.ReadFull(conn, addr[:]); err != nil {
+		if _, err := io.ReadFull(br, addr[:]); err != nil {
 			return
 		}
 		var port [2]byte
-		if _, err := io.ReadFull(conn, port[:]); err != nil {
+		if _, err := io.ReadFull(br, port[:]); err != nil {
 			return
 		}
 		p := binary.BigEndian.Uint16(port[:])
@@ -143,15 +146,16 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	case 0x03: // Domain
 		var domainLen [1]byte
-		if _, err := io.ReadFull(conn, domainLen[:]); err != nil {
+		if _, err := io.ReadFull(br, domainLen[:]); err != nil {
 			return
 		}
-		domain := make([]byte, domainLen[0])
-		if _, err := io.ReadFull(conn, domain); err != nil {
+		var domainBuf [256]byte
+		domain := domainBuf[:domainLen[0]]
+		if _, err := io.ReadFull(br, domain); err != nil {
 			return
 		}
 		var port [2]byte
-		if _, err := io.ReadFull(conn, port[:]); err != nil {
+		if _, err := io.ReadFull(br, port[:]); err != nil {
 			return
 		}
 		p := binary.BigEndian.Uint16(port[:])
@@ -159,11 +163,11 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	case 0x04: // IPv6
 		var addr [16]byte
-		if _, err := io.ReadFull(conn, addr[:]); err != nil {
+		if _, err := io.ReadFull(br, addr[:]); err != nil {
 			return
 		}
 		var port [2]byte
-		if _, err := io.ReadFull(conn, port[:]); err != nil {
+		if _, err := io.ReadFull(br, port[:]); err != nil {
 			return
 		}
 		p := binary.BigEndian.Uint16(port[:])
@@ -190,6 +194,11 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	// +----+-----+-------+------+----------+----------+
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
+	var src io.Reader = conn
+	if br.Buffered() > 0 {
+		src = io.MultiReader(io.LimitReader(br, int64(br.Buffered())), conn)
+	}
+
 	// 6. Bidirectional relay: SOCKS client ←→ TSUNAMI stream
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -197,7 +206,7 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 	go func() {
 		defer wg.Done()
 		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, conn, *bufp)
+		io.CopyBuffer(stream, src, *bufp)
 		protocol.RelayBufPool.Put(bufp)
 		stream.Close()
 	}()

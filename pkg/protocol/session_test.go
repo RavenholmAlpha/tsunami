@@ -226,3 +226,98 @@ func TestSessionWindowUpdateIncreasesSendWindow(t *testing.T) {
 		t.Fatalf("post-update grant = %d, want 512", grant)
 	}
 }
+
+func TestSessionFastOpenSuccessAndLateRejection(t *testing.T) {
+	cConn, sConn := tcpPipeProtocol(t)
+	clientSess := NewSession(cConn, 1)
+	clientSess.EnableFastOpen()
+	defer clientSess.Close()
+	defer sConn.Close()
+
+	go func() { _ = clientSess.RunEventLoop() }()
+
+	// Peer intentionally withholds CmdSYNACK for stream 1 to prove OpenStream
+	// returns immediately (0-RTT), then rejects stream 2 via late CmdSYNACK error.
+	peerFrames := make(chan *Frame, 8)
+	go func() {
+		fr := NewFrameReader(sConn)
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			peerFrames <- f
+			if f.Command == CmdSYN && f.StreamID == 2 {
+				_ = EncodeFrame(sConn, NewFrame(CmdSYNACK, 2, []byte("too many streams")))
+			}
+		}
+	}()
+
+	st1, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("fast-open stream 1 failed: %v", err)
+	}
+	if _, err := st1.Write([]byte("0rtt-payload")); err != nil {
+		t.Fatalf("0-RTT write before SYNACK failed: %v", err)
+	}
+	_ = st1.Close()
+
+	// Drain stream 1 SYN + PSH + FIN; ensure PSH arrived immediately.
+	sawPSH := false
+	deadline := time.After(2 * time.Second)
+	for !sawPSH {
+		select {
+		case f := <-peerFrames:
+			if f.Command == CmdPSH && f.StreamID == 1 && string(f.Data) == "0rtt-payload" {
+				sawPSH = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for 0-RTT PSH payload")
+		}
+	}
+
+	st2, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("fast-open stream 2 failed: %v", err)
+	}
+	defer st2.Close()
+
+	var buf [16]byte
+	_, err = st2.Read(buf[:])
+	if !errors.Is(err, ErrStreamRejected) {
+		t.Fatalf("late rejected fast-open stream read err = %v, want ErrStreamRejected", err)
+	}
+}
+
+func TestStreamRingRecvQueueWrapAroundAndPoolRecycle(t *testing.T) {
+	stream := newStream(1, NewSession(&testReadWriteCloser{}, 1))
+	stream.setMaxRecvBytes(4 << 20)
+
+	const totalChunks = 64
+	var want []byte
+	for i := 0; i < totalChunks; i++ {
+		msg := bytes.Repeat([]byte{byte('A' + i%26)}, 3000)
+		want = append(want, msg...)
+		bufp, pooled := getRecvPayloadBuf(len(msg))
+		copy(pooled, msg)
+		if err := stream.deliverDataPooled(pooled, bufp); err != nil {
+			t.Fatalf("deliver chunk %d: %v", i, err)
+		}
+	}
+	stream.closeByRemote(nil)
+
+	got := make([]byte, 0, len(want))
+	tmp := make([]byte, 1000) // partial reads exercise recvLeftChunk recycling
+	for {
+		n, err := stream.Read(tmp)
+		if n > 0 {
+			got = append(got, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ring recv mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}

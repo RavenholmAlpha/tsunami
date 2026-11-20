@@ -10,15 +10,20 @@ import (
 )
 
 const (
-	// DefaultStreamWindow is the default per-stream sliding flow-control window (1 MiB).
-	DefaultStreamWindow = 1 << 20
-	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (2 MiB).
-	DefaultMaxStreamRecvBytes = 2 << 20
+	// DefaultStreamWindow is the default per-stream sliding flow-control window (2 MiB).
+	DefaultStreamWindow = 2 << 20
+	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (4 MiB).
+	DefaultMaxStreamRecvBytes = 4 << 20
 
 	minStreamWindow = 64 << 10
-	maxStreamWindow = 4 << 20
+	maxStreamWindow = 8 << 20
 	maxWriteBatch   = 256 << 10
 )
+
+type recvChunk struct {
+	data    []byte
+	poolBuf *[]byte
+}
 
 // ClampStreamWindow bounds an advertised per-stream receive window into a safe range.
 func ClampStreamWindow(window int) int {
@@ -40,15 +45,17 @@ type Stream struct {
 	session  *Session
 	priority uint8
 
-	// Receive side: non-blocking bounded queue so RunEventLoop never stalls on a slow consumer.
-	recvMu       sync.Mutex
-	recvQueue    [][]byte
-	recvBytes    int
-	maxRecvBytes int
-	recvEOF      bool
-	recvErr      error
-	readNotify   chan struct{}
-	readLeft     []byte // leftover from partial reads
+	// Receive side: non-blocking bounded ring queue so RunEventLoop never stalls on a slow consumer.
+	recvMu        sync.Mutex
+	recvRing      []recvChunk
+	recvHead      int
+	recvCount     int
+	recvBytes     int
+	maxRecvBytes  int
+	recvEOF       bool
+	recvErr       error
+	readNotify    chan struct{}
+	recvLeftChunk recvChunk // leftover from partial reads
 
 	// Open / close lifecycle.
 	doneCh      chan struct{} // closed when stream is done, unblocks reads and writers
@@ -57,13 +64,12 @@ type Stream struct {
 	readBufOnce sync.Once
 
 	// Per-stream sliding-window flow control (when negotiated).
-	flowControl           bool
+	flowControl           atomic.Bool
 	sendMu                sync.Mutex
 	sendWindow            int64
 	sendWinNotify         chan struct{}
-	unackedMu             sync.Mutex
-	unackedRead           int64
-	windowUpdateThreshold int64
+	unackedRead           atomic.Int64
+	windowUpdateThreshold atomic.Int64
 
 	// State.
 	closed      atomic.Bool
@@ -97,17 +103,15 @@ func (s *Stream) initFlowControl(localWindow, remoteWindow int) {
 		remoteWindow = DefaultStreamWindow
 	}
 	s.sendMu.Lock()
-	s.flowControl = true
 	s.sendWindow = int64(remoteWindow)
+	s.flowControl.Store(true)
 	s.sendMu.Unlock()
 
 	thresh := int64(localWindow) / 4
 	if thresh < 1 {
 		thresh = 1
 	}
-	s.unackedMu.Lock()
-	s.windowUpdateThreshold = thresh
-	s.unackedMu.Unlock()
+	s.windowUpdateThreshold.Store(thresh)
 
 	capLimit := localWindow * 2
 	if capLimit < DefaultMaxStreamRecvBytes {
@@ -171,9 +175,13 @@ func (s *Stream) ID() uint32 {
 
 // Read reads data from the stream, implementing io.Reader.
 func (s *Stream) Read(p []byte) (int, error) {
-	if len(s.readLeft) > 0 {
-		n := copy(p, s.readLeft)
-		s.readLeft = s.readLeft[n:]
+	if len(s.recvLeftChunk.data) > 0 {
+		n := copy(p, s.recvLeftChunk.data)
+		s.recvLeftChunk.data = s.recvLeftChunk.data[n:]
+		if len(s.recvLeftChunk.data) == 0 && s.recvLeftChunk.poolBuf != nil {
+			putRecvPayloadBuf(s.recvLeftChunk.poolBuf)
+			s.recvLeftChunk.poolBuf = nil
+		}
 		s.bytesRead.Add(int64(n))
 		s.maybeSendWindowUpdate(n)
 		return n, nil
@@ -185,14 +193,9 @@ func (s *Stream) Read(p []byte) (int, error) {
 			s.recvMu.Unlock()
 			return 0, ErrStreamClosed
 		}
-		if len(s.recvQueue) > 0 {
-			chunk := s.recvQueue[0]
-			s.recvQueue[0] = nil
-			s.recvQueue = s.recvQueue[1:]
-			if len(s.recvQueue) == 0 {
-				s.recvQueue = nil
-			}
-			s.recvBytes -= len(chunk)
+		if s.recvCount > 0 {
+			chunk := s.popRecvLocked()
+			s.recvBytes -= len(chunk.data)
 			s.recvMu.Unlock()
 
 			n := s.consumeReadData(p, chunk)
@@ -217,36 +220,59 @@ func (s *Stream) Read(p []byte) (int, error) {
 	}
 }
 
-func (s *Stream) consumeReadData(p []byte, data []byte) int {
-	n := copy(p, data)
-	if n < len(data) {
-		s.readLeft = data[n:]
+func (s *Stream) pushRecvLocked(ch recvChunk) {
+	if s.recvCount == len(s.recvRing) {
+		newCap := len(s.recvRing) * 2
+		if newCap < 16 {
+			newCap = 16
+		}
+		newRing := make([]recvChunk, newCap)
+		for i := 0; i < s.recvCount; i++ {
+			newRing[i] = s.recvRing[(s.recvHead+i)%len(s.recvRing)]
+		}
+		s.recvRing = newRing
+		s.recvHead = 0
+	}
+	tail := (s.recvHead + s.recvCount) % len(s.recvRing)
+	s.recvRing[tail] = ch
+	s.recvCount++
+}
+
+func (s *Stream) popRecvLocked() recvChunk {
+	ch := s.recvRing[s.recvHead]
+	s.recvRing[s.recvHead] = recvChunk{}
+	s.recvHead = (s.recvHead + 1) % len(s.recvRing)
+	s.recvCount--
+	if s.recvCount == 0 {
+		s.recvHead = 0
+	}
+	return ch
+}
+
+func (s *Stream) consumeReadData(p []byte, chunk recvChunk) int {
+	n := copy(p, chunk.data)
+	if n < len(chunk.data) {
+		s.recvLeftChunk = recvChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
+	} else if chunk.poolBuf != nil {
+		putRecvPayloadBuf(chunk.poolBuf)
 	}
 	s.bytesRead.Add(int64(n))
 	return n
 }
 
 func (s *Stream) maybeSendWindowUpdate(consumed int) {
-	if consumed <= 0 || s.closed.Load() {
+	if consumed <= 0 || s.closed.Load() || !s.flowControl.Load() {
 		return
 	}
 
-	s.sendMu.Lock()
-	fc := s.flowControl
-	s.sendMu.Unlock()
-	if !fc {
+	cur := s.unackedRead.Add(int64(consumed))
+	if cur < s.windowUpdateThreshold.Load() {
 		return
 	}
-
-	s.unackedMu.Lock()
-	s.unackedRead += int64(consumed)
-	if s.unackedRead < s.windowUpdateThreshold {
-		s.unackedMu.Unlock()
+	delta := s.unackedRead.Swap(0)
+	if delta <= 0 {
 		return
 	}
-	delta := s.unackedRead
-	s.unackedRead = 0
-	s.unackedMu.Unlock()
 
 	for delta > 0 {
 		step := delta
@@ -277,11 +303,11 @@ func (s *Stream) addSendWindow(delta int64) {
 }
 
 func (s *Stream) acquireSendWindow(want int) (enabled bool, grant int) {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	if !s.flowControl {
+	if !s.flowControl.Load() {
 		return false, want
 	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	if s.sendWindow <= 0 {
 		return true, 0
 	}
@@ -307,11 +333,17 @@ func (s *Stream) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	direct := s.session.canWritePSHDirect()
 	fc, grant := s.acquireSendWindow(len(p))
 	if !fc {
 		// Legacy / flow-control-disabled path: batch all frames in a single write.
-		frames := buildPSHFrames(s.id, p)
-		if err := s.session.writeFrames(frames); err != nil {
+		var err error
+		if direct {
+			err = s.session.writePSHData(s.id, p)
+		} else {
+			err = s.session.writeFrames(buildPSHFrames(s.id, p))
+		}
+		if err != nil {
 			return 0, err
 		}
 		s.bytesWritten.Add(int64(len(p)))
@@ -334,8 +366,13 @@ func (s *Stream) Write(p []byte) (int, error) {
 		}
 
 		chunk := p[off : off+grant]
-		frames := buildPSHFrames(s.id, chunk)
-		if err := s.session.writeFrames(frames); err != nil {
+		var err error
+		if direct {
+			err = s.session.writePSHData(s.id, chunk)
+		} else {
+			err = s.session.writeFrames(buildPSHFrames(s.id, chunk))
+		}
+		if err != nil {
 			return off, err
 		}
 		off += grant
@@ -375,7 +412,13 @@ func (s *Stream) Close() error {
 
 	s.recvMu.Lock()
 	s.recvEOF = true
-	s.recvQueue = nil
+	for s.recvCount > 0 {
+		ch := s.popRecvLocked()
+		putRecvPayloadBuf(ch.poolBuf)
+	}
+	s.recvRing = nil
+	s.recvHead = 0
+	s.recvCount = 0
 	s.recvBytes = 0
 	s.recvMu.Unlock()
 
@@ -392,24 +435,32 @@ func (s *Stream) Close() error {
 // It never blocks the session's RunEventLoop; if the per-stream hard buffer cap
 // is exceeded, it returns ErrStreamRecvOverflow so only this stream is closed.
 func (s *Stream) deliverData(data []byte) error {
+	return s.deliverDataPooled(data, nil)
+}
+
+func (s *Stream) deliverDataPooled(data []byte, poolBuf *[]byte) error {
 	if s.closed.Load() {
+		putRecvPayloadBuf(poolBuf)
 		return ErrStreamClosed
 	}
 
 	s.recvMu.Lock()
 	if s.recvEOF || s.localClosed.Load() || s.closed.Load() {
 		s.recvMu.Unlock()
+		putRecvPayloadBuf(poolBuf)
 		return ErrStreamClosed
 	}
 	if len(data) == 0 {
 		s.recvMu.Unlock()
+		putRecvPayloadBuf(poolBuf)
 		return nil
 	}
 	if s.maxRecvBytes > 0 && s.recvBytes+len(data) > s.maxRecvBytes {
 		s.recvMu.Unlock()
+		putRecvPayloadBuf(poolBuf)
 		return ErrStreamRecvOverflow
 	}
-	s.recvQueue = append(s.recvQueue, data)
+	s.pushRecvLocked(recvChunk{data: data, poolBuf: poolBuf})
 	s.recvBytes += len(data)
 	s.recvMu.Unlock()
 

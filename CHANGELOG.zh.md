@@ -9,6 +9,27 @@
 
 ## [未发布]
 
+## [1.5.0] - 2026-11-21
+
+### 新增
+- **0-RTT 极速开流（`SETTINGS` 协商 `fast-open=1`）**：向后兼容的会话能力协商，`Session.OpenStream` 发送 `CmdSYN` 后无需等待 `CmdSYNACK` 往返即可直接发出目标地址与首包应用数据，降低跨国高延迟链路下的首包延迟（TTFB）。
+- **RFC 6555 Happy Eyeballs 并发回退拨号**：`dialTarget` 对双栈解析结果交错排序并按 `250ms` 错峰并行拨号，避免单栈不通时串行卡顿。
+- **内置性能基准测试集**：新增覆盖 Fronting 认证/重放缓存/Deadline/Split-H2（`pkg/fronting`）、帧编解码/多路复用流吞吐与开流延迟（`pkg/protocol`）、流量整形（`pkg/shaping`）及 UoT 中继（`pkg/uot`）的永久基准测试。
+
+### 变更
+- **提升默认流控窗口与 Split-H2 上行流水线容量**：默认单流流控窗口提升至 `2 MiB`（上限 `8 MiB`，单流接收缓存上限 `4 MiB`），Split-H2 并发在途请求提升至 `12`，客户端发送环形缓冲 `2 MiB`、服务端乱序重组上限 `4 MiB`，改善高 BDP 跨国链路表现。
+- **全链路热路径 CPU 与内存分配优化**：
+  - `NonceCache` 将每次插入的 $O(N)$ 全表扫描优化为 $O(1)$ FIFO 环形队列，HTTP 前置签名/验签改用栈上直接 RFC 2104 HMAC-SHA256 与内联小写转换，显著减少堆逃逸。
+  - `HTTPClientConn`、`SplitH2ServerConn`、`SplitH2ClientConn` 复用 `time.Timer` 替代高频 `time.AfterFunc` 创建销毁。
+  - `SplitH2ServerConn`/`SplitH2ClientConn`、`shaping.Conn` 与 `protocol.Stream` 接收队列均改用环形缓冲配合 `sync.Pool` 复用，消除切片头部搬移与重复拷贝。
+  - 引入 `64 KiB` 缓冲帧读取器、三级接收缓冲池（`4 KiB` / `16 KiB` / `65535 B`）与 `CmdWaste` 零分配丢弃；新增 `padding.Writer.WritePSH` 直写快路径并复用序列化缓冲区；`RelayBufPool` 对齐 `MaxFrameDataLen`（`65535 B`）；`WINDOW_UPDATE` 与 `pkg/control` 计数/限速改用原子操作及读写锁+分桶锁；SOCKS5/HTTP 代理握手改用栈上缓冲读取。
+
+### 修复
+- **Traffic Shaping 与 Padding v2 握手边界串帧问题**：将 `padding.Writer` 绑定严格延后到 `SETTINGS` 协商与 `shaping.Wrap` 完成之后，避免握手阶段尾随的 `CmdWaste` 裸帧穿透进 `shaping.Conn.Read` 引发 `invalid frame` / 秒断 EOF；修复 `SetOnPaddingSchemeUpdate` 绑定到了旧 writer 以及 `Session.SetWriteDeadline` 重置覆盖 `shaping.Conn` 异步写超时的问题。
+- **UoT 中继关闭泄漏与短 NAT 超时节流 Bug**：修复流关闭后 `udpToStream` 最长阻塞 120 秒才退出的泄漏问题；将 `SetReadDeadline` 刷新步长改为 `min(1s, natTimeout/4)` 修复短 `natTimeout` 活跃期误超时；增加有界 DNS 解析缓存与基于 `netip.AddrPort` 的零拷贝回包封帧。
+- 修复 `NonceCache.Add` 惰性过期清理顺序，避免已过期 nonce 在后台清理触发前仍被误判为重放。
+- 修复 `HTTPProxyServer.handleConnect` 遗漏排空 `bufio.Reader` 预读缓冲字节的问题。
+
 ## [1.4.0] - 2026-11-20
 
 ### 新增

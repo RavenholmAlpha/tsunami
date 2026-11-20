@@ -1,7 +1,6 @@
 package fronting
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -9,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -35,10 +33,18 @@ const (
 	defaultNonceCacheMaxEntries = 1 << 17
 )
 
-// NonceCache tracks recently seen nonces to prevent replay attacks.
+type nonceRecord struct {
+	key        string
+	insertedAt time.Time
+}
+
+// NonceCache tracks recently seen nonces to prevent replay attacks in O(1) amortized time.
 type NonceCache struct {
 	mu         sync.Mutex
 	entries    map[string]time.Time
+	ring       []nonceRecord
+	ringHead   int
+	ringLen    int
 	ttl        time.Duration
 	maxEntries int
 }
@@ -59,37 +65,84 @@ func NewNonceCache(ttl time.Duration) *NonceCache {
 func (nc *NonceCache) Add(nonce string) bool {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
-	if _, exists := nc.entries[nonce]; exists {
-		return false
+	now := time.Now()
+	nc.pruneLocked(now)
+	if exp, exists := nc.entries[nonce]; exists {
+		if !exp.Before(now.Add(-nc.ttl)) {
+			return false
+		}
+		delete(nc.entries, nonce)
 	}
-	nc.pruneLocked(time.Now())
-	if nc.maxEntries > 0 && len(nc.entries) >= nc.maxEntries {
-		nc.evictOldestLocked(nc.maxEntries / 8)
+	if nc.maxEntries > 0 {
+		for len(nc.entries) >= nc.maxEntries {
+			if !nc.popOldestLocked() {
+				for k := range nc.entries {
+					delete(nc.entries, k)
+					break
+				}
+			}
+		}
 	}
-	nc.entries[nonce] = time.Now()
+	nc.entries[nonce] = now
+	nc.pushRingLocked(nonce, now)
 	return true
 }
 
-// pruneLocked removes expired entries. nc.mu must be held.
-func (nc *NonceCache) pruneLocked(now time.Time) {
-	cutoff := now.Add(-nc.ttl)
-	for k, t := range nc.entries {
-		if t.Before(cutoff) {
-			delete(nc.entries, k)
+func (nc *NonceCache) pushRingLocked(nonce string, now time.Time) {
+	if nc.ringLen == len(nc.ring) {
+		newCap := len(nc.ring) * 2
+		if newCap < 64 {
+			newCap = 64
 		}
+		if nc.maxEntries > 0 && newCap > nc.maxEntries {
+			newCap = nc.maxEntries
+		}
+		if newCap <= len(nc.ring) {
+			newCap = len(nc.ring) + 1
+		}
+		newRing := make([]nonceRecord, newCap)
+		for i := 0; i < nc.ringLen; i++ {
+			newRing[i] = nc.ring[(nc.ringHead+i)%len(nc.ring)]
+		}
+		nc.ring = newRing
+		nc.ringHead = 0
 	}
+	tail := (nc.ringHead + nc.ringLen) % len(nc.ring)
+	nc.ring[tail] = nonceRecord{key: nonce, insertedAt: now}
+	nc.ringLen++
 }
 
-func (nc *NonceCache) evictOldestLocked(count int) {
-	if count < 1 {
-		count = 1
+func (nc *NonceCache) popOldestLocked() bool {
+	if nc.ringLen == 0 {
+		return false
 	}
-	for k := range nc.entries {
-		if count == 0 {
+	rec := nc.ring[nc.ringHead]
+	nc.ring[nc.ringHead] = nonceRecord{}
+	nc.ringHead = (nc.ringHead + 1) % len(nc.ring)
+	nc.ringLen--
+	if exp, ok := nc.entries[rec.key]; ok && exp.Equal(rec.insertedAt) {
+		delete(nc.entries, rec.key)
+	}
+	return true
+}
+
+// pruneLocked removes expired entries from the head of the FIFO ring in O(1) amortized time.
+// nc.mu must be held.
+func (nc *NonceCache) pruneLocked(now time.Time) {
+	cutoff := now.Add(-nc.ttl)
+	for nc.ringLen > 0 {
+		head := nc.ring[nc.ringHead]
+		if !head.insertedAt.Before(cutoff) {
 			break
 		}
-		delete(nc.entries, k)
-		count--
+		nc.popOldestLocked()
+	}
+	if nc.ringLen == 0 && len(nc.entries) > 0 {
+		for k, t := range nc.entries {
+			if t.Before(cutoff) {
+				delete(nc.entries, k)
+			}
+		}
 	}
 }
 
@@ -129,8 +182,10 @@ func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
 	req.Header.Set(headerVersion, authVersion)
 	req.Header.Set(headerDate, ts)
 	req.Header.Set(headerNonce, nonce)
-	sig := computeMAC(req.Method, req.URL.EscapedPath(), req.Host, ts, nonce, sid, seq, key)
-	req.Header.Set(headerAuth, "HMAC-SHA256 Signature="+sig)
+	sum := computeMACBytes(req.Method, req.URL.EscapedPath(), req.Host, ts, nonce, sid, seq, key)
+	var hexSig [sha256.Size * 2]byte
+	hex.Encode(hexSig[:], sum[:])
+	req.Header.Set(headerAuth, "HMAC-SHA256 Signature="+string(hexSig[:]))
 	return nil
 }
 
@@ -149,8 +204,16 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	if ts == "" || nonce == "" || authHeader == "" {
 		return false
 	}
-	got := strings.TrimPrefix(authHeader, "HMAC-SHA256 Signature=")
-	if got == authHeader {
+	const sigPrefix = "HMAC-SHA256 Signature="
+	if len(authHeader) <= len(sigPrefix) || authHeader[:len(sigPrefix)] != sigPrefix {
+		return false
+	}
+	got := authHeader[len(sigPrefix):]
+	if len(got) != sha256.Size*2 {
+		return false
+	}
+	var gotMAC [sha256.Size]byte
+	if !decodeHex32(got, &gotMAC) {
 		return false
 	}
 	if len(nonce) < 16 || len(nonce) > 128 {
@@ -164,17 +227,11 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	if when.After(now.Add(skew)) || when.Before(now.Add(-skew)) {
 		return false
 	}
-	if _, err := hex.DecodeString(got); err != nil {
-		return false
-	}
 
 	sid := req.Header.Get(HeaderSessionID)
 	seq := req.Header.Get(HeaderStreamSeq)
 	if sid != "" {
-		if len(sid) < 16 || len(sid) > 64 {
-			return false
-		}
-		if _, err := hex.DecodeString(sid); err != nil {
+		if len(sid) < 16 || len(sid) > 64 || len(sid)%2 != 0 || !isHexString(sid) {
 			return false
 		}
 	}
@@ -194,8 +251,8 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 
 	valid := false
 	for _, key := range keys {
-		want := computeMAC(req.Method, requestPath, req.Host, ts, nonce, sid, seq, key)
-		if subtle.ConstantTimeCompare([]byte(strings.ToLower(got)), []byte(want)) == 1 {
+		want := computeMACBytes(req.Method, requestPath, req.Host, ts, nonce, sid, seq, key)
+		if subtle.ConstantTimeCompare(gotMAC[:], want[:]) == 1 {
 			valid = true
 			break
 		}
@@ -212,14 +269,97 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	return true
 }
 
-func computeMAC(method, requestPath, host, ts, nonce, sid, seq string, key [32]byte) string {
-	mac := hmac.New(sha256.New, key[:])
-	if sid == "" && seq == "" {
-		fmt.Fprintf(mac, "%s\n%s\n%s\n%s\n%s", method, requestPath, strings.ToLower(host), ts, nonce)
-	} else {
-		fmt.Fprintf(mac, "%s\n%s\n%s\n%s\n%s\n%s\n%s", method, requestPath, strings.ToLower(host), ts, nonce, sid, seq)
+func computeMACBytes(method, requestPath, host, ts, nonce, sid, seq string, key [32]byte) [sha256.Size]byte {
+	need := len(method) + 1 + len(requestPath) + 1 + len(host) + 1 + len(ts) + 1 + len(nonce)
+	hasSplit := sid != "" || seq != ""
+	if hasSplit {
+		need += 2 + len(sid) + len(seq)
 	}
-	return hex.EncodeToString(mac.Sum(nil))
+
+	var innerStack [sha256.BlockSize + 512]byte
+	var inner []byte
+	if sha256.BlockSize+need <= len(innerStack) {
+		inner = innerStack[:sha256.BlockSize]
+	} else {
+		inner = make([]byte, sha256.BlockSize, sha256.BlockSize+need)
+	}
+	for i := 0; i < len(key); i++ {
+		inner[i] = key[i] ^ 0x36
+	}
+	for i := len(key); i < sha256.BlockSize; i++ {
+		inner[i] = 0x36
+	}
+
+	inner = append(inner, method...)
+	inner = append(inner, '\n')
+	inner = append(inner, requestPath...)
+	inner = append(inner, '\n')
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		inner = append(inner, c)
+	}
+	inner = append(inner, '\n')
+	inner = append(inner, ts...)
+	inner = append(inner, '\n')
+	inner = append(inner, nonce...)
+	if hasSplit {
+		inner = append(inner, '\n')
+		inner = append(inner, sid...)
+		inner = append(inner, '\n')
+		inner = append(inner, seq...)
+	}
+
+	innerSum := sha256.Sum256(inner)
+
+	var outer [sha256.BlockSize + sha256.Size]byte
+	for i := 0; i < len(key); i++ {
+		outer[i] = key[i] ^ 0x5c
+	}
+	for i := len(key); i < sha256.BlockSize; i++ {
+		outer[i] = 0x5c
+	}
+	copy(outer[sha256.BlockSize:], innerSum[:])
+	return sha256.Sum256(outer[:])
+}
+
+func decodeHexNibble(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func isHexString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if _, ok := decodeHexNibble(s[i]); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeHex32(s string, dst *[sha256.Size]byte) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < sha256.Size; i++ {
+		hi, ok1 := decodeHexNibble(s[i*2])
+		lo, ok2 := decodeHexNibble(s[i*2+1])
+		if !ok1 || !ok2 {
+			return false
+		}
+		dst[i] = (hi << 4) | lo
+	}
+	return true
 }
 
 func randomNonce() (string, error) {

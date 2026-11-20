@@ -2,10 +2,12 @@ package uot
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,5 +92,152 @@ func TestRelay_resolve(t *testing.T) {
 	}
 	if !allowedTargets["10.0.0.1:80"] {
 		t.Error("10.0.0.1:80 should have been allowed")
+	}
+}
+
+func TestRelayInstantCloseAndResolveCaching(t *testing.T) {
+	echoConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoConn.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := echoConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echoConn.WriteToUDP(buf[:n], addr)
+		}
+	}()
+
+	echoPort := echoConn.LocalAddr().(*net.UDPAddr).Port
+	c2sR, c2sW := io.Pipe()
+	s2cR, s2cW := io.Pipe()
+
+	var resolveCalls atomic.Int32
+	relay := NewRelay(&duplexStreamForTest{r: c2sR, w: s2cW}, func(target string) (*net.UDPAddr, error) {
+		resolveCalls.Add(1)
+		return net.ResolveUDPAddr("udp", target)
+	})
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- relay.Run()
+	}()
+
+	// Send 5 packets to the same target; resolve should be called only once.
+	var pkt bytes.Buffer
+	pkt.WriteByte(protocol.AtypIPv4)
+	pkt.Write([]byte{127, 0, 0, 1})
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(echoPort))
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(4))
+	pkt.WriteString("ping")
+
+	resp := make([]byte, 9+4)
+	for i := 0; i < 5; i++ {
+		if _, err := c2sW.Write(pkt.Bytes()); err != nil {
+			t.Fatalf("write pkt %d: %v", i, err)
+		}
+		if _, err := io.ReadFull(s2cR, resp); err != nil {
+			t.Fatalf("read resp %d: %v", i, err)
+		}
+		if string(resp[9:]) != "ping" {
+			t.Fatalf("reply = %q, want ping", resp[9:])
+		}
+	}
+	if got := resolveCalls.Load(); got != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (cached)", got)
+	}
+
+	// Closing client uplink must stop Run() immediately rather than waiting 120s.
+	_ = c2sW.Close()
+	_ = s2cR.Close()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Relay.Run returned error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Relay.Run did not exit promptly after stream EOF (120s leak)")
+	}
+}
+
+type duplexStreamForTest struct {
+	r io.ReadCloser
+	w io.WriteCloser
+}
+
+func (d *duplexStreamForTest) Read(p []byte) (int, error)  { return d.r.Read(p) }
+func (d *duplexStreamForTest) Write(p []byte) (int, error) { return d.w.Write(p) }
+func (d *duplexStreamForTest) Close() error {
+	_ = d.r.Close()
+	return d.w.Close()
+}
+
+func TestRelayShortNATTimeoutStaysAliveUnderTraffic(t *testing.T) {
+	echoAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	echoConn, err := net.ListenUDP("udp", echoAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoConn.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := echoConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echoConn.WriteToUDP(buf[:n], addr)
+		}
+	}()
+
+	echoPort := echoConn.LocalAddr().(*net.UDPAddr).Port
+	c2sR, c2sW := io.Pipe()
+	s2cR, s2cW := io.Pipe()
+	relay := NewRelay(&duplexStreamForTest{r: c2sR, w: s2cW}, func(target string) (*net.UDPAddr, error) {
+		return net.ResolveUDPAddr("udp", target)
+	})
+	relay.natTimeout = 150 * time.Millisecond
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- relay.Run()
+	}()
+
+	var pkt bytes.Buffer
+	pkt.WriteByte(protocol.AtypIPv4)
+	pkt.Write([]byte{127, 0, 0, 1})
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(echoPort))
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(4))
+	pkt.WriteString("pong")
+
+	resp := make([]byte, 9+4)
+	for i := 0; i < 6; i++ {
+		if i > 0 {
+			time.Sleep(40 * time.Millisecond)
+		}
+		if _, err := c2sW.Write(pkt.Bytes()); err != nil {
+			t.Fatalf("write pkt %d: %v", i, err)
+		}
+		if _, err := io.ReadFull(s2cR, resp); err != nil {
+			t.Fatalf("read resp %d: %v", i, err)
+		}
+		if string(resp[9:]) != "pong" {
+			t.Fatalf("reply %d = %q, want pong", i, resp[9:])
+		}
+	}
+
+	_ = c2sW.Close()
+	_ = s2cR.Close()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Relay.Run returned error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Relay.Run did not exit promptly after EOF")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
@@ -138,15 +139,21 @@ type UsageDelta struct {
 	DownloadBytes int64
 }
 
+type usageCounter struct {
+	userID        string
+	uploadBytes   atomic.Int64
+	downloadBytes atomic.Int64
+}
+
 // UsageTracker accumulates per-user usage deltas for panel reporting.
 type UsageTracker struct {
-	mu     sync.Mutex
-	deltas map[string]*UsageDelta
+	mu     sync.RWMutex
+	deltas map[string]*usageCounter
 }
 
 // NewUsageTracker creates an empty usage tracker.
 func NewUsageTracker() *UsageTracker {
-	return &UsageTracker{deltas: make(map[string]*UsageDelta)}
+	return &UsageTracker{deltas: make(map[string]*usageCounter)}
 }
 
 // Record records usage for one user.
@@ -156,21 +163,33 @@ func (t *UsageTracker) Record(user *protocol.UserInfo, direction Direction, n in
 	}
 
 	key := user.Identity()
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delta := t.deltas[key]
-	if delta == nil {
-		delta = &UsageDelta{UserID: key}
-		t.deltas[key] = delta
+	t.mu.RLock()
+	counter := t.deltas[key]
+	if counter != nil {
+		switch direction {
+		case DirectionUpload:
+			counter.uploadBytes.Add(int64(n))
+		case DirectionDownload:
+			counter.downloadBytes.Add(int64(n))
+		}
+		t.mu.RUnlock()
+		return
 	}
+	t.mu.RUnlock()
 
+	t.mu.Lock()
+	counter = t.deltas[key]
+	if counter == nil {
+		counter = &usageCounter{userID: key}
+		t.deltas[key] = counter
+	}
 	switch direction {
 	case DirectionUpload:
-		delta.UploadBytes += int64(n)
+		counter.uploadBytes.Add(int64(n))
 	case DirectionDownload:
-		delta.DownloadBytes += int64(n)
+		counter.downloadBytes.Add(int64(n))
 	}
+	t.mu.Unlock()
 }
 
 // Snapshot returns current deltas without resetting them.
@@ -178,8 +197,8 @@ func (t *UsageTracker) Snapshot() []UsageDelta {
 	if t == nil {
 		return nil
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return cloneUsageDeltas(t.deltas)
 }
 
@@ -189,10 +208,9 @@ func (t *UsageTracker) SnapshotAndReset() []UsageDelta {
 		return nil
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	deltas := cloneUsageDeltas(t.deltas)
-	t.deltas = make(map[string]*UsageDelta)
+	t.deltas = make(map[string]*usageCounter)
+	t.mu.Unlock()
 	return deltas
 }
 
@@ -211,21 +229,25 @@ func (t *UsageTracker) Restore(deltas []UsageDelta) {
 		}
 		current := t.deltas[delta.UserID]
 		if current == nil {
-			current = &UsageDelta{UserID: delta.UserID}
+			current = &usageCounter{userID: delta.UserID}
 			t.deltas[delta.UserID] = current
 		}
-		current.UploadBytes += delta.UploadBytes
-		current.DownloadBytes += delta.DownloadBytes
+		current.uploadBytes.Add(delta.UploadBytes)
+		current.downloadBytes.Add(delta.DownloadBytes)
 	}
 }
 
-func cloneUsageDeltas(source map[string]*UsageDelta) []UsageDelta {
+func cloneUsageDeltas(source map[string]*usageCounter) []UsageDelta {
 	deltas := make([]UsageDelta, 0, len(source))
-	for _, delta := range source {
-		if delta == nil {
+	for _, counter := range source {
+		if counter == nil {
 			continue
 		}
-		deltas = append(deltas, *delta)
+		deltas = append(deltas, UsageDelta{
+			UserID:        counter.userID,
+			UploadBytes:   counter.uploadBytes.Load(),
+			DownloadBytes: counter.downloadBytes.Load(),
+		})
 	}
 	sort.Slice(deltas, func(i, j int) bool {
 		return deltas[i].UserID < deltas[j].UserID
@@ -234,15 +256,16 @@ func cloneUsageDeltas(source map[string]*UsageDelta) []UsageDelta {
 }
 
 type limiterBucket struct {
+	mu     sync.Mutex
 	rate   float64
 	burst  float64
 	tokens float64
 	last   time.Time
 }
 
-// UserLimiter is a simple per-user global token-bucket limiter.
+// UserLimiter is a per-user token-bucket limiter with per-user lock granularity.
 type UserLimiter struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	buckets map[string]*limiterBucket
 }
 
@@ -282,25 +305,44 @@ func (l *UserLimiter) Wait(ctx context.Context, user *protocol.UserInfo, directi
 }
 
 func (l *UserLimiter) reserve(key string, rateBps int64, n int) time.Duration {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	now := time.Now()
 	rate := float64(rateBps)
-	burst := rate
-	if burst < 64*1024 {
-		burst = 64 * 1024
+	l.mu.RLock()
+	bucket := l.buckets[key]
+	l.mu.RUnlock()
+
+	if bucket == nil {
+		now := time.Now()
+		burst := rate
+		if burst < 64*1024 {
+			burst = 64 * 1024
+		}
+		l.mu.Lock()
+		bucket = l.buckets[key]
+		if bucket == nil {
+			bucket = &limiterBucket{
+				rate:   rate,
+				burst:  burst,
+				tokens: burst,
+				last:   now,
+			}
+			l.buckets[key] = bucket
+		}
+		l.mu.Unlock()
 	}
 
-	bucket := l.buckets[key]
-	if bucket == nil || bucket.rate != rate {
-		bucket = &limiterBucket{
-			rate:   rate,
-			burst:  burst,
-			tokens: burst,
-			last:   now,
+	now := time.Now()
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+
+	if bucket.rate != rate {
+		burst := rate
+		if burst < 64*1024 {
+			burst = 64 * 1024
 		}
-		l.buckets[key] = bucket
+		bucket.rate = rate
+		bucket.burst = burst
+		bucket.tokens = burst
+		bucket.last = now
 	}
 
 	elapsed := now.Sub(bucket.last).Seconds()

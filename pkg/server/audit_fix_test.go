@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
+	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestPrivateTargetPolicyCoversReservedRanges(t *testing.T) {
@@ -52,5 +55,45 @@ func TestDialTargetBlocksPrivateLiteral(t *testing.T) {
 	allowAll := &Server{config: Config{AllowAll: true}}
 	if _, err := allowAll.dialTarget(context.Background(), "127.0.0.1:1"); errors.Is(err, errBlockedTarget) {
 		t.Fatalf("allow-all dial was blocked by policy: %v", err)
+	}
+}
+
+func TestDialHappyEyeballsFastFallback(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	// RFC5737 TEST-NET-1 (192.0.2.1) either fails fast or drops packets; stagger
+	// 50ms ensures working 127.0.0.1 wins well under 1s instead of waiting 10s.
+	addrs := interleaveAddresses([]netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("127.0.0.1"),
+	})
+	start := time.Now()
+	conn, err := dialHappyEyeballs(context.Background(), addrs, port, 50*time.Millisecond, 3*time.Second)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("dialHappyEyeballs failed: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case sc := <-accepted:
+		_ = sc.Close()
+	case <-time.After(time.Second):
+		t.Fatal("listener did not accept connection")
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("Happy Eyeballs fallback took too long: %v", elapsed)
 	}
 }

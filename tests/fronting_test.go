@@ -23,6 +23,7 @@ import (
 	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
 	"github.com/tsunami-protocol/tsunami/pkg/server"
+	"github.com/tsunami-protocol/tsunami/pkg/shaping"
 	"github.com/tsunami-protocol/tsunami/pkg/surge"
 	"github.com/tsunami-protocol/tsunami/pkg/transport"
 	utls "github.com/refraction-networking/utls"
@@ -1081,5 +1082,109 @@ func TestFrontingPQCurveNegotiatedWithUTLSChrome(t *testing.T) {
 	}
 	if state.NegotiatedProtocol != "h2" {
 		t.Fatalf("ALPN = %q, want h2", state.NegotiatedProtocol)
+	}
+}
+
+func TestTrafficShapingEndToEnd(t *testing.T) {
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+
+	shCfg := shaping.DefaultConfig()
+	shCfg.IdleChaffMaxInterval = 0
+
+	modes := []struct {
+		name     string
+		fronting bool
+	}{
+		{name: "split-h2", fronting: true},
+		{name: "raw-tls", fronting: false},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := reserveTCPAddr(t)
+			srvCfg := server.Config{
+				Listen: addr,
+				TLS: transport.TLSConfig{
+					ALPN:       []string{"h2", "http/1.1"},
+					MinVersion: tls.VersionTLS12,
+				},
+				TCP: *transport.DefaultTCPConfig(),
+				Users: []*protocol.UserInfo{
+					{Name: "shaping-user", Password: testPassword},
+				},
+				SurgeMode: string(surge.ModeNone),
+				Shaping:   &shCfg,
+				AllowAll:  true,
+			}
+			if tc.fronting {
+				srvCfg.Fronting = fronting.Config{
+					Enabled:  true,
+					Path:     "/assets/update",
+					SiteName: "Shaping Front Site",
+				}
+			}
+
+			srv, err := server.New(srvCfg)
+			if err != nil {
+				t.Fatalf("server.New: %v", err)
+			}
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.Start() }()
+			waitTCP(t, addr)
+			defer func() {
+				_ = srv.Close()
+				select {
+				case <-errCh:
+				case <-time.After(2 * time.Second):
+				}
+			}()
+
+			// Run 3 independent sessions so default Padding v2 control-frame
+			// randomization exercises multiple pad-to boundaries under shaping.
+			payload := bytes.Repeat([]byte("S"), 128*1024)
+			for sessIdx := 0; sessIdx < 3; sessIdx++ {
+				cliCfg := frontingClientConfig(addr, fronting.TransportH2)
+				cliCfg.Fronting.Enabled = tc.fronting
+				cliCfg.Shaping = &shCfg
+
+				c, err := client.New(cliCfg)
+				if err != nil {
+					t.Fatalf("session %d client.New: %v", sessIdx, err)
+				}
+
+				for streamIdx := 0; streamIdx < 2; streamIdx++ {
+					stream, err := c.OpenStream(echoAddr)
+					if err != nil {
+						_ = c.Close()
+						t.Fatalf("session %d stream %d OpenStream: %v", sessIdx, streamIdx, err)
+					}
+					writeErrCh := make(chan error, 1)
+					go func(st *protocol.Stream) {
+						_, werr := st.Write(payload)
+						writeErrCh <- werr
+					}(stream)
+
+					got := make([]byte, len(payload))
+					if _, err := io.ReadFull(stream, got); err != nil {
+						_ = stream.Close()
+						_ = c.Close()
+						t.Fatalf("session %d stream %d ReadFull: %v", sessIdx, streamIdx, err)
+					}
+					if werr := <-writeErrCh; werr != nil {
+						_ = stream.Close()
+						_ = c.Close()
+						t.Fatalf("session %d stream %d Write: %v", sessIdx, streamIdx, werr)
+					}
+					if !bytes.Equal(got, payload) {
+						_ = stream.Close()
+						_ = c.Close()
+						t.Fatalf("session %d stream %d echo mismatch", sessIdx, streamIdx)
+					}
+					_ = stream.Close()
+				}
+				_ = c.Close()
+			}
+		})
 	}
 }

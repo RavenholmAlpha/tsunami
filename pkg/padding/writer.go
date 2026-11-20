@@ -37,12 +37,14 @@ type Writer struct {
 	role   Role
 	fw     *protocol.FrameWriter
 
-	mu       sync.Mutex
-	ctlIdx   int   // control-bucket write counter (PacketIndex)
-	ctlBytes int64 // bytes written for control writes (observability)
-	streams  map[uint32]*streamState
-	nextSeq  uint64
-	rawBuf   []byte // reusable encoding buffer for unpadded frame writes
+	mu           sync.Mutex
+	ctlIdx       int   // control-bucket write counter (PacketIndex)
+	ctlBytes     int64 // bytes written for control writes (observability)
+	streams      map[uint32]*streamState
+	nextSeq      uint64
+	rawBuf       []byte // reusable encoding buffer for unpadded frame writes
+	serializeBuf []byte // reusable serialization buffer for padded writes
+	padBuf       []byte // reusable pad-to assembly buffer
 }
 
 // NewWriter creates a new padding-aware writer for the client role.
@@ -119,6 +121,65 @@ func (pw *Writer) WriteFramesWithPadding(frames []*protocol.Frame) error {
 	return pw.writeControlLocked(frames)
 }
 
+// WritePSH writes raw stream payload bytes directly as CmdPSH frames without
+// allocating intermediate Frame objects on the fast unpadded path.
+func (pw *Writer) WritePSH(streamID uint32, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if streamID == 0 {
+		var frames [1]*protocol.Frame
+		var f protocol.Frame
+		for off := 0; off < len(data); {
+			n := len(data) - off
+			if n > protocol.MaxFrameDataLen {
+				n = protocol.MaxFrameDataLen
+			}
+			f = protocol.Frame{Command: protocol.CmdPSH, StreamID: streamID, Data: data[off : off+n]}
+			frames[0] = &f
+			if err := pw.WriteFramesWithPadding(frames[:]); err != nil {
+				return err
+			}
+			off += n
+		}
+		return nil
+	}
+
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	if pw.scheme == nil {
+		return pw.writePSHRawLocked(streamID, data)
+	}
+
+	state := pw.streams[streamID]
+	if state == nil {
+		pw.nextSeq++
+		state = &streamState{insertedAt: time.Now(), seq: pw.nextSeq}
+		pw.streams[streamID] = state
+		pw.pruneStreamsLocked()
+	}
+
+	idx := state.idx
+	state.idx++
+
+	var segments []Segment
+	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
+	}
+	if segments == nil {
+		if err := pw.writePSHRawLocked(streamID, data); err != nil {
+			return err
+		}
+		state.bytes += pshWireLen(len(data))
+		return nil
+	}
+
+	written, err := pw.applySegments(pw.serializePSHLocked(streamID, data), segments)
+	state.bytes += written
+	return err
+}
+
 // writeStreamLocked applies the per-stream epoch to a data write.
 func (pw *Writer) writeStreamLocked(frames []*protocol.Frame, id uint32) error {
 	state := pw.streams[id]
@@ -145,7 +206,7 @@ func (pw *Writer) writeStreamLocked(frames []*protocol.Frame, id uint32) error {
 		return nil
 	}
 
-	written, err := pw.applySegments(serializeFrames(frames), segments)
+	written, err := pw.applySegments(pw.serializeFramesLocked(frames), segments)
 	state.bytes += written
 	return err
 }
@@ -167,7 +228,7 @@ func (pw *Writer) writeControlLocked(frames []*protocol.Frame) error {
 		return nil
 	}
 
-	written, err := pw.applySegments(serializeFrames(frames), segments)
+	written, err := pw.applySegments(pw.serializeFramesLocked(frames), segments)
 	pw.ctlBytes += int64(written)
 	return err
 }
@@ -213,15 +274,19 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 			// Not enough user data — send remaining user data + waste padding
 			// Subtract FrameHeaderLen because the waste frame wire format adds its own header
 			wasteSize := clampWasteSize(targetLen - remaining - protocol.FrameHeaderLen)
-			wasteFrame := protocol.NewWasteFrame(wasteSize)
-			wasteBytes := serializeFrames([]*protocol.Frame{wasteFrame})
+			totalLen := remaining + protocol.FrameHeaderLen + wasteSize
+			out := pw.allocPadBufLocked(totalLen)
+			copy(out, userData[offset:offset+remaining])
+			waste := out[remaining:]
+			waste[0] = byte(protocol.CmdWaste)
+			waste[1] = 0
+			waste[2] = 0
+			waste[3] = 0
+			waste[4] = 0
+			binary.BigEndian.PutUint16(waste[5:7], uint16(wasteSize))
+			clear(waste[protocol.FrameHeaderLen:])
 
-			// Combine: remaining user data + waste frame
-			combined := make([]byte, remaining+len(wasteBytes))
-			copy(combined, userData[offset:offset+remaining])
-			copy(combined[remaining:], wasteBytes)
-
-			n, err := pw.w.Write(combined)
+			n, err := pw.w.Write(out)
 			written += n
 			if err != nil {
 				return written, err
@@ -231,10 +296,21 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 		} else {
 			// No user data left — send pure waste padding
 			wasteSize := clampWasteSize(targetLen - protocol.FrameHeaderLen)
-			if err := pw.fw.WriteFrame(protocol.NewWasteFrame(wasteSize)); err != nil {
+			totalLen := protocol.FrameHeaderLen + wasteSize
+			out := pw.allocPadBufLocked(totalLen)
+			out[0] = byte(protocol.CmdWaste)
+			out[1] = 0
+			out[2] = 0
+			out[3] = 0
+			out[4] = 0
+			binary.BigEndian.PutUint16(out[5:7], uint16(wasteSize))
+			clear(out[protocol.FrameHeaderLen:])
+
+			n, err := pw.w.Write(out)
+			if err != nil {
 				return written, err
 			}
-			written += protocol.FrameHeaderLen + wasteSize
+			written += n
 		}
 	}
 
@@ -282,15 +358,136 @@ func (pw *Writer) writePadTo(payload []byte, seg Segment) (int, error) {
 	}
 	wasteSize := target - minTarget
 
-	out := make([]byte, target)
+	out := pw.allocPadBufLocked(target)
 	copy(out, payload)
 	waste := out[len(payload):]
 	waste[0] = byte(protocol.CmdWaste)
-	// waste[1:5] is the stream ID and stays zero; the length is the waste payload size.
+	waste[1] = 0
+	waste[2] = 0
+	waste[3] = 0
+	waste[4] = 0
+	// the length is the waste payload size.
 	binary.BigEndian.PutUint16(waste[5:7], uint16(wasteSize))
+	clear(waste[protocol.FrameHeaderLen:])
 
 	n, err := pw.w.Write(out)
 	return n, err
+}
+
+func (pw *Writer) allocPadBufLocked(total int) []byte {
+	if total <= maxReusableRawBuf {
+		if cap(pw.padBuf) < total {
+			pw.padBuf = make([]byte, total)
+		}
+		return pw.padBuf[:total]
+	}
+	return make([]byte, total)
+}
+
+func pshWireLen(dataLen int) int {
+	if dataLen <= 0 {
+		return 0
+	}
+	chunks := (dataLen + protocol.MaxFrameDataLen - 1) / protocol.MaxFrameDataLen
+	return chunks*protocol.FrameHeaderLen + dataLen
+}
+
+func (pw *Writer) serializeFramesLocked(frames []*protocol.Frame) []byte {
+	size := wireLen(frames)
+	var buf []byte
+	if size <= maxReusableRawBuf {
+		if cap(pw.serializeBuf) < size {
+			pw.serializeBuf = make([]byte, 0, size)
+		}
+		buf = pw.serializeBuf[:0]
+	} else {
+		buf = make([]byte, 0, size)
+	}
+	var header [protocol.FrameHeaderLen]byte
+	for _, f := range frames {
+		header[0] = byte(f.Command)
+		header[1] = byte(f.StreamID >> 24)
+		header[2] = byte(f.StreamID >> 16)
+		header[3] = byte(f.StreamID >> 8)
+		header[4] = byte(f.StreamID)
+		header[5] = byte(len(f.Data) >> 8)
+		header[6] = byte(len(f.Data))
+		buf = append(buf, header[:]...)
+		buf = append(buf, f.Data...)
+	}
+	if size <= maxReusableRawBuf {
+		pw.serializeBuf = buf[:0]
+	}
+	return buf
+}
+
+func (pw *Writer) serializePSHLocked(streamID uint32, data []byte) []byte {
+	size := pshWireLen(len(data))
+	var buf []byte
+	if size <= maxReusableRawBuf {
+		if cap(pw.serializeBuf) < size {
+			pw.serializeBuf = make([]byte, 0, size)
+		}
+		buf = pw.serializeBuf[:0]
+	} else {
+		buf = make([]byte, 0, size)
+	}
+	var header [protocol.FrameHeaderLen]byte
+	for off := 0; off < len(data); {
+		n := len(data) - off
+		if n > protocol.MaxFrameDataLen {
+			n = protocol.MaxFrameDataLen
+		}
+		header[0] = byte(protocol.CmdPSH)
+		header[1] = byte(streamID >> 24)
+		header[2] = byte(streamID >> 16)
+		header[3] = byte(streamID >> 8)
+		header[4] = byte(streamID)
+		header[5] = byte(n >> 8)
+		header[6] = byte(n)
+		buf = append(buf, header[:]...)
+		buf = append(buf, data[off:off+n]...)
+		off += n
+	}
+	if size <= maxReusableRawBuf {
+		pw.serializeBuf = buf[:0]
+	}
+	return buf
+}
+
+func (pw *Writer) writePSHRawLocked(streamID uint32, data []byte) error {
+	total := pshWireLen(len(data))
+	var buf []byte
+	if total <= maxReusableRawBuf {
+		if cap(pw.rawBuf) < total {
+			pw.rawBuf = make([]byte, 0, total)
+		}
+		buf = pw.rawBuf[:0]
+	} else {
+		buf = make([]byte, 0, total)
+	}
+	var header [protocol.FrameHeaderLen]byte
+	for off := 0; off < len(data); {
+		n := len(data) - off
+		if n > protocol.MaxFrameDataLen {
+			n = protocol.MaxFrameDataLen
+		}
+		header[0] = byte(protocol.CmdPSH)
+		header[1] = byte(streamID >> 24)
+		header[2] = byte(streamID >> 16)
+		header[3] = byte(streamID >> 8)
+		header[4] = byte(streamID)
+		header[5] = byte(n >> 8)
+		header[6] = byte(n)
+		buf = append(buf, header[:]...)
+		buf = append(buf, data[off:off+n]...)
+		off += n
+	}
+	_, err := pw.w.Write(buf)
+	if total <= maxReusableRawBuf {
+		pw.rawBuf = buf[:0]
+	}
+	return err
 }
 
 // maxReusableRawBuf bounds the encoding buffer retained per Writer. Writes up
@@ -419,7 +616,7 @@ func (pw *Writer) ControlBytes() int64 {
 	return pw.ctlBytes
 }
 
-// serializeFrames converts frames to their wire format bytes.
+// serializeFrames is no longer needed; keep serializeFramesLocked on Writer.
 func serializeFrames(frames []*protocol.Frame) []byte {
 	size := 0
 	for _, f := range frames {

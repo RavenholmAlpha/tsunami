@@ -37,6 +37,7 @@ type Session struct {
 	localVersion       int
 	remoteVersion      int
 	flowControl        atomic.Bool
+	fastOpen           atomic.Bool
 	localStreamWindow  int
 	remoteStreamWindow int
 
@@ -52,14 +53,19 @@ type Session struct {
 	onStreamClosed        func(id uint32)         // Called after a stream is removed from the session
 	streamClosedMu        sync.Mutex              // protects onStreamClosed
 
-	// Optional padding-aware write function.
-	// When set, frame writes route through this instead of the raw FrameWriter.
-	// The callback is called under writeMu and must not call writeFrame.
-	paddingWriteFn func(frames []*Frame) error
+	// Optional padding-aware write functions.
+	// When set, frame writes route through these instead of the raw FrameWriter.
+	// Callbacks are invoked under writeMu and must not call writeFrame.
+	paddingWriteFn    func(frames []*Frame) error
+	paddingPSHWriteFn func(streamID uint32, data []byte) error
+	hasCustomWriteFn  atomic.Bool
+	hasPSHWriteFn     atomic.Bool
 
 	// Error channel
 	errCh chan error
 }
+
+const sessionWriteDeadline = 30 * time.Second
 
 // DefaultMaxStreams bounds how many streams one session may carry at once.
 // It is deliberately far above real browsing concurrency but low enough that a
@@ -136,6 +142,12 @@ func (s *Session) EnableFlowControl(localWindow, remoteWindow int) {
 	s.streamMu.Unlock()
 }
 
+// EnableFastOpen enables 0-RTT stream creation where OpenStream sends CmdSYN
+// and returns immediately without waiting for CmdSYNACK.
+func (s *Session) EnableFastOpen() {
+	s.fastOpen.Store(true)
+}
+
 // OpenStream creates a new stream on this session (client side).
 func (s *Session) OpenStream() (*Stream, error) {
 	s.openMu.Lock()
@@ -169,9 +181,11 @@ func (s *Session) OpenStream() (*Stream, error) {
 	}
 	s.openMu.Unlock()
 
-	if err := stream.waitForOpen(10 * time.Second); err != nil {
-		_ = stream.Close()
-		return nil, err
+	if !s.fastOpen.Load() {
+		if err := stream.waitForOpen(10 * time.Second); err != nil {
+			_ = stream.Close()
+			return nil, err
+		}
 	}
 
 	s.lastActive.Store(time.Now().UnixNano())
@@ -254,7 +268,7 @@ func (s *Session) writeFrame(f *Frame) error {
 	s.lastActive.Store(time.Now().UnixNano())
 	s.writeMu.Lock()
 	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
 	}
 	var err error
 	if s.paddingWriteFn != nil {
@@ -266,6 +280,9 @@ func (s *Session) writeFrame(f *Frame) error {
 		nc.SetWriteDeadline(time.Time{})
 	}
 	s.writeMu.Unlock()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
 	return err
 }
 
@@ -293,7 +310,7 @@ func (s *Session) writeFrames(frames []*Frame) error {
 	s.writeMu.Lock()
 	s.lastActive.Store(time.Now().UnixNano())
 	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
 	}
 	var err error
 	if s.paddingWriteFn != nil {
@@ -305,6 +322,84 @@ func (s *Session) writeFrames(frames []*Frame) error {
 		nc.SetWriteDeadline(time.Time{})
 	}
 	s.writeMu.Unlock()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
+	return err
+}
+
+func (s *Session) canWritePSHDirect() bool {
+	return !s.hasCustomWriteFn.Load() || s.hasPSHWriteFn.Load()
+}
+
+func (s *Session) writePSHData(streamID uint32, data []byte) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	s.lastActive.Store(time.Now().UnixNano())
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	}
+	var err error
+	if s.paddingPSHWriteFn != nil {
+		err = s.paddingPSHWriteFn(streamID, data)
+	} else {
+		err = s.writeRawPSHLocked(streamID, data)
+	}
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Time{})
+	}
+	s.writeMu.Unlock()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
+	return err
+}
+
+func (s *Session) writeRawPSHLocked(streamID uint32, data []byte) error {
+	if len(data) <= MaxFrameDataLen {
+		poolBufp := frameBufPool.Get().(*[]byte)
+		buf := (*poolBufp)[:FrameHeaderLen+len(data)]
+		buf[0] = byte(CmdPSH)
+		binary.BigEndian.PutUint32(buf[1:5], streamID)
+		binary.BigEndian.PutUint16(buf[5:7], uint16(len(data)))
+		copy(buf[FrameHeaderLen:], data)
+		_, err := s.writer.w.Write(buf)
+		*poolBufp = (*poolBufp)[:MaxFrameDataLen+FrameHeaderLen]
+		frameBufPool.Put(poolBufp)
+		return err
+	}
+
+	chunks := (len(data) + MaxFrameDataLen - 1) / MaxFrameDataLen
+	totalLen := chunks*FrameHeaderLen + len(data)
+	bufp := writeCoalesceBufPool.Get().(*[]byte)
+	buf := *bufp
+	if cap(buf) < totalLen {
+		buf = make([]byte, 0, totalLen)
+	}
+	buf = buf[:0]
+	var header [FrameHeaderLen]byte
+	for off := 0; off < len(data); {
+		n := len(data) - off
+		if n > MaxFrameDataLen {
+			n = MaxFrameDataLen
+		}
+		header[0] = byte(CmdPSH)
+		binary.BigEndian.PutUint32(header[1:5], streamID)
+		binary.BigEndian.PutUint16(header[5:7], uint16(n))
+		buf = append(buf, header[:]...)
+		buf = append(buf, data[off:off+n]...)
+		off += n
+	}
+	_, err := s.writer.w.Write(buf)
+	if cap(buf) <= maxCoalescePool {
+		*bufp = buf[:0]
+		writeCoalesceBufPool.Put(bufp)
+	}
 	return err
 }
 
@@ -376,6 +471,16 @@ func (s *Session) SetOnPaddingSchemeUpdate(fn func(data []byte) error) {
 func (s *Session) SetPaddingWriteFn(fn func(frames []*Frame) error) {
 	s.writeMu.Lock()
 	s.paddingWriteFn = fn
+	s.hasCustomWriteFn.Store(fn != nil)
+	s.writeMu.Unlock()
+}
+
+// SetPaddingPSHWriteFn sets a fast-path callback for writing raw stream payload
+// bytes without intermediate Frame allocations.
+func (s *Session) SetPaddingPSHWriteFn(fn func(streamID uint32, data []byte) error) {
+	s.writeMu.Lock()
+	s.paddingPSHWriteFn = fn
+	s.hasPSHWriteFn.Store(fn != nil)
 	s.writeMu.Unlock()
 }
 
@@ -391,12 +496,13 @@ func (s *Session) notifyStreamCountChange(count int) {
 func (s *Session) RunEventLoop() error {
 	defer s.Close()
 
+	reader := NewBufferedFrameReader(s.conn, 64*1024)
 	for {
 		if s.closed.Load() {
 			return nil
 		}
 
-		frame, err := s.reader.ReadFrame()
+		frame, poolBuf, err := reader.readFramePooled()
 		if err != nil {
 			if s.closed.Load() {
 				return nil
@@ -406,7 +512,7 @@ func (s *Session) RunEventLoop() error {
 
 		s.lastActive.Store(time.Now().UnixNano())
 
-		if err := s.handleFrame(frame); err != nil {
+		if err := s.handleFramePooled(frame, poolBuf); err != nil {
 			return err
 		}
 	}
@@ -414,6 +520,10 @@ func (s *Session) RunEventLoop() error {
 
 // handleFrame dispatches a received frame.
 func (s *Session) handleFrame(f *Frame) error {
+	return s.handleFramePooled(f, nil)
+}
+
+func (s *Session) handleFramePooled(f *Frame, poolBuf *[]byte) error {
 	switch f.Command {
 	case CmdWaste:
 		// Silently discard padding data
@@ -466,9 +576,10 @@ func (s *Session) handleFrame(f *Frame) error {
 	case CmdPSH:
 		stream := s.getStream(f.StreamID)
 		if stream == nil {
+			putRecvPayloadBuf(poolBuf)
 			return nil // ignore data for closed/unknown streams
 		}
-		if err := stream.deliverData(f.Data); err != nil {
+		if err := stream.deliverDataPooled(f.Data, poolBuf); err != nil {
 			if errors.Is(err, ErrStreamRecvOverflow) {
 				log.Printf("tsunami: stream %d receive buffer overflow; closing stream", f.StreamID)
 				stream.closeByRemote(ErrStreamRecvOverflow)

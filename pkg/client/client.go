@@ -406,14 +406,8 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	// server still enforces its own per-session limit.
 	session.SetMaxStreams(0)
 
-	// Wire padding system into session write path.
-	pw := padding.NewWriterForRole(tlsConn, scheme, padding.RoleClient)
-	bindClientPadding(session, pw)
-	session.SetOnPaddingSchemeUpdate(func(data []byte) error {
-		return c.applyPaddingSchemeUpdate(data, pw)
-	})
-
-	// Send client settings
+	// Send client settings (handshake stays unpadded so settings framing cleanly
+	// separates from post-handshake traffic shaping / padding v2).
 	settings := &protocol.ClientSettings{
 		Version:      protocol.CurrentVersion,
 		Client:       "http-client/1.0",
@@ -422,6 +416,7 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		PaddingV2:    true,
 		FlowControl:  true,
 		StreamWindow: protocol.DefaultStreamWindow,
+		FastOpen:     true,
 	}
 	if err := session.SendSettings(settings); err != nil {
 		session.Close()
@@ -466,16 +461,27 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	if ss.FlowControl {
 		session.EnableFlowControl(protocol.DefaultStreamWindow, protocol.ClampStreamWindow(ss.StreamWindow))
 	}
+	if ss.FastOpen {
+		session.EnableFastOpen()
+	}
 
-	// Activate traffic shaping if both sides agreed
+	// Activate traffic shaping before binding the session padding writer so no
+	// unshaped padding frames leak across the shaping boundary.
+	activeConn := tlsConn
 	if c.config.Shaping != nil && shapingConfirmed {
 		shaped := shaping.Wrap(tlsConn, *c.config.Shaping)
 		session.ReplaceConn(shaped)
-		pw = padding.NewWriterForRole(shaped, scheme, padding.RoleClient)
-		bindClientPadding(session, pw)
+		activeConn = shaped
 		log.Printf("tsunami: traffic shaping enabled (frame=%d interval=%v burst=%d)",
 			c.config.Shaping.FrameSize, c.config.Shaping.Interval, c.config.Shaping.BurstSlots)
 	}
+
+	// Wire padding system into session write path on top of the active connection.
+	pw := padding.NewWriterForRole(activeConn, scheme, padding.RoleClient)
+	bindClientPadding(session, pw)
+	session.SetOnPaddingSchemeUpdate(func(data []byte) error {
+		return c.applyPaddingSchemeUpdate(data, pw)
+	})
 
 	// Start session event loop in background
 	go func() {
@@ -495,6 +501,7 @@ func bindClientPadding(session *protocol.Session, pw *padding.Writer) {
 	session.SetPaddingWriteFn(func(frames []*protocol.Frame) error {
 		return pw.WriteFramesWithPadding(frames)
 	})
+	session.SetPaddingPSHWriteFn(pw.WritePSH)
 	session.SetOnStreamClosed(func(id uint32) {
 		pw.ForgetStream(id)
 	})

@@ -14,6 +14,7 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 		PaddingV2:      true,
 		FlowControl:    true,
 		StreamWindow:   DefaultStreamWindow,
+		FastOpen:       true,
 	}
 
 	data := EncodeClientSettings(original)
@@ -43,6 +44,9 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 	if decoded.StreamWindow != original.StreamWindow {
 		t.Errorf("streamWindow = %d, want %d", decoded.StreamWindow, original.StreamWindow)
 	}
+	if !decoded.FastOpen {
+		t.Error("fast-open capability was not round-tripped")
+	}
 }
 
 // TestClientSettingsLegacyDecode ensures a pre-v2 client (no padding-v2 key)
@@ -60,6 +64,9 @@ func TestClientSettingsLegacyDecode(t *testing.T) {
 	if decoded.FlowControl || decoded.StreamWindow != 0 {
 		t.Fatal("legacy settings must not advertise flow-control")
 	}
+	if decoded.FastOpen {
+		t.Fatal("legacy settings must not advertise fast-open")
+	}
 	// Encoding a client without the capability must omit the key so old
 	// servers keep ignoring the settings blob.
 	encoded := EncodeClientSettings(decoded)
@@ -68,6 +75,9 @@ func TestClientSettingsLegacyDecode(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("flow-control")) || bytes.Contains(encoded, []byte("stream-window")) {
 		t.Fatal("flow-control keys must be omitted when not set")
+	}
+	if bytes.Contains(encoded, []byte("fast-open")) {
+		t.Fatal("fast-open key must be omitted when not set")
 	}
 }
 
@@ -78,6 +88,7 @@ func TestServerSettingsEncodeDecode(t *testing.T) {
 		MaxConnections: 4,
 		FlowControl:    true,
 		StreamWindow:   DefaultStreamWindow,
+		FastOpen:       true,
 	}
 
 	data := EncodeServerSettings(original)
@@ -100,6 +111,9 @@ func TestServerSettingsEncodeDecode(t *testing.T) {
 	}
 	if decoded.StreamWindow != original.StreamWindow {
 		t.Errorf("streamWindow = %d, want %d", decoded.StreamWindow, original.StreamWindow)
+	}
+	if !decoded.FastOpen {
+		t.Error("fast-open capability was not round-tripped")
 	}
 }
 

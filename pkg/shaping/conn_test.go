@@ -325,6 +325,45 @@ func TestCloseNoDeadlockOnInnerWriteError(t *testing.T) {
 	}
 }
 
+func TestShapingRingWrapAroundLargeTransfer(t *testing.T) {
+	rawA, rawB := tcpPipe(t)
+	cfg := Config{
+		FrameSize:            256,
+		Interval:             1 * time.Millisecond,
+		BurstSlots:           8,
+		MaxBufferSize:        4096,
+		IdleChaffMaxInterval: 0,
+	}
+	client := Wrap(rawA, cfg)
+	server := Wrap(rawB, cfg)
+	defer client.Close()
+	defer server.Close()
+
+	// Transfer 256 KiB through a tiny 4 KiB ring buffer so the circular buffer
+	// wraps around more than 60 times and coalesces bursts cleanly.
+	payload := make([]byte, 256*1024)
+	for i := range payload {
+		payload[i] = byte(i*31 + i>>9)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := client.Write(payload)
+		errCh <- err
+	}()
+
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("ReadFull shaped 256 KiB: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Write shaped 256 KiB: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("ring wrap payload mismatch at byte %d", firstDiff(got, payload))
+	}
+}
+
 func firstDiff(a, b []byte) int {
 	for i := range a {
 		if i >= len(b) || a[i] != b[i] {

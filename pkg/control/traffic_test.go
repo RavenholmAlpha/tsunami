@@ -2,7 +2,9 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/tsunami-protocol/tsunami/pkg/protocol"
@@ -71,5 +73,43 @@ func TestTrafficPolicyWrapReader(t *testing.T) {
 	deltas := tracker.Snapshot()
 	if len(deltas) != 1 || deltas[0].UploadBytes != 5 {
 		t.Fatalf("deltas = %+v", deltas)
+	}
+}
+
+func TestUsageTrackerAndUserLimiterConcurrent(t *testing.T) {
+	tracker := NewUsageTracker()
+	limiter := NewUserLimiter()
+	users := []*protocol.UserInfo{
+		{ID: "u1", SpeedLimitBps: 10 << 20},
+		{ID: "u2", SpeedLimitBps: 0},
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			u := users[id%len(users)]
+			for i := 0; i < 100; i++ {
+				if err := limiter.Wait(context.Background(), u, DirectionDownload, 64); err != nil {
+					t.Errorf("Wait: %v", err)
+					return
+				}
+				tracker.Record(u, DirectionDownload, 64)
+				tracker.Record(u, DirectionUpload, 32)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	deltas := tracker.Snapshot()
+	if len(deltas) != 2 {
+		t.Fatalf("deltas = %d, want 2", len(deltas))
+	}
+	if deltas[0].DownloadBytes != 400*64 || deltas[0].UploadBytes != 400*32 {
+		t.Fatalf("u1 delta = %+v", deltas[0])
+	}
+	if deltas[1].DownloadBytes != 400*64 || deltas[1].UploadBytes != 400*32 {
+		t.Fatalf("u2 delta = %+v", deltas[1])
 	}
 }

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-21
+
+### Added
+- **0-RTT Fast-Open streams (`fast-open=1` in `SETTINGS`)**: backward-compatible session capability enabling `Session.OpenStream` to dispatch `CmdSYN` and immediately send target headers and application data without stalling for a round-trip `CmdSYNACK`.
+- **RFC 6555 Happy Eyeballs target dialing**: `dialTarget` interleaves IPv6/IPv4 candidates and staggers fallback attempts (`250ms` delay) instead of sequential serial blocking.
+- **Permanent microbenchmark suites**: added Go benchmarks covering HTTP fronting replay cache/signing/deadlines/Split-H2 (`pkg/fronting`), frame serialization/session stream throughput/open latency (`pkg/protocol`), shaping (`pkg/shaping`), and UoT relay (`pkg/uot`).
+
+### Changed
+- **Default stream flow control & Split-H2 pipelining capacities**: raised `DefaultStreamWindow` (`2 MiB`, max `8 MiB`), `DefaultMaxStreamRecvBytes` (`4 MiB`), Split-H2 concurrent in-flight uplinks (`12`), client send ring (`2 MiB`), and server reorder buffer (`4 MiB`) for higher BDP cross-border links.
+- **Hot-path CPU and allocation reductions**:
+  - Replaced `NonceCache` O(N) full-map pruning scan with an O(1) FIFO ring buffer, and rewrote HMAC-SHA256 request signing/verification with stack-buffered direct SHA-256 passes and inline ASCII host lowering.
+  - Replaced per-call `time.AfterFunc` deadline timers on `HTTPClientConn` and `SplitH2ServerConn`/`SplitH2ClientConn` with reusable resettable timers.
+  - Replaced head-shifting slice queues with circular ring buffers and `sync.Pool` chunk recycling across `SplitH2ServerConn`/`SplitH2ClientConn`, `shaping.Conn`, and `protocol.Stream` receive queues.
+  - Added buffered `64 KiB` `FrameReader` + tiered receive payload pools (`4 KiB` / `16 KiB` / `65535 B`) with zero-allocation `CmdWaste` discard, coalesced direct `WritePSH` in `padding.Writer` with reusable scratch buffers, `RelayBufPool` sized cleanly to `MaxFrameDataLen` (`65535 B`), lock-free fast-path `WINDOW_UPDATE`, per-user lock sharding / atomics in `pkg/control`, and buffered SOCKS5/HTTP proxy handshakes.
+
+### Fixed
+- **Traffic shaping + Padding v2 handshake framing boundary**: moved session `padding.Writer` binding strictly after settings exchange and `shaping.Wrap` so trailing padding `CmdWaste` frames cannot bleed into `shaping.Conn.Read`; registered `SetOnPaddingSchemeUpdate` on the post-shaping writer and prevented `Session.SetWriteDeadline` resets from clobbering `shaping.Conn`'s async writer deadlines.
+- **UoT relay lifecycle & NAT timeout**: fixed the 120 s close leak on EOF (`closeUDP()` / `stream.Close()` synchronization in `Relay.Run`), throttled `SetReadDeadline` proportionally (`min(1s, natTimeout/4)`) so short NAT timeouts remain alive under active traffic, and added bounded DNS target resolution caching and `netip.AddrPort` zero-copy framing.
+- Fixed `NonceCache.Add` lazy TTL pruning order so expired entries are evicted before replay rejection.
+- Fixed `HTTPProxyServer.handleConnect` draining buffered pipelined bytes from `bufio.Reader` before stream relay.
+
 ## [1.4.0] - 2026-11-20
 
 ### Added

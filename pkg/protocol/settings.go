@@ -22,6 +22,8 @@ type ClientSettings struct {
 	FlowControl bool
 	// StreamWindow advertises the client's per-stream receive window in bytes.
 	StreamWindow int
+	// FastOpen enables 0-RTT stream opening without blocking on CmdSYNACK.
+	FastOpen bool
 }
 
 // EncodeClientSettings serializes client settings to the wire format.
@@ -46,6 +48,9 @@ func EncodeClientSettings(s *ClientSettings) []byte {
 	}
 	if s.StreamWindow > 0 {
 		fmt.Fprintf(&b, "stream-window=%d\n", s.StreamWindow)
+	}
+	if s.FastOpen {
+		fmt.Fprintf(&b, "fast-open=1\n")
 	}
 	return []byte(b.String())
 }
@@ -89,6 +94,8 @@ func DecodeClientSettings(data []byte) (*ClientSettings, error) {
 				return nil, fmt.Errorf("tsunami: invalid stream-window: %w", err)
 			}
 			s.StreamWindow = w
+		case "fast-open":
+			s.FastOpen = val == "1"
 		}
 	}
 	return s, nil
@@ -111,6 +118,7 @@ type ServerSettings struct {
 	Shaping        bool
 	FlowControl    bool
 	StreamWindow   int
+	FastOpen       bool
 }
 
 // EncodeServerSettings serializes server settings to the wire format.
@@ -134,6 +142,9 @@ func EncodeServerSettings(s *ServerSettings) []byte {
 	}
 	if s.StreamWindow > 0 {
 		fmt.Fprintf(&b, "stream-window=%d\n", s.StreamWindow)
+	}
+	if s.FastOpen {
+		fmt.Fprintf(&b, "fast-open=1\n")
 	}
 	return []byte(b.String())
 }
@@ -179,6 +190,8 @@ func DecodeServerSettings(data []byte) (*ServerSettings, error) {
 				return nil, fmt.Errorf("tsunami: invalid stream-window: %w", err)
 			}
 			s.StreamWindow = w
+		case "fast-open":
+			s.FastOpen = val == "1"
 		}
 	}
 	return s, nil

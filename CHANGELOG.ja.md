@@ -9,6 +9,27 @@
 
 ## [未リリース]
 
+## [1.5.0] - 2026-11-21
+
+### 追加
+- **0-RTT 高速ストリーム開始（`SETTINGS` で `fast-open=1` をネゴシエート）**：後方互換のセッション拡張として、`Session.OpenStream` が `CmdSYN` 送信後に `CmdSYNACK` の往復を待たず宛先ヘッダーと初回データを即座に送信できるようにしました。
+- **RFC 6555 Happy Eyeballs ターゲット接続**：`dialTarget` が IPv6/IPv4 アドレスをインターリーブし `250ms` 間隔で並行接続を行うことで、片系不通時の直列遅延を削減しました。
+- **常設マイクロベンチマーク群**：HTTP フロンティングのリプレイキャッシュ/署名/期限/Split-H2（`pkg/fronting`）、フレーム処理/セッションストリームスループット/開始遅延（`pkg/protocol`）、シェーピング（`pkg/shaping`）、UoT リレー（`pkg/uot`）のベンチマークを追加しました。
+
+### 変更
+- **ストリーム単位フロー制御と Split-H2 パイプライン容量の拡大**：既定ウィンドウを `2 MiB`（上限 `8 MiB`、受信上限 `4 MiB`）に拡大し、Split-H2 の同時インフライト上限を `12`、クライアント送信リングを `2 MiB`、サーバー並替えバッファを `4 MiB` に引き上げました。
+- **ホットパスの CPU・アロケーション最適化**：
+  - `NonceCache` の $O(N)$ 全件走査を $O(1)$ FIFO リングに置換し、HMAC-SHA256 署名/検証をスタックバッファ利用の直接計算とインライン小文字化へ刷新しました。
+  - `HTTPClientConn` と `SplitH2ServerConn`/`SplitH2ClientConn` の期限タイマーを再利用可能な `time.Timer` に変更しました。
+  - `SplitH2ServerConn`/`SplitH2ClientConn`、`shaping.Conn`、`protocol.Stream` のキューをリングバッファと `sync.Pool` へ移行しました。
+  - `64 KiB` バッファ付きフレームリーダー、3 段階受信プール（`4 KiB` / `16 KiB` / `65535 B`）、ゼロアロケーション `CmdWaste` 破棄、`padding.Writer.WritePSH` 高速パス、`65535 B` 揃いの `RelayBufPool`、ロックフリー寄り `WINDOW_UPDATE`、細粒度ロック/アトミック化された `pkg/control`、バッファ済み SOCKS5/HTTP ハンドシェイクを導入しました。
+
+### 修正
+- **Traffic Shaping と Padding v2 のハンドシェイク境界問題**：`padding.Writer` のバインドを `SETTINGS` 交換および `shaping.Wrap` の後へ移動し、末尾の `CmdWaste` 生フレームが `shaping.Conn.Read` に混入して即座に EOF/フレーム不正となる不具合を修正しました。あわせて `SetOnPaddingSchemeUpdate` のバインド先と `shaping.Conn.SetWriteDeadline` の競合を修正しました。
+- **UoT リレーの終了リークと短い NAT タイムアウト節流バグ**：ストリーム終了時に `udpToStream` が最大 120 秒残るリークを修正し、`SetReadDeadline` の更新間隔を `min(1s, natTimeout/4)` へ変更しました。さらに上限付き DNS 解決キャッシュと `netip.AddrPort` ベースのゼロコピー応答エンコードを導入しました。
+- `NonceCache.Add` の遅延期限切れ掃除の順序を修正しました。
+- `HTTPProxyServer.handleConnect` で `bufio.Reader` 内の先読み済みバイトを取りこぼす不具合を修正しました。
+
 ## [1.4.0] - 2026-11-20
 
 ### 追加

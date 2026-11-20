@@ -1,6 +1,8 @@
 package fronting
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"net/http"
 	"strings"
 	"testing"
@@ -135,5 +137,77 @@ func TestSignAndVerifySplitHeaders(t *testing.T) {
 		if req.Header.Get(h) != "" {
 			t.Fatalf("StripAuthHeaders left %q=%q", h, req.Header.Get(h))
 		}
+	}
+}
+
+func TestNonceCacheFIFOEvictionExpiryAndUppercaseHex(t *testing.T) {
+	cache := NewNonceCache(40 * time.Millisecond)
+	cache.maxEntries = 3
+
+	for _, n := range []string{"nonce-1-000000000000", "nonce-2-000000000000", "nonce-3-000000000000"} {
+		if !cache.Add(n) {
+			t.Fatalf("initial Add(%q) failed", n)
+		}
+	}
+	// Adding a 4th entry must evict the oldest entry (nonce-1) in FIFO order.
+	if !cache.Add("nonce-4-000000000000") {
+		t.Fatal("Add 4th nonce failed")
+	}
+	if !cache.Add("nonce-1-000000000000") {
+		t.Fatal("oldest evicted nonce-1 should be accepted again after FIFO eviction")
+	}
+	if cache.Add("nonce-4-000000000000") {
+		t.Fatal("recent nonce-4 should still be blocked as replay")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if !cache.Add("nonce-4-000000000000") {
+		t.Fatal("expired nonce-4 should be accepted after TTL")
+	}
+
+	// VerifyRequest must accept uppercase hex MAC signatures too.
+	key := KeyFromSecret("case-secret")
+	now := time.Unix(2000, 0)
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com/assets/update", nil)
+	req.Host = "EXAMPLE.COM"
+	if err := SignRequest(req, key, now); err != nil {
+		t.Fatal(err)
+	}
+	sig := strings.TrimPrefix(req.Header.Get(headerAuth), "HMAC-SHA256 Signature=")
+	req.Header.Set(headerAuth, "HMAC-SHA256 Signature="+strings.ToUpper(sig))
+	if !VerifyRequest(req, [][32]byte{key}, now, ClockSkew) {
+		t.Fatal("uppercase hex MAC signature rejected")
+	}
+}
+
+func TestComputeMACBytesMatchesStdlibHMAC(t *testing.T) {
+	key := KeyFromSecret("hmac-cross-check-secret")
+	cases := []struct {
+		name                             string
+		method, path, host, ts, nonce    string
+		sid, seq                         string
+	}{
+		{"get", http.MethodGet, "/assets/main.js", "example.com", "1700000", "nonce-1234567890abcdef", "", ""},
+		{"split-h2-upper-host", http.MethodPost, "/assets/update", "CDN.EXAMPLE.ORG", "1700001", "nonce-fedcba9876543210", "0123456789abcdef", "42"},
+		{"long-path-heap-fallback", http.MethodPost, "/" + strings.Repeat("p", 640), "Long.Host.Example", "1700002", "nonce-longpath123456", "abcdef0123456789", "999"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeMACBytes(tc.method, tc.path, tc.host, tc.ts, tc.nonce, tc.sid, tc.seq, key)
+
+			canonical := strings.Join([]string{tc.method, tc.path, strings.ToLower(tc.host), tc.ts, tc.nonce}, "\n")
+			if tc.sid != "" || tc.seq != "" {
+				canonical += "\n" + tc.sid + "\n" + tc.seq
+			}
+			mac := hmac.New(sha256.New, key[:])
+			_, _ = mac.Write([]byte(canonical))
+			var want [sha256.Size]byte
+			mac.Sum(want[:0])
+
+			if got != want {
+				t.Fatalf("computeMACBytes mismatch:\n got=%x\nwant=%x", got, want)
+			}
+		})
 	}
 }

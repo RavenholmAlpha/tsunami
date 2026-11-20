@@ -84,14 +84,14 @@ func (h *HTTPProxyServer) handleConn(conn net.Conn) {
 	}
 
 	if req.Method == "CONNECT" {
-		h.handleConnect(conn, req)
+		h.handleConnect(conn, br, req)
 	} else {
 		h.handleHTTP(conn, br, req)
 	}
 }
 
 // handleConnect handles HTTPS tunneling via CONNECT method.
-func (h *HTTPProxyServer) handleConnect(conn net.Conn, req *http.Request) {
+func (h *HTTPProxyServer) handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request) {
 	targetAddr := req.Host
 	if !strings.Contains(targetAddr, ":") {
 		targetAddr += ":443"
@@ -108,6 +108,11 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, req *http.Request) {
 	// Send 200 Connection Established
 	fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
+	var src io.Reader = conn
+	if br != nil && br.Buffered() > 0 {
+		src = io.MultiReader(io.LimitReader(br, int64(br.Buffered())), conn)
+	}
+
 	// Bidirectional relay
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -115,7 +120,7 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, req *http.Request) {
 	go func() {
 		defer wg.Done()
 		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, conn, *bufp)
+		io.CopyBuffer(stream, src, *bufp)
 		protocol.RelayBufPool.Put(bufp)
 		stream.Close()
 	}()

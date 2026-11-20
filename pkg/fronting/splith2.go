@@ -21,16 +21,84 @@ import (
 const (
 	maxPendingSplitSessions = 256
 	splitPairingTimeout     = 10 * time.Second
-	maxSplitUplinkGap       = 16
-	maxSplitUplinkBytes     = 2 << 20 // 2 MiB server-side uplink reorder buffer
+	maxSplitUplinkGap       = 48
+	maxSplitUplinkBytes     = 4 << 20 // 4 MiB server-side uplink reorder buffer
 
 	// MaxSplitChunkSize caps a single Split-H2 uplink POST body.
 	MaxSplitChunkSize = 512 << 10
 
-	splitClientMaxSendBuf  = 1 << 20   // 1 MiB client-side send buffer
+	splitClientMaxSendBuf  = 2 << 20   // 2 MiB client-side send buffer
 	splitClientMaxChunk    = 128 << 10 // 128 KiB per POST chunk
-	splitClientMaxInFlight = 4
+	splitClientMaxInFlight = 12
 )
+
+var (
+	splitServerChunkPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, splitClientMaxChunk)
+			return &buf
+		},
+	}
+	splitClientChunkPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, splitClientMaxChunk)
+			return &buf
+		},
+	}
+)
+
+type splitChunk struct {
+	data    []byte
+	poolBuf *[]byte
+}
+
+func recycleServerSplitChunk(poolBuf *[]byte) {
+	if poolBuf != nil && cap(*poolBuf) >= splitClientMaxChunk {
+		*poolBuf = (*poolBuf)[:splitClientMaxChunk]
+		splitServerChunkPool.Put(poolBuf)
+	}
+}
+
+// ReadSplitUplinkBody reads a bounded Split-H2 uplink POST body, using
+// splitServerChunkPool to avoid repeated slice growth when Content-Length is known.
+func ReadSplitUplinkBody(body io.Reader, contentLength int64) ([]byte, *[]byte, error) {
+	if contentLength > MaxSplitChunkSize {
+		return nil, nil, fmt.Errorf("fronting: uplink chunk exceeds max size %d", contentLength)
+	}
+	if contentLength == 0 {
+		return nil, nil, nil
+	}
+	if contentLength > 0 && contentLength <= splitClientMaxChunk {
+		bufp := splitServerChunkPool.Get().(*[]byte)
+		data := (*bufp)[:int(contentLength)]
+		if _, err := io.ReadFull(body, data); err != nil {
+			recycleServerSplitChunk(bufp)
+			return nil, nil, err
+		}
+		return data, bufp, nil
+	}
+	if contentLength > 0 {
+		data := make([]byte, int(contentLength))
+		if _, err := io.ReadFull(body, data); err != nil {
+			return nil, nil, err
+		}
+		return data, nil, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(body, MaxSplitChunkSize+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(data) > MaxSplitChunkSize {
+		return nil, nil, errors.New("fronting: uplink chunk exceeds max size")
+	}
+	return data, nil, nil
+}
+
+// RecycleSplitUplinkBody returns a buffer obtained from ReadSplitUplinkBody if it
+// was not transferred to DeliverUplinkPooled.
+func RecycleSplitUplinkBody(poolBuf *[]byte) {
+	recycleServerSplitChunk(poolBuf)
+}
 
 var (
 	errSplitSessionNotFound    = errors.New("fronting: split session not found")
@@ -83,6 +151,20 @@ func (r *SplitSessionRegistry) AttachDownlink(sid string, w http.ResponseWriter,
 // If sid is not yet paired with a GET downlink, only seq == 0 may create a
 // pending session (bounded by maxPendingSplitSessions and splitPairingTimeout).
 func (r *SplitSessionRegistry) DeliverUplink(ctx context.Context, sid string, seq uint64, data []byte) error {
+	return r.deliverUplinkChunk(ctx, sid, seq, splitChunk{data: data})
+}
+
+// DeliverUplinkPooled delivers a pooled uplink chunk and takes ownership of
+// poolBuf when returning nil; on error poolBuf is recycled immediately.
+func (r *SplitSessionRegistry) DeliverUplinkPooled(ctx context.Context, sid string, seq uint64, data []byte, poolBuf *[]byte) error {
+	err := r.deliverUplinkChunk(ctx, sid, seq, splitChunk{data: data, poolBuf: poolBuf})
+	if err != nil && poolBuf != nil {
+		recycleServerSplitChunk(poolBuf)
+	}
+	return err
+}
+
+func (r *SplitSessionRegistry) deliverUplinkChunk(ctx context.Context, sid string, seq uint64, chunk splitChunk) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -111,7 +193,7 @@ func (r *SplitSessionRegistry) DeliverUplink(ctx context.Context, sid string, se
 	}
 	r.mu.Unlock()
 
-	return s.enqueueUplink(ctx, seq, data)
+	return s.enqueueUplink(ctx, seq, chunk)
 }
 
 // HasSession reports whether sid is currently registered.
@@ -162,29 +244,32 @@ type SplitH2ServerConn struct {
 	local            net.Addr
 
 	nextSeq       uint64
-	pending       map[uint64][]byte
-	readQueue     [][]byte
-	readLeft      []byte
+	pending       map[uint64]splitChunk
+	readQueue     []splitChunk
+	readQueueHead int
+	readLeftChunk splitChunk
 	bufferedBytes int
 
-	closed       bool
-	closedCh     chan struct{}
-	readNotify   chan struct{}
-	spaceNotify  chan struct{}
-	readTimer    *time.Timer
-	stopCtxWatch func() bool
-	readExpired  atomic.Bool
-	writeMu      sync.Mutex
-	writing      atomic.Bool
-	closedWrite  atomic.Bool
-	closeOnce    sync.Once
+	closed             bool
+	closedCh           chan struct{}
+	readNotify         chan struct{}
+	spaceNotify        chan struct{}
+	readTimer          *time.Timer
+	readDeadlineAt     time.Time
+	readDeadlineActive bool
+	stopCtxWatch       func() bool
+	readExpired        atomic.Bool
+	writeMu            sync.Mutex
+	writing            atomic.Bool
+	closedWrite        atomic.Bool
+	closeOnce          sync.Once
 }
 
 func newSplitH2ServerConn(reg *SplitSessionRegistry, sid string) *SplitH2ServerConn {
 	return &SplitH2ServerConn{
 		reg:         reg,
 		sid:         sid,
-		pending:     make(map[uint64][]byte),
+		pending:     make(map[uint64]splitChunk),
 		closedCh:    make(chan struct{}),
 		readNotify:  make(chan struct{}, 1),
 		spaceNotify: make(chan struct{}, 1),
@@ -244,7 +329,7 @@ func (c *SplitH2ServerConn) attachDownlink(w http.ResponseWriter, flusher http.F
 	return nil
 }
 
-func (c *SplitH2ServerConn) enqueueUplink(ctx context.Context, seq uint64, data []byte) error {
+func (c *SplitH2ServerConn) enqueueUplink(ctx context.Context, seq uint64, chunk splitChunk) error {
 	for {
 		c.mu.Lock()
 		if c.closed {
@@ -263,7 +348,7 @@ func (c *SplitH2ServerConn) enqueueUplink(ctx context.Context, seq uint64, data 
 			c.mu.Unlock()
 			return errSplitGapTooLarge
 		}
-		if c.bufferedBytes > 0 && c.bufferedBytes+len(data) > maxSplitUplinkBytes {
+		if c.bufferedBytes > 0 && c.bufferedBytes+len(chunk.data) > maxSplitUplinkBytes {
 			c.mu.Unlock()
 			select {
 			case <-c.spaceNotify:
@@ -275,17 +360,19 @@ func (c *SplitH2ServerConn) enqueueUplink(ctx context.Context, seq uint64, data 
 			}
 		}
 
-		c.pending[seq] = data
-		c.bufferedBytes += len(data)
+		c.pending[seq] = chunk
+		c.bufferedBytes += len(chunk.data)
 		for {
-			chunk, ok := c.pending[c.nextSeq]
+			ready, ok := c.pending[c.nextSeq]
 			if !ok {
 				break
 			}
 			delete(c.pending, c.nextSeq)
 			c.nextSeq++
-			if len(chunk) > 0 {
-				c.readQueue = append(c.readQueue, chunk)
+			if len(ready.data) > 0 {
+				c.readQueue = append(c.readQueue, ready)
+			} else if ready.poolBuf != nil {
+				recycleServerSplitChunk(ready.poolBuf)
 			}
 		}
 		c.mu.Unlock()
@@ -302,9 +389,13 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 	if c.readExpired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}
-	if len(c.readLeft) > 0 {
-		n := copy(p, c.readLeft)
-		c.readLeft = c.readLeft[n:]
+	if len(c.readLeftChunk.data) > 0 {
+		n := copy(p, c.readLeftChunk.data)
+		c.readLeftChunk.data = c.readLeftChunk.data[n:]
+		if len(c.readLeftChunk.data) == 0 && c.readLeftChunk.poolBuf != nil {
+			recycleServerSplitChunk(c.readLeftChunk.poolBuf)
+			c.readLeftChunk.poolBuf = nil
+		}
 		return n, nil
 	}
 
@@ -314,14 +405,15 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 			c.mu.Unlock()
 			return 0, os.ErrDeadlineExceeded
 		}
-		if len(c.readQueue) > 0 {
-			chunk := c.readQueue[0]
-			c.readQueue[0] = nil
-			c.readQueue = c.readQueue[1:]
-			if len(c.readQueue) == 0 {
-				c.readQueue = nil
+		if c.readQueueHead < len(c.readQueue) {
+			chunk := c.readQueue[c.readQueueHead]
+			c.readQueue[c.readQueueHead] = splitChunk{}
+			c.readQueueHead++
+			if c.readQueueHead == len(c.readQueue) {
+				c.readQueue = c.readQueue[:0]
+				c.readQueueHead = 0
 			}
-			c.bufferedBytes -= len(chunk)
+			c.bufferedBytes -= len(chunk.data)
 			c.mu.Unlock()
 
 			select {
@@ -329,9 +421,11 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 			default:
 			}
 
-			n := copy(p, chunk)
-			if n < len(chunk) {
-				c.readLeft = chunk[n:]
+			n := copy(p, chunk.data)
+			if n < len(chunk.data) {
+				c.readLeftChunk = splitChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
+			} else if chunk.poolBuf != nil {
+				recycleServerSplitChunk(chunk.poolBuf)
 			}
 			return n, nil
 		}
@@ -370,22 +464,39 @@ func (c *SplitH2ServerConn) Close() error {
 
 		c.mu.Lock()
 		c.closed = true
+		c.readDeadlineActive = false
 		if c.pairTimer != nil {
 			c.pairTimer.Stop()
 			c.pairTimer = nil
 		}
 		if c.readTimer != nil {
 			c.readTimer.Stop()
-			c.readTimer = nil
 		}
 		stopWatch := c.stopCtxWatch
 		c.stopCtxWatch = nil
+		pending := c.pending
 		c.pending = nil
+		var queued []splitChunk
+		if c.readQueueHead < len(c.readQueue) {
+			queued = c.readQueue[c.readQueueHead:]
+		}
 		c.readQueue = nil
+		c.readQueueHead = 0
 		c.bufferedBytes = 0
 		rc := c.rc
 		close(c.closedCh)
 		c.mu.Unlock()
+
+		for _, ch := range pending {
+			if ch.poolBuf != nil {
+				recycleServerSplitChunk(ch.poolBuf)
+			}
+		}
+		for _, ch := range queued {
+			if ch.poolBuf != nil {
+				recycleServerSplitChunk(ch.poolBuf)
+			}
+		}
 
 		if stopWatch != nil {
 			stopWatch()
@@ -419,18 +530,22 @@ func (c *SplitH2ServerConn) SetReadDeadline(t time.Time) error {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
 	if t.IsZero() {
+		c.readDeadlineActive = false
 		c.readExpired.Store(false)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
+		c.readDeadlineActive = false
 		c.readExpired.Store(true)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		select {
 		case c.readNotify <- struct{}{}:
@@ -439,15 +554,30 @@ func (c *SplitH2ServerConn) SetReadDeadline(t time.Time) error {
 		return nil
 	}
 	c.readExpired.Store(false)
-	c.readTimer = time.AfterFunc(d, func() {
-		c.readExpired.Store(true)
-		select {
-		case c.readNotify <- struct{}{}:
-		default:
-		}
-	})
+	c.readDeadlineAt = t
+	c.readDeadlineActive = true
+	if c.readTimer == nil {
+		c.readTimer = time.AfterFunc(d, c.onReadDeadline)
+	} else {
+		c.readTimer.Reset(d)
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *SplitH2ServerConn) onReadDeadline() {
+	c.mu.Lock()
+	if c.closed || !c.readDeadlineActive || time.Now().Before(c.readDeadlineAt) {
+		c.mu.Unlock()
+		return
+	}
+	c.readDeadlineActive = false
+	c.readExpired.Store(true)
+	c.mu.Unlock()
+	select {
+	case c.readNotify <- struct{}{}:
+	default:
+	}
 }
 
 func (c *SplitH2ServerConn) SetWriteDeadline(t time.Time) error {
@@ -487,19 +617,25 @@ type SplitH2ClientConn struct {
 	initOnce sync.Once
 	initErr  error
 
-	mu           sync.Mutex
-	closed       bool
-	closedCh     chan struct{}
-	abortErr     error
-	sendBuf      []byte
-	nextSeq      uint64
-	sendNotify   chan struct{}
-	spaceNotify  chan struct{}
-	readTimer    *time.Timer
-	writeTimer   *time.Timer
-	readExpired  atomic.Bool
-	writeExpired atomic.Bool
-	closeOnce    sync.Once
+	mu                  sync.Mutex
+	closed              bool
+	closedCh            chan struct{}
+	abortErr            error
+	sendRing            []byte
+	sendHead            int
+	sendLen             int
+	nextSeq             uint64
+	sendNotify          chan struct{}
+	spaceNotify         chan struct{}
+	readTimer           *time.Timer
+	readDeadlineAt      time.Time
+	readDeadlineActive  bool
+	writeTimer          *time.Timer
+	writeDeadlineAt     time.Time
+	writeDeadlineActive bool
+	readExpired         atomic.Bool
+	writeExpired        atomic.Bool
+	closeOnce           sync.Once
 }
 
 // NewSplitH2ClientConn creates and starts a Split-H2 client connection using the
@@ -671,7 +807,7 @@ func (c *SplitH2ClientConn) Write(p []byte) (int, error) {
 			return off, err
 		}
 
-		avail := splitClientMaxSendBuf - len(c.sendBuf)
+		avail := splitClientMaxSendBuf - c.sendLen
 		if avail <= 0 {
 			c.mu.Unlock()
 			select {
@@ -689,7 +825,7 @@ func (c *SplitH2ClientConn) Write(p []byte) (int, error) {
 		if chunk > avail {
 			chunk = avail
 		}
-		c.sendBuf = append(c.sendBuf, p[off:off+chunk]...)
+		c.appendSendRingLocked(p[off : off+chunk])
 		off += chunk
 		c.mu.Unlock()
 
@@ -702,11 +838,51 @@ func (c *SplitH2ClientConn) Write(p []byte) (int, error) {
 	return off, nil
 }
 
+func (c *SplitH2ClientConn) appendSendRingLocked(src []byte) {
+	need := c.sendLen + len(src)
+	if need > len(c.sendRing) {
+		newCap := len(c.sendRing) * 2
+		if newCap < 64<<10 {
+			newCap = 64 << 10
+		}
+		for newCap < need {
+			newCap *= 2
+		}
+		if newCap > splitClientMaxSendBuf {
+			newCap = splitClientMaxSendBuf
+		}
+		newRing := make([]byte, newCap)
+		if c.sendLen > 0 {
+			first := len(c.sendRing) - c.sendHead
+			if first > c.sendLen {
+				first = c.sendLen
+			}
+			copy(newRing, c.sendRing[c.sendHead:c.sendHead+first])
+			if first < c.sendLen {
+				copy(newRing[first:], c.sendRing[:c.sendLen-first])
+			}
+		}
+		c.sendRing = newRing
+		c.sendHead = 0
+	}
+
+	tail := (c.sendHead + c.sendLen) % len(c.sendRing)
+	first := len(c.sendRing) - tail
+	if first > len(src) {
+		first = len(src)
+	}
+	copy(c.sendRing[tail:], src[:first])
+	if first < len(src) {
+		copy(c.sendRing, src[first:])
+	}
+	c.sendLen += len(src)
+}
+
 func (c *SplitH2ClientConn) uploadLoop() {
 	sem := make(chan struct{}, splitClientMaxInFlight)
 
 	for {
-		chunk, seq, ok := c.nextUploadChunk()
+		bufp, n, seq, ok := c.nextUploadChunk()
 		if !ok {
 			return
 		}
@@ -714,7 +890,7 @@ func (c *SplitH2ClientConn) uploadLoop() {
 		// Send seq == 0 synchronously before pipelining so session creation at
 		// the server always sees seq == 0 before any seq > 0 arrives.
 		if seq == 0 {
-			if err := c.sendChunk(seq, chunk); err != nil {
+			if err := c.sendChunk(seq, bufp, n); err != nil {
 				c.abort(err)
 				return
 			}
@@ -727,31 +903,42 @@ func (c *SplitH2ClientConn) uploadLoop() {
 			return
 		}
 
-		go func(seqNum uint64, data []byte) {
+		go func(seqNum uint64, bp *[]byte, size int) {
 			defer func() { <-sem }()
-			if err := c.sendChunk(seqNum, data); err != nil {
+			if err := c.sendChunk(seqNum, bp, size); err != nil {
 				c.abort(err)
 			}
-		}(seq, chunk)
+		}(seq, bufp, n)
 	}
 }
 
-func (c *SplitH2ClientConn) nextUploadChunk() ([]byte, uint64, bool) {
+func (c *SplitH2ClientConn) nextUploadChunk() (*[]byte, int, uint64, bool) {
 	for {
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
-		if len(c.sendBuf) > 0 {
-			n := len(c.sendBuf)
+		if c.sendLen > 0 {
+			n := c.sendLen
 			if n > splitClientMaxChunk {
 				n = splitClientMaxChunk
 			}
-			chunk := make([]byte, n)
-			copy(chunk, c.sendBuf[:n])
-			copy(c.sendBuf, c.sendBuf[n:])
-			c.sendBuf = c.sendBuf[:len(c.sendBuf)-n]
+			bufp := splitClientChunkPool.Get().(*[]byte)
+			dst := (*bufp)[:n]
+			first := len(c.sendRing) - c.sendHead
+			if first > n {
+				first = n
+			}
+			copy(dst, c.sendRing[c.sendHead:c.sendHead+first])
+			if first < n {
+				copy(dst[first:], c.sendRing[:n-first])
+			}
+			c.sendHead = (c.sendHead + n) % len(c.sendRing)
+			c.sendLen -= n
+			if c.sendLen == 0 {
+				c.sendHead = 0
+			}
 			seq := c.nextSeq
 			c.nextSeq++
 			c.mu.Unlock()
@@ -760,24 +947,25 @@ func (c *SplitH2ClientConn) nextUploadChunk() ([]byte, uint64, bool) {
 			case c.spaceNotify <- struct{}{}:
 			default:
 			}
-			return chunk, seq, true
+			return bufp, n, seq, true
 		}
 		c.mu.Unlock()
 
 		select {
 		case <-c.sendNotify:
 		case <-c.closedCh:
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
 	}
 }
 
-func (c *SplitH2ClientConn) sendChunk(seq uint64, data []byte) error {
+func (c *SplitH2ClientConn) sendChunk(seq uint64, bufp *[]byte, n int) error {
+	data := (*bufp)[:n]
 	req, err := http.NewRequestWithContext(c.reqCtx, http.MethodPost, c.endpoint.String(), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	req.ContentLength = int64(len(data))
+	req.ContentLength = int64(n)
 	req.Host = c.host
 	ApplyBrowserHeaders(req.Header, c.fingerprint)
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -794,6 +982,11 @@ func (c *SplitH2ClientConn) sendChunk(seq uint64, data []byte) error {
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
+
+	// Recycle upload chunk buffer only after a completed round-trip so http2 cannot
+	// read from it concurrently after returning an error.
+	*bufp = (*bufp)[:splitClientMaxChunk]
+	splitClientChunkPool.Put(bufp)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fronting: split h2 uplink seq=%d status %s", seq, resp.Status)
@@ -812,15 +1005,17 @@ func (c *SplitH2ClientConn) abort(err error) {
 			err = net.ErrClosed
 		}
 		c.abortErr = err
+		c.readDeadlineActive = false
+		c.writeDeadlineActive = false
 		if c.readTimer != nil {
 			c.readTimer.Stop()
-			c.readTimer = nil
 		}
 		if c.writeTimer != nil {
 			c.writeTimer.Stop()
-			c.writeTimer = nil
 		}
-		c.sendBuf = nil
+		c.sendRing = nil
+		c.sendHead = 0
+		c.sendLen = 0
 		reader := c.reader
 		cancel := c.reqCancel
 		onClose := c.onClose
@@ -868,29 +1063,48 @@ func (c *SplitH2ClientConn) SetReadDeadline(t time.Time) error {
 		}
 		return net.ErrClosed
 	}
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
 	if t.IsZero() {
+		c.readDeadlineActive = false
 		c.readExpired.Store(false)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
+		c.readDeadlineActive = false
 		c.readExpired.Store(true)
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
 		c.mu.Unlock()
 		c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.readExpired.Store(false)
-	c.readTimer = time.AfterFunc(d, func() {
-		c.readExpired.Store(true)
-		c.abort(os.ErrDeadlineExceeded)
-	})
+	c.readDeadlineAt = t
+	c.readDeadlineActive = true
+	if c.readTimer == nil {
+		c.readTimer = time.AfterFunc(d, c.onReadDeadline)
+	} else {
+		c.readTimer.Reset(d)
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *SplitH2ClientConn) onReadDeadline() {
+	c.mu.Lock()
+	if c.closed || !c.readDeadlineActive || time.Now().Before(c.readDeadlineAt) {
+		c.mu.Unlock()
+		return
+	}
+	c.readDeadlineActive = false
+	c.readExpired.Store(true)
+	c.mu.Unlock()
+	c.abort(os.ErrDeadlineExceeded)
 }
 
 func (c *SplitH2ClientConn) SetWriteDeadline(t time.Time) error {
@@ -903,27 +1117,46 @@ func (c *SplitH2ClientConn) SetWriteDeadline(t time.Time) error {
 		}
 		return net.ErrClosed
 	}
-	if c.writeTimer != nil {
-		c.writeTimer.Stop()
-		c.writeTimer = nil
-	}
 	if t.IsZero() {
+		c.writeDeadlineActive = false
 		c.writeExpired.Store(false)
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
+		c.writeDeadlineActive = false
 		c.writeExpired.Store(true)
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+		}
 		c.mu.Unlock()
 		c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.writeExpired.Store(false)
-	c.writeTimer = time.AfterFunc(d, func() {
-		c.writeExpired.Store(true)
-		c.abort(os.ErrDeadlineExceeded)
-	})
+	c.writeDeadlineAt = t
+	c.writeDeadlineActive = true
+	if c.writeTimer == nil {
+		c.writeTimer = time.AfterFunc(d, c.onWriteDeadline)
+	} else {
+		c.writeTimer.Reset(d)
+	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *SplitH2ClientConn) onWriteDeadline() {
+	c.mu.Lock()
+	if c.closed || !c.writeDeadlineActive || time.Now().Before(c.writeDeadlineAt) {
+		c.mu.Unlock()
+		return
+	}
+	c.writeDeadlineActive = false
+	c.writeExpired.Store(true)
+	c.mu.Unlock()
+	c.abort(os.ErrDeadlineExceeded)
 }

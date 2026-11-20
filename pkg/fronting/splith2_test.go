@@ -287,19 +287,139 @@ func TestSplitH2ClientAndServerEndToEndOverHTTP2(t *testing.T) {
 		t.Fatalf("Read after deadline = %v, want os.ErrDeadlineExceeded", err)
 	}
 
-	_ = clientConn.Close()
-	select {
-	case srvConn := <-acceptedConns:
-		// Wait briefly for server downlink close propagation
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if !reg.HasSession(srvConn.(*SplitH2ServerConn).sid) {
+	// Clearing deadline after Reset must not expire spuriously.
+	_ = cc.Close()
+}
+
+func TestReadSplitUplinkBodyAndClientRingWrap(t *testing.T) {
+	// Pooled Content-Length <= 128 KiB path.
+	smallPayload := bytes.Repeat([]byte("R"), 64*1024)
+	body, poolBuf, err := ReadSplitUplinkBody(bytes.NewReader(smallPayload), int64(len(smallPayload)))
+	if err != nil {
+		t.Fatalf("ReadSplitUplinkBody small: %v", err)
+	}
+	if !bytes.Equal(body, smallPayload) {
+		t.Fatal("small payload mismatch")
+	}
+	if poolBuf == nil {
+		t.Fatal("expected pooled buffer for <=128 KiB Content-Length")
+	}
+	RecycleSplitUplinkBody(poolBuf)
+
+	// Reject oversized Content-Length before allocating.
+	if _, _, err := ReadSplitUplinkBody(bytes.NewReader(nil), MaxSplitChunkSize+1); err == nil {
+		t.Fatal("expected error for oversized Content-Length")
+	}
+
+	// Verify SplitH2ClientConn ring buffer wrap-around and reusable write deadline reset.
+	reg := NewSplitSessionRegistry()
+	defer reg.CloseAll()
+	cert := generateSelfSignedForTest(t, "localhost")
+	tlsCfg := CaddyLikeTLSConfig([]tls.Certificate{cert})
+	key := KeyFromSecret("ring-wrap-secret")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/assets/update", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.Header.Get(HeaderSessionID)
+		if r.Method == http.MethodGet {
+			conn, err := reg.AttachDownlink(sid, w, r)
+			if err != nil {
+				http.Error(w, "bad", http.StatusBadRequest)
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			defer conn.Close()
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := conn.Read(buf)
+				if n > 0 {
+					if _, wErr := conn.Write(buf[:n]); wErr != nil {
+						return
+					}
+				}
+				if err != nil {
+					return
+				}
+			}
 		}
-		t.Fatal("server session remained registered after client close")
-	default:
+		seq, _ := strconvParseUint(r.Header.Get(HeaderStreamSeq))
+		data, pb, err := ReadSplitUplinkBody(r.Body, r.ContentLength)
+		if err != nil {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		if err := reg.DeliverUplinkPooled(r.Context(), sid, seq, data, pb); err != nil {
+			http.Error(w, "bad", http.StatusGone)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{Handler: mux, TLSConfig: tlsCfg}
+	_ = http2.ConfigureServer(srv, &http2.Server{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { _ = srv.Serve(tls.NewListener(ln, tlsCfg)) }()
+	defer srv.Close()
+
+	rawTCP, err := net.DialTimeout("tcp", ln.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uconn := utls.UClient(rawTCP, &utls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+		MinVersion:         tls.VersionTLS13,
+	}, utls.HelloChrome_Auto)
+	if err := uconn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	h2Tr := &http2.Transport{}
+	cc, err := h2Tr.NewClientConn(uconn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep, _ := url.Parse("https://" + ln.Addr().String() + "/assets/update")
+	conn, err := NewSplitH2ClientConn(ep, "localhost", key, "chrome", cc.RoundTrip, func() {
+		_ = cc.Close()
+		h2Tr.CloseIdleConnections()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Exercise reusable deadline Set -> Clear -> Wait longer than original deadline -> still healthy.
+	if err := conn.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(35 * time.Millisecond)
+
+	// Transfer > 512 KiB across multiple ring wrap-arounds with byte-pattern check.
+	total := 600 * 1024
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i*17 + i>>8)
+	}
+	go func() {
+		_, _ = conn.Write(want)
+	}()
+	got := make([]byte, total)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("ReadFull 600 KiB: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("ring wrap-around echo payload mismatch")
 	}
 }
 

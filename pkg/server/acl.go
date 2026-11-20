@@ -150,7 +150,10 @@ func resolveTargetIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 	return result, nil
 }
 
-const targetDialTimeout = 10 * time.Second
+const (
+	targetDialTimeout  = 10 * time.Second
+	happyEyeballsDelay = 250 * time.Millisecond
+)
 
 // dialTarget connects to target while enforcing the private-address policy.
 //
@@ -160,7 +163,12 @@ const targetDialTimeout = 10 * time.Second
 // an internal address inside net.Dial.
 func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error) {
 	if s.config.AllowAll {
-		return (&net.Dialer{Timeout: targetDialTimeout}).DialContext(ctx, "tcp", target)
+		dialer := &net.Dialer{
+			Timeout:       targetDialTimeout,
+			KeepAlive:     30 * time.Second,
+			FallbackDelay: happyEyeballsDelay,
+		}
+		return dialer.DialContext(ctx, "tcp", target)
 	}
 	host, port, err := splitTarget(target)
 	if err != nil {
@@ -175,13 +183,121 @@ func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error
 			return nil, errBlockedTarget
 		}
 	}
-	var lastErr error
-	for _, addr := range addresses {
-		conn, err := (&net.Dialer{Timeout: targetDialTimeout}).DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), port))
-		if err == nil {
-			return conn, nil
+	if len(addresses) == 1 {
+		dialer := &net.Dialer{Timeout: targetDialTimeout, KeepAlive: 30 * time.Second}
+		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(addresses[0].String(), port))
+	}
+	return dialHappyEyeballs(ctx, interleaveAddresses(addresses), port, happyEyeballsDelay, targetDialTimeout)
+}
+
+func interleaveAddresses(addrs []netip.Addr) []netip.Addr {
+	if len(addrs) <= 1 {
+		return addrs
+	}
+	var primary, fallback []netip.Addr
+	firstIsV6 := addrs[0].Is6()
+	for _, addr := range addrs {
+		if addr.Is6() == firstIsV6 {
+			primary = append(primary, addr)
+		} else {
+			fallback = append(fallback, addr)
 		}
-		lastErr = err
+	}
+	if len(fallback) == 0 {
+		return addrs
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for i := 0; i < len(primary) || i < len(fallback); i++ {
+		if i < len(primary) {
+			out = append(out, primary[i])
+		}
+		if i < len(fallback) {
+			out = append(out, fallback[i])
+		}
+	}
+	return out
+}
+
+func dialHappyEyeballs(ctx context.Context, addrs []netip.Addr, port string, staggerDelay, timeout time.Duration) (net.Conn, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("no resolved addresses")
+	}
+
+	type attemptResult struct {
+		conn net.Conn
+		err  error
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	results := make(chan attemptResult, len(addrs))
+	dialOne := func(addr netip.Addr) {
+		dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+		conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(addr.String(), port))
+		results <- attemptResult{conn: conn, err: err}
+	}
+
+	go dialOne(addrs[0])
+	started := 1
+	failures := 0
+	var lastErr error
+
+	timer := time.NewTimer(staggerDelay)
+	defer timer.Stop()
+
+	for failures < len(addrs) {
+		var timerC <-chan time.Time
+		if started < len(addrs) {
+			timerC = timer.C
+		}
+		select {
+		case res := <-results:
+			if res.err == nil {
+				cancel()
+				// Drain already-started attempts in the background so any late connection is closed.
+				go func(remaining int) {
+					for i := 0; i < remaining; i++ {
+						r := <-results
+						if r.conn != nil {
+							_ = r.conn.Close()
+						}
+					}
+				}(started - failures - 1)
+				return res.conn, nil
+			}
+			failures++
+			lastErr = res.err
+			if started < len(addrs) {
+				// Launch the next candidate immediately instead of waiting for stagger.
+				go dialOne(addrs[started])
+				started++
+				if started < len(addrs) {
+					timer.Reset(staggerDelay)
+				}
+			}
+		case <-timerC:
+			if started < len(addrs) {
+				go dialOne(addrs[started])
+				started++
+				if started < len(addrs) {
+					timer.Reset(staggerDelay)
+				}
+			}
+		case <-dialCtx.Done():
+			go func(remaining int) {
+				for i := 0; i < remaining; i++ {
+					r := <-results
+					if r.conn != nil {
+						_ = r.conn.Close()
+					}
+				}
+			}(started - failures)
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, dialCtx.Err()
+		}
 	}
 	return nil, lastErr
 }
