@@ -9,6 +9,26 @@
 
 ## [未发布]
 
+## [1.4.0] - 2026-11-20
+
+### 新增
+- **Split-H2（`split-h2`）默认前置传输**：采用类似 XHTTP/SplitHTTP 的流式 `GET` 下行通道配对带有限 `Content-Length` 的流水线 `POST` 上行通道，使用绑定到 HMAC 签名的顺序请求头（`X-Session-Id` / `X-Stream-Seq`，转发封面站前剥离）；原有的单流全双工 `POST` 保留为 `h2-stream`。
+- **单流滑动窗口流控**（`CmdWindowUpdate = 0x0E`，通过 `SETTINGS` 中的 `flow-control=1` / `stream-window` 协商开启）与非阻塞每流接收队列溢出隔离（`ErrStreamRecvOverflow`），防止单条慢流队头阻塞整条多路复用会话。
+- **严格 SNI 与 `Host` 匹配**（`fronting.strict_sni` / `--front-strict-sni`，默认 `true`）：仅当客户端 SNI 位于服务器证书上时才完成 TLS 握手（模拟原版 Caddy 发送 TLS `internal_error` 告警拒绝未知或空 SNI），且 `Host` 不在证书上的未认证请求返回空 `200`（自动生成的自签证书豁免）。启用后客户端需发送证书上的 SNI；CDN 无 SNI 回源等场景可关闭以恢复旧行为。详见 [Strict SNI and Host matching](docs/fronting.md#strict-sni-and-host-matching)。
+
+### 变更
+- **流量整形重构（`pkg/shaping`）**：移除每 5 ms 持续发送哑包的固定速率模式，改为空闲静默、仅偶发变长随机杂乱突发包，并采用有界写缓冲配合 `sync.Cond` 背压避免内存膨胀。
+- **对齐现代 Caddy（Go 1.25）抗检测特性**：`CaddyLikeTLSConfig` 改用 Go 默认 `CurvePreferences` 与 `CipherSuites`（支持后量子 `X25519MLKEM768`）、标准 `&http2.Server{}` 默认参数（16 KiB 帧与默认窗口，移除未加密 H2）、使 `User-Agent` / `Sec-Fetch-*` 与所选 uTLS 指纹严格同步（`Chrome/133`、`Firefox/120`、`Safari/16.0`）、在会话建立路径添加对称随机 `AuthJitter()`、站点伪装上游失败时返回符合 Caddy 习惯的空响应体 `502 Bad Gateway`。Raw TLS 模式（`--fronting=false`）保持原样不变。
+- 客户端 Surge 控制器现应用服务端下发的 `ServerSettings` Surge 限速策略（`surge_mode`、`surge_rate`、`surge_burst`）；HTTP 与 SOCKS5 中继统一复用 `RelayBufPool` 并执行显式资源清理。
+
+### 修复
+- **前置层读写超时与 Flush 假死**：为 `HTTPServerConn`（基于 `http.ResponseController`）、`SplitH2ServerConn` 与 `HTTPClientConn` 接入真实读写截止时间与无泄漏定时器/上下文清理；客户端建连增加 10 秒 TLS 握手超时与 15 秒认证写入超时；修复 `HTTPServerConn` 恰好落在 `bufio` 4096 字节边界时不 Flush 导致的偶发假死。
+- 修复 `shaping.Conn` 的 `writeLoop` 在底层连接写失败时的自死锁问题。
+- 优化弱网与切网恢复：在 `SendHeartbeat` 失败时立即通过 `mux.Pool.RemoveSession` 驱逐死会话，并在 `Client.OpenStream` 中透明重试新建会话。
+- 修复 `splitHostPort` 对 IPv6 地址与端口的解析问题。
+
+## [1.3.3] - 2026-11-12
+
 ### 修复
 - 重新运行安装向导（`tsunami-manage config`）改不了任何设置。它先问“是否复用现有设置？”，默认是“是”，而选“是”会跳过全部问题，于是上一次部署的域名、TLS 方式和站点伪装被原样沿用。现在向导逐项提问，每一项以当前值为默认：按 Enter 保留，输入新值就修改。
 - 对那个问题回答“否”也没用：站点伪装菜单总是预选“本地站点”，并把上一次的上游地址当默认，一路按 Enter 会把 remote 站点变成指向远程地址的 local 站点；fronting 路径和密钥还会重新生成，已发出去的客户端命令随之失效。现在菜单预选当前模式，上游默认值只在模式不变时提供，路径、密钥和密码都会保留。
@@ -16,13 +36,15 @@
 - 在管理菜单里打开状态或客户端信息，会把保存的设置加载进当前 shell，向导随后把它们误当成命令行指定的值，跳过 TLS 和站点两个问题。现在保存的设置单独读取，只有真正的环境变量才会跳过提问。
 - 本地站点上游的提问在输入结束后会无限重复；现在连续十次空回答后放弃。
 - 域名输错之后，下一次提示会丢失默认值，按 Enter 就选中了自签名测试模式。现在默认值会保留。
-- fronting 对任何客户端都会完成 TLS 握手并出示站点证书，包括不带 SNI 的（直接扫描 `https://<IP>/`）和 SNI 错误的，域名因此暴露。原版 Caddy 会用 TLS `internal_error` 告警拒绝这类握手。现在 fronting 监听器行为一致：只有 SNI 是证书上的域名时才完成握手。
-- fronting 对任意 `Host` 头都返回伪装站点。现在 `Host` 不在证书上的请求得到空的 `200`，与 Caddy 在没有站点匹配时的响应一致。已认证的隧道不受影响。
 
 ### 变更
-- 客户端发送的 SNI 必须是服务器证书上的域名（`--sni`，默认取服务器主机名）。CDN 回源不带 SNI，或客户端使用其他 SNI 的部署，可以在 `fronting` 下设置 `"strict_sni": false`，或使用 `--front-strict-sni=false` 恢复原行为。自动生成的自签名证书不受此限制。详见 [Strict SNI and Host matching](docs/fronting.md#strict-sni-and-host-matching)。
 - 自己设置的站点名称在更换域名后保留；由旧域名派生的名称会按新域名重新派生。
 - 非交互式安装（`TSUNAMI_ASSUME_YES=1`，或没有终端的管道方式）行为不变：不读取上一次部署。
+
+## [1.3.2] - 2026-11-12
+
+### 新增
+- 新增 OpenWrt（`aarch64`、`armv7`、`x86`、`x86_64`）、32 位 x86（`linux-386`、`windows-386`）与 Linux ARMv7（`linux-armv7`）发布压缩包，并在 CI 中加入 QEMU 用户态冒烟测试。
 
 ## [1.3.1] - 2026-11-03
 

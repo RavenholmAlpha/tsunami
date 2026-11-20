@@ -393,8 +393,10 @@ func (c *SplitH2ServerConn) Close() error {
 		if c.writing.Load() && rc != nil {
 			_ = rc.SetWriteDeadline(time.Unix(1, 0))
 		}
-		// Ensure no goroutine remains inside ResponseWriter.Write/Flush once Close returns.
+		// Wait for any in-flight ResponseWriter.Write/Flush to finish and clear writer refs.
 		c.writeMu.Lock()
+		c.writer = nil
+		c.flusher = nil
 		c.writeMu.Unlock()
 
 		if c.reg != nil {

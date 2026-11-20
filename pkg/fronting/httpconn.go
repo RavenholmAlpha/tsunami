@@ -51,7 +51,7 @@ func (c *HTTPServerConn) Read(p []byte) (int, error) {
 func (c *HTTPServerConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.closed.Load() {
+	if c.closed.Load() || c.writer == nil {
 		return 0, net.ErrClosed
 	}
 
@@ -76,7 +76,10 @@ func (c *HTTPServerConn) Close() error {
 	if c.writing.Load() && c.rc != nil {
 		_ = c.rc.SetWriteDeadline(time.Unix(1, 0))
 	}
+	// Wait for any in-flight ResponseWriter.Write/Flush to finish and clear writer refs.
 	c.writeMu.Lock()
+	c.writer = nil
+	c.flusher = nil
 	c.writeMu.Unlock()
 	return err
 }
