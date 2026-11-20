@@ -49,6 +49,8 @@ const (
 	CmdBandwidthReport Command = 0x0C
 	// CmdStreamPriority sets the priority of a Stream.
 	CmdStreamPriority Command = 0x0D
+	// CmdWindowUpdate grants additional send window bytes for a Stream.
+	CmdWindowUpdate Command = 0x0E
 )
 
 // String returns the human-readable name for a command.
@@ -82,6 +84,8 @@ func (c Command) String() string {
 		return "BW_REPORT"
 	case CmdStreamPriority:
 		return "STREAM_PRIORITY"
+	case CmdWindowUpdate:
+		return "WINDOW_UPDATE"
 	default:
 		return "UNKNOWN"
 	}
@@ -92,7 +96,8 @@ func (c Command) HasData() bool {
 	switch c {
 	case CmdWaste, CmdPSH, CmdSettings, CmdAlert,
 		CmdUpdatePaddingScheme, CmdSYNACK, CmdServerSettings,
-		CmdSurgeCtrl, CmdBandwidthReport, CmdStreamPriority:
+		CmdSurgeCtrl, CmdBandwidthReport, CmdStreamPriority,
+		CmdWindowUpdate:
 		return true
 	default:
 		return false

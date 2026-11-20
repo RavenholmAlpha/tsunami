@@ -12,6 +12,8 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 		PaddingMD5:     "abcdef0123456789",
 		SurgeBandwidth: 100,
 		PaddingV2:      true,
+		FlowControl:    true,
+		StreamWindow:   DefaultStreamWindow,
 	}
 
 	data := EncodeClientSettings(original)
@@ -35,6 +37,12 @@ func TestClientSettingsEncodeDecode(t *testing.T) {
 	if !decoded.PaddingV2 {
 		t.Error("padding-v2 capability was not round-tripped")
 	}
+	if !decoded.FlowControl {
+		t.Error("flow-control capability was not round-tripped")
+	}
+	if decoded.StreamWindow != original.StreamWindow {
+		t.Errorf("streamWindow = %d, want %d", decoded.StreamWindow, original.StreamWindow)
+	}
 }
 
 // TestClientSettingsLegacyDecode ensures a pre-v2 client (no padding-v2 key)
@@ -49,10 +57,17 @@ func TestClientSettingsLegacyDecode(t *testing.T) {
 	if decoded.PaddingV2 {
 		t.Fatal("legacy settings must not advertise padding-v2")
 	}
+	if decoded.FlowControl || decoded.StreamWindow != 0 {
+		t.Fatal("legacy settings must not advertise flow-control")
+	}
 	// Encoding a client without the capability must omit the key so old
 	// servers keep ignoring the settings blob.
-	if bytes.Contains(EncodeClientSettings(decoded), []byte("padding-v2")) {
+	encoded := EncodeClientSettings(decoded)
+	if bytes.Contains(encoded, []byte("padding-v2")) {
 		t.Fatal("padding-v2 key must be omitted when the capability is not set")
+	}
+	if bytes.Contains(encoded, []byte("flow-control")) || bytes.Contains(encoded, []byte("stream-window")) {
+		t.Fatal("flow-control keys must be omitted when not set")
 	}
 }
 
@@ -61,6 +76,8 @@ func TestServerSettingsEncodeDecode(t *testing.T) {
 		Version:        3,
 		SurgeMode:      SurgeModeAuto,
 		MaxConnections: 4,
+		FlowControl:    true,
+		StreamWindow:   DefaultStreamWindow,
 	}
 
 	data := EncodeServerSettings(original)
@@ -77,6 +94,12 @@ func TestServerSettingsEncodeDecode(t *testing.T) {
 	}
 	if decoded.MaxConnections != original.MaxConnections {
 		t.Errorf("maxConnections = %d, want %d", decoded.MaxConnections, original.MaxConnections)
+	}
+	if !decoded.FlowControl {
+		t.Error("flow-control capability was not round-tripped")
+	}
+	if decoded.StreamWindow != original.StreamWindow {
+		t.Errorf("streamWindow = %d, want %d", decoded.StreamWindow, original.StreamWindow)
 	}
 }
 

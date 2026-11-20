@@ -2,6 +2,8 @@ package shaping
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -49,7 +51,7 @@ func TestRoundTrip(t *testing.T) {
 	msg := []byte("hello shaped world")
 
 	go func() {
-		client.Write(msg)
+		_, _ = client.Write(msg)
 	}()
 
 	buf := make([]byte, 256)
@@ -62,7 +64,7 @@ func TestRoundTrip(t *testing.T) {
 			t.Fatalf("timeout: got %d bytes, want %d", len(received), len(msg))
 		default:
 		}
-		server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, err := server.Read(buf)
 		if err != nil {
 			t.Fatalf("read: %v", err)
@@ -93,7 +95,7 @@ func TestLargePayload(t *testing.T) {
 	}
 
 	go func() {
-		client.Write(payload)
+		_, _ = client.Write(payload)
 	}()
 
 	received := make([]byte, 0, len(payload))
@@ -106,7 +108,7 @@ func TestLargePayload(t *testing.T) {
 			t.Fatalf("timeout: got %d bytes, want %d", len(received), len(payload))
 		default:
 		}
-		server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = server.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, err := server.Read(buf)
 		if err != nil {
 			t.Fatalf("read: %v", err)
@@ -119,72 +121,207 @@ func TestLargePayload(t *testing.T) {
 	}
 }
 
-func TestDummyFramesOnIdle(t *testing.T) {
+func TestIdleSilentNoContinuousDummyFlood(t *testing.T) {
 	rawA, rawB := tcpPipe(t)
 	cfg := Config{
-		FrameSize:  32,
-		Interval:   2 * time.Millisecond,
-		BurstSlots: 1,
+		FrameSize:            64,
+		Interval:             1 * time.Millisecond,
+		BurstSlots:           4,
+		IdleChaffMinInterval: 5 * time.Second,
+		IdleChaffMaxInterval: 10 * time.Second,
 	}
-	// Only wrap one side — read raw from the other
 	shaped := Wrap(rawA, cfg)
 	defer shaped.Close()
+	defer rawB.Close()
 
-	time.Sleep(20 * time.Millisecond)
-
-	buf := make([]byte, 32*20)
-	rawB.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	n, _ := io.ReadAtLeast(rawB, buf, 32)
-	rawB.Close()
-
-	if n < 32 {
-		t.Fatalf("expected at least one frame (32 bytes), got %d bytes", n)
+	// Before IdleChaffMinInterval elapses, an idle connection must emit zero bytes.
+	buf := make([]byte, 64)
+	_ = rawB.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+	n, err := rawB.Read(buf)
+	if n > 0 {
+		t.Fatalf("idle connection emitted %d unexpected bytes before chaff interval", n)
 	}
-
-	frames := n / 32
-	dummyCount := 0
-	for i := 0; i < frames; i++ {
-		if buf[i*32] == frameTypeDummy {
-			dummyCount++
-		}
-	}
-	if dummyCount == 0 {
-		t.Error("expected dummy frames during idle, got none")
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("expected read timeout while idle, got %v", err)
 	}
 }
 
-func TestFixedFrameSize(t *testing.T) {
+func TestSparseRandomChaffOnIdle(t *testing.T) {
 	rawA, rawB := tcpPipe(t)
 	cfg := Config{
-		FrameSize:  48,
-		Interval:   1 * time.Millisecond,
-		BurstSlots: 4,
+		FrameSize:              128,
+		Interval:               1 * time.Millisecond,
+		BurstSlots:             4,
+		IdleChaffMinInterval:   15 * time.Millisecond,
+		IdleChaffMaxInterval:   30 * time.Millisecond,
+		IdleChaffMinSize:       16,
+		IdleChaffMaxSize:       96,
+		IdleChaffMaxBurst:      3,
+		IdleChaffBurstMinDelay: 1 * time.Millisecond,
+		IdleChaffBurstMaxDelay: 3 * time.Millisecond,
 	}
 	shaped := Wrap(rawA, cfg)
+	defer shaped.Close()
+	defer rawB.Close()
 
-	go func() {
-		shaped.Write([]byte("test data"))
-		time.Sleep(10 * time.Millisecond)
-		shaped.Close()
-	}()
-
-	var total int
-	buf := make([]byte, 4096)
-	for {
-		rawB.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-		n, err := rawB.Read(buf[total:])
-		total += n
-		if err != nil {
-			break
+	// Inspect raw wire frames produced while idle.
+	_ = rawB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var hdr [outerHeaderLen]byte
+	seenSizes := make(map[int]struct{})
+	var nonZeroPayloads int
+	for i := 0; i < 4; i++ {
+		if _, err := io.ReadFull(rawB, hdr[:]); err != nil {
+			t.Fatalf("read chaff header %d: %v", i, err)
+		}
+		if hdr[0] != frameTypeDummy {
+			t.Fatalf("chaff frame %d type = %d, want %d", i, hdr[0], frameTypeDummy)
+		}
+		bodyLen := int(binary.BigEndian.Uint16(hdr[1:3]))
+		if bodyLen < cfg.IdleChaffMinSize || bodyLen > cfg.IdleChaffMaxSize {
+			t.Fatalf("chaff body len = %d, want [%d, %d]", bodyLen, cfg.IdleChaffMinSize, cfg.IdleChaffMaxSize)
+		}
+		seenSizes[bodyLen] = struct{}{}
+		body := make([]byte, bodyLen)
+		if _, err := io.ReadFull(rawB, body); err != nil {
+			t.Fatalf("read chaff body %d: %v", i, err)
+		}
+		for _, b := range body {
+			if b != 0 {
+				nonZeroPayloads++
+				break
+			}
 		}
 	}
-	rawB.Close()
-
-	if total == 0 {
-		t.Fatal("no data received")
+	if nonZeroPayloads == 0 {
+		t.Fatal("chaff frames contained all zeros instead of random noise")
 	}
-	if total%48 != 0 {
-		t.Errorf("total bytes %d is not a multiple of frame size 48", total)
+	if len(seenSizes) < 2 {
+		t.Fatalf("chaff frames had constant size: %v", seenSizes)
+	}
+}
+
+func TestSparseChaffStrippedByPeerRead(t *testing.T) {
+	rawClient, rawServer := tcpPipe(t)
+	clientCfg := Config{
+		FrameSize:              128,
+		Interval:               1 * time.Millisecond,
+		BurstSlots:             4,
+		IdleChaffMinInterval:   10 * time.Millisecond,
+		IdleChaffMaxInterval:   20 * time.Millisecond,
+		IdleChaffMinSize:       24,
+		IdleChaffMaxSize:       80,
+		IdleChaffMaxBurst:      2,
+		IdleChaffBurstMinDelay: 1 * time.Millisecond,
+		IdleChaffBurstMaxDelay: 2 * time.Millisecond,
+	}
+	client := Wrap(rawClient, clientCfg)
+	server := Wrap(rawServer, Config{FrameSize: 128, Interval: time.Millisecond, BurstSlots: 4})
+	defer client.Close()
+	defer server.Close()
+
+	// Let idle chaff run first, then send real data.
+	time.Sleep(60 * time.Millisecond)
+
+	msg := []byte("real payload after messy chaff")
+	if _, err := client.Write(msg); err != nil {
+		t.Fatalf("write after chaff: %v", err)
+	}
+
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("read after chaff: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("got %q, want %q", got, msg)
+	}
+}
+
+func TestWriteBufferBackpressureBounded(t *testing.T) {
+	// net.Pipe is unbuffered, so writeLoop blocks inside c.inner.Write until
+	// the peer reads; this deterministically saturates writeBuf at MaxBufferSize.
+	rawA, rawB := net.Pipe()
+	defer rawB.Close()
+
+	cfg := Config{
+		FrameSize:     64,
+		Interval:      1 * time.Millisecond,
+		BurstSlots:    1,
+		MaxBufferSize: 128,
+	}
+	shaped := Wrap(rawA, cfg)
+	defer shaped.Close()
+
+	writeDone := make(chan error, 1)
+	bigPayload := bytes.Repeat([]byte("A"), 4096)
+	go func() {
+		_, err := shaped.Write(bigPayload)
+		writeDone <- err
+	}()
+
+	// Write must block due to MaxBufferSize backpressure while peer isn't reading.
+	select {
+	case err := <-writeDone:
+		t.Fatalf("Write returned %v before peer drained, expected backpressure block", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	// Start draining from peer: Write must unblock and finish cleanly.
+	peer := Wrap(rawB, cfg)
+	defer peer.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		got := make([]byte, len(bigPayload))
+		_, err := io.ReadFull(peer, got)
+		if err == nil && !bytes.Equal(got, bigPayload) {
+			err = errors.New("payload mismatch")
+		}
+		readDone <- err
+	}()
+
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("Write after drain failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write remained blocked after peer started draining")
+	}
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("peer read failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer read timed out")
+	}
+}
+
+func TestCloseNoDeadlockOnInnerWriteError(t *testing.T) {
+	rawA, rawB := tcpPipe(t)
+	shaped := Wrap(rawA, Config{
+		FrameSize:  64,
+		Interval:   1 * time.Millisecond,
+		BurstSlots: 2,
+	})
+
+	// Close peer and local raw socket so writeLoop's inner.Write fails.
+	_ = rawB.Close()
+	_ = rawA.Close()
+
+	_, _ = shaped.Write([]byte("trigger inner write error"))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- shaped.Close()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Conn.Close deadlocked after inner write error")
 	}
 }
 

@@ -582,12 +582,34 @@ func (p *Pool) runHeartbeat(now time.Time) {
 	for _, s := range sends {
 		if err := s.SendHeartbeat(); err != nil && !errors.Is(err, protocol.ErrSessionClosed) {
 			log.Printf("tsunami: heartbeat send failed session=%d: %v", s.Seq(), err)
+			p.RemoveSession(s)
 		}
 	}
 	for _, s := range closes {
 		log.Printf("tsunami: closing unresponsive session %d (no heartbeat response within %v)", s.Seq(), p.config.HeartbeatTimeout)
 		_ = s.Close()
 	}
+}
+
+// RemoveSession removes a dead or broken session from the pool immediately and
+// closes it outside the pool lock so subsequent streams do not reuse it.
+func (p *Pool) RemoveSession(target *protocol.Session) {
+	if target == nil {
+		return
+	}
+	p.mu.Lock()
+	remaining := make([]*protocol.Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		if s == target {
+			continue
+		}
+		remaining = append(remaining, s)
+	}
+	p.sessions = remaining
+	delete(p.heartbeatState, target)
+	p.mu.Unlock()
+
+	_ = target.Close()
 }
 
 // CloseIdleSessions closes sessions idle longer than the given duration,

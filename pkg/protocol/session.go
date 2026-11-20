@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,8 +34,11 @@ type Session struct {
 	closeOnce sync.Once
 
 	// Negotiated settings
-	localVersion  int
-	remoteVersion int
+	localVersion       int
+	remoteVersion      int
+	flowControl        atomic.Bool
+	localStreamWindow  int
+	remoteStreamWindow int
 
 	// Idle tracking (atomic to avoid data races between event loop and write goroutines)
 	idleSince  atomic.Int64 // stores UnixNano; 0 = not idle
@@ -115,6 +120,22 @@ func (s *Session) Seq() uint64 {
 	return s.seq
 }
 
+// EnableFlowControl turns on per-stream sliding-window flow control for
+// subsequent streams opened on this session. Must be called before RunEventLoop.
+func (s *Session) EnableFlowControl(localWindow, remoteWindow int) {
+	if localWindow <= 0 {
+		localWindow = DefaultStreamWindow
+	}
+	if remoteWindow <= 0 {
+		remoteWindow = DefaultStreamWindow
+	}
+	s.streamMu.Lock()
+	s.localStreamWindow = localWindow
+	s.remoteStreamWindow = remoteWindow
+	s.flowControl.Store(true)
+	s.streamMu.Unlock()
+}
+
 // OpenStream creates a new stream on this session (client side).
 func (s *Session) OpenStream() (*Stream, error) {
 	s.openMu.Lock()
@@ -131,6 +152,9 @@ func (s *Session) OpenStream() (*Stream, error) {
 	stream := newStream(id, s)
 
 	s.streamMu.Lock()
+	if s.flowControl.Load() {
+		stream.initFlowControl(s.localStreamWindow, s.remoteStreamWindow)
+	}
 	s.streams[id] = stream
 	count := len(s.streams)
 	s.streamMu.Unlock()
@@ -409,6 +433,9 @@ func (s *Session) handleFrame(f *Frame) error {
 		// Server-side: new stream opened by client.
 		stream := newStream(f.StreamID, s)
 		s.streamMu.Lock()
+		if s.flowControl.Load() {
+			stream.initFlowControl(s.localStreamWindow, s.remoteStreamWindow)
+		}
 		s.streams[f.StreamID] = stream
 		count := len(s.streams)
 		s.streamMu.Unlock()
@@ -442,8 +469,26 @@ func (s *Session) handleFrame(f *Frame) error {
 			return nil // ignore data for closed/unknown streams
 		}
 		if err := stream.deliverData(f.Data); err != nil {
-			return nil // stream closed while the frame was in flight
+			if errors.Is(err, ErrStreamRecvOverflow) {
+				log.Printf("tsunami: stream %d receive buffer overflow; closing stream", f.StreamID)
+				stream.closeByRemote(ErrStreamRecvOverflow)
+				go func(id uint32) {
+					_ = s.writeFrame(NewFrame(CmdFIN, id, nil))
+				}(f.StreamID)
+			}
+			return nil
 		}
+
+	case CmdWindowUpdate:
+		stream := s.getStream(f.StreamID)
+		if stream == nil || len(f.Data) != 4 {
+			return nil
+		}
+		delta := binary.BigEndian.Uint32(f.Data)
+		if delta > 0 {
+			stream.addSendWindow(int64(delta))
+		}
+		return nil
 
 	case CmdFIN:
 		stream := s.getStream(f.StreamID)

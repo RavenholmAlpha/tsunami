@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -42,8 +43,8 @@ func main() {
 		frontPath      = flag.String("front-path", fronting.DefaultPath, "Fronting HTTP path")
 		frontHost      = flag.String("front-host", "", "Fronting Host header (defaults to SNI)")
 		frontSecret    = flag.String("front-secret", "", "Fronting HTTP-layer secret (defaults to password)")
-		frontTransport = flag.String("front-transport", fronting.TransportH2, "Fronting transport: h2 or websocket")
-		trafficShaping = flag.Bool("traffic-shaping", false, "Enable constant-rate traffic shaping")
+		frontTransport = flag.String("front-transport", fronting.TransportH2, "Fronting transport: h2 (split), h2-stream, or websocket")
+		trafficShaping = flag.Bool("traffic-shaping", false, "Enable traffic shaping")
 		showVersion    = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -131,10 +132,9 @@ func main() {
 }
 
 func splitHostPort(addr string) (string, string, error) {
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[:i], addr[i+1:], nil
-		}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, "", nil
 	}
-	return addr, "", nil
+	return host, port, nil
 }

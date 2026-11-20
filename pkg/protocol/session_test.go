@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -194,5 +195,34 @@ func TestSessionWithoutOnStreamClosedHook(t *testing.T) {
 	// No hook set: closing must not panic.
 	if err := stream.Close(); err != nil {
 		t.Fatalf("close stream: %v", err)
+	}
+}
+
+func TestSessionWindowUpdateIncreasesSendWindow(t *testing.T) {
+	session := NewSession(&testReadWriteCloser{}, 1)
+	session.EnableFlowControl(1024, 1024)
+	stream := newStream(11, session)
+	stream.initFlowControl(1024, 1024)
+	session.streams[11] = stream
+
+	// Exhaust initial send window.
+	_, grant := stream.acquireSendWindow(1024)
+	if grant != 1024 {
+		t.Fatalf("initial grant = %d, want 1024", grant)
+	}
+	_, grant = stream.acquireSendWindow(100)
+	if grant != 0 {
+		t.Fatalf("exhausted grant = %d, want 0", grant)
+	}
+
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], 512)
+	if err := session.handleFrame(NewFrame(CmdWindowUpdate, 11, payload[:])); err != nil {
+		t.Fatalf("handle WINDOW_UPDATE: %v", err)
+	}
+
+	_, grant = stream.acquireSendWindow(600)
+	if grant != 512 {
+		t.Fatalf("post-update grant = %d, want 512", grant)
 	}
 }

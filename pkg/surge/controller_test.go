@@ -104,3 +104,32 @@ func TestGetSessionExpandsImmediatelyWhenNextStreamCrossesThreshold(t *testing.T
 		t.Fatalf("selected existing overloaded session seq=%d, want a new session", selected.Seq())
 	}
 }
+
+func TestApplyServerSettings(t *testing.T) {
+	pool := newTestPool()
+	defer pool.Close()
+
+	c := NewController(Config{
+		Mode:           ModeAuto,
+		Threshold:      8,
+		MaxConnections: 4,
+	}, pool)
+	defer c.Stop()
+
+	c.ApplyServerSettings(ModeAuto, 2, 5)
+	c.mu.Lock()
+	if c.config.MaxConnections != 2 || c.config.Threshold != 5 {
+		t.Fatalf("ApplyServerSettings got maxConn=%d threshold=%d, want 2, 5", c.config.MaxConnections, c.config.Threshold)
+	}
+	c.mu.Unlock()
+
+	c.ApplyServerSettings(ModeNone, 4, 8)
+	if c.CurrentLayer() != 1 {
+		t.Fatalf("CurrentLayer = %d, want 1 after ModeNone", c.CurrentLayer())
+	}
+	c.mu.Lock()
+	if c.config.Mode != ModeNone {
+		t.Fatalf("Mode = %q, want %q", c.config.Mode, ModeNone)
+	}
+	c.mu.Unlock()
+}

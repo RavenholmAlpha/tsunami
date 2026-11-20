@@ -174,13 +174,13 @@ The site handler is an `httputil.ReverseProxy` configured to look like Caddy:
   query strings are proxied exactly like Caddy would proxy them.
 - **WebSocket.** HTTP/1.1 `Upgrade` requests pass through to the upstream, so
   the cover site can run its own real-time features.
-- **Auth isolation.** `Authorization`, `X-Api-Version`, `X-Date`, and
-  `X-Trace-Id` are fronting-internal and are stripped before proxying, so a
-  cover website never sees TSUNAMI metadata.
-- **Upstream failure.** If the upstream is down or unreachable, the built-in
-  site page is served with `200 OK` and the normal auth jitter. Proxy errors
-  are logged server-side only; probes never see a `502`, a Go error page, or
-  wiring details.
+- **Auth isolation.** `Authorization`, `X-Api-Version`, `X-Date`,
+  `X-Trace-Id`, `X-Session-Id`, and `X-Stream-Seq` are fronting-internal and
+  are stripped before proxying, so a cover website never sees TSUNAMI metadata.
+- **Upstream failure.** If the upstream is down or unreachable, the fronting
+  proxy answers `502 Bad Gateway` with an empty body and the configured
+  `Server` header (matching stock Caddy); proxy errors are logged server-side
+  only, never leaked in response bodies.
 - **TLS verification.** HTTPS upstreams are verified against the system roots
   by default. `insecure_skip_verify` exists for internal CAs and for
   operators who cannot fix an upstream certificate chain.
@@ -211,9 +211,6 @@ New deployments should use the `site` object.
 - For `remote` mode, the upstream's absolute links still point at the upstream
   domain, so a browser that follows a link leaves the camouflage. Copying a
   site into `local` mode is usually the stronger option.
-- If the upstream is unreachable, visitors get the built-in page instead of an
-  error. That fallback is deliberate: a `502` from a "normal website" is a
-  strong fingerprint.
 - The cover website must not depend on the TSUNAMI path: requests to the
   fronting path with a valid HMAC are tunnels, and those requests never reach
   the upstream.

@@ -152,6 +152,28 @@ func (c *Controller) CurrentLayer() int {
 	return int(c.currentLayer.Load())
 }
 
+// ApplyServerSettings reconciles Surge limits advertised by the server in
+// ServerSettings without overriding an explicit client ModeNone choice.
+func (c *Controller) ApplyServerSettings(mode Mode, maxConn, threshold int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if mode == ModeNone {
+		c.config.Mode = ModeNone
+		c.currentLayer.Store(1)
+		return
+	}
+	if c.config.Mode == ModeNone {
+		return
+	}
+	if maxConn > 0 && maxConn < c.config.MaxConnections {
+		c.config.MaxConnections = maxConn
+	}
+	if threshold > 0 {
+		c.config.Threshold = threshold
+	}
+}
+
 // monitor periodically checks whether to upgrade/downgrade layers.
 func (c *Controller) monitor() {
 	ticker := time.NewTicker(2 * time.Second)

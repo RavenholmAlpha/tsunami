@@ -61,11 +61,21 @@ func UpgradeServer(w http.ResponseWriter, r *http.Request, serverHeader string) 
 	return NewWebSocketConn(conn, brw.Reader, false), nil
 }
 
-// ClientWebSocketHandshake performs a WebSocket client handshake on conn.
+// ClientWebSocketHandshake performs a WebSocket client handshake on conn using
+// DefaultUserAgent.
 func ClientWebSocketHandshake(conn net.Conn, endpoint *url.URL, host string, key [32]byte) (net.Conn, error) {
+	return ClientWebSocketHandshakeWithUserAgent(conn, endpoint, host, key, DefaultUserAgent)
+}
+
+// ClientWebSocketHandshakeWithUserAgent performs a WebSocket client handshake on
+// conn with the specified User-Agent header.
+func ClientWebSocketHandshakeWithUserAgent(conn net.Conn, endpoint *url.URL, host string, key [32]byte, userAgent string) (net.Conn, error) {
 	wsKey, err := newWebSocketKey()
 	if err != nil {
 		return nil, err
+	}
+	if userAgent == "" {
+		userAgent = DefaultUserAgent
 	}
 
 	req, err := http.NewRequest(http.MethodGet, endpoint.String(), nil)
@@ -82,7 +92,8 @@ func ClientWebSocketHandshake(conn net.Conn, endpoint *url.URL, host string, key
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("Sec-WebSocket-Key", wsKey)
-	req.Header.Set("User-Agent", DefaultUserAgent)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	if err := SignRequest(req, key, time.Now()); err != nil {
 		return nil, err
 	}
