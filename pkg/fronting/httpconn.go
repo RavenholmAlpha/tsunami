@@ -221,63 +221,59 @@ func (c *HTTPClientConn) Write(p []byte) (int, error) {
 }
 
 func (c *HTTPClientConn) Close() error {
-	c.closeOnce.Do(func() {
-		c.abort(net.ErrClosed)
-	})
-	return c.closeErr
+	return c.abort(net.ErrClosed)
 }
 
-func (c *HTTPClientConn) abort(err error) {
-	c.mu.Lock()
-	if c.closed {
+func (c *HTTPClientConn) abort(err error) error {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		if err == nil {
+			err = net.ErrClosed
+		}
+		c.abortErr = err
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+			c.readTimer = nil
+		}
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+			c.writeTimer = nil
+		}
+		reader := c.reader
+		cancel := c.reqCancel
+		onClose := c.onClose
 		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	if err == nil {
-		err = net.ErrClosed
-	}
-	c.abortErr = err
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-	if c.writeTimer != nil {
-		c.writeTimer.Stop()
-		c.writeTimer = nil
-	}
-	close(c.closedCh)
-	reader := c.reader
-	cancel := c.reqCancel
-	onClose := c.onClose
-	c.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
-	var errs []error
-	if c.writer != nil {
-		_ = c.writer.CloseWithError(err)
-	}
-	if reader != nil {
-		if rErr := reader.Close(); rErr != nil {
-			errs = append(errs, rErr)
+		if cancel != nil {
+			cancel()
 		}
-	}
-	// Drain any unconsumed pending response so its body cannot leak.
-	if c.respCh != nil {
-		select {
-		case res := <-c.respCh:
-			if res.Response != nil && res.Response.Body != nil {
-				_ = res.Response.Body.Close()
+		var errs []error
+		if c.writer != nil {
+			_ = c.writer.CloseWithError(err)
+		}
+		if reader != nil {
+			if rErr := reader.Close(); rErr != nil {
+				errs = append(errs, rErr)
 			}
-		default:
 		}
-	}
-	if onClose != nil {
-		onClose()
-	}
-	c.closeErr = errors.Join(errs...)
+		// Drain any unconsumed pending response so its body cannot leak.
+		if c.respCh != nil {
+			select {
+			case res := <-c.respCh:
+				if res.Response != nil && res.Response.Body != nil {
+					_ = res.Response.Body.Close()
+				}
+			default:
+			}
+		}
+		if onClose != nil {
+			onClose()
+		}
+		c.closeErr = errors.Join(errs...)
+		close(c.closedCh)
+	})
+	return c.closeErr
 }
 
 func (c *HTTPClientConn) LocalAddr() net.Addr  { return c.local }
@@ -313,13 +309,13 @@ func (c *HTTPClientConn) SetReadDeadline(t time.Time) error {
 	if d <= 0 {
 		c.readExpired.Store(true)
 		c.mu.Unlock()
-		c.abort(os.ErrDeadlineExceeded)
+		_ = c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.readExpired.Store(false)
 	c.readTimer = time.AfterFunc(d, func() {
 		c.readExpired.Store(true)
-		c.abort(os.ErrDeadlineExceeded)
+		_ = c.abort(os.ErrDeadlineExceeded)
 	})
 	c.mu.Unlock()
 	return nil
@@ -351,23 +347,26 @@ func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
 	if d <= 0 {
 		c.writeExpired.Store(true)
 		c.mu.Unlock()
-		c.abort(os.ErrDeadlineExceeded)
+		_ = c.abort(os.ErrDeadlineExceeded)
 		return nil
 	}
 	c.writeExpired.Store(false)
 	c.writeTimer = time.AfterFunc(d, func() {
 		c.writeExpired.Store(true)
-		c.abort(os.ErrDeadlineExceeded)
+		_ = c.abort(os.ErrDeadlineExceeded)
 	})
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *HTTPClientConn) ensureReader() error {
-	if c.reader != nil {
-		return nil
-	}
 	c.initOnce.Do(func() {
+		c.mu.Lock()
+		hasReader := c.reader != nil
+		c.mu.Unlock()
+		if hasReader {
+			return
+		}
 		if c.respCh == nil {
 			c.initErr = net.ErrClosed
 			return

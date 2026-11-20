@@ -609,9 +609,6 @@ func (c *SplitH2ClientConn) Read(p []byte) (int, error) {
 }
 
 func (c *SplitH2ClientConn) ensureReader() error {
-	if c.reader != nil {
-		return nil
-	}
 	c.initOnce.Do(func() {
 		select {
 		case res := <-c.respCh:
@@ -808,53 +805,49 @@ func (c *SplitH2ClientConn) sendChunk(seq uint64, data []byte) error {
 }
 
 func (c *SplitH2ClientConn) abort(err error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	if err == nil {
-		err = net.ErrClosed
-	}
-	c.abortErr = err
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-	if c.writeTimer != nil {
-		c.writeTimer.Stop()
-		c.writeTimer = nil
-	}
-	c.sendBuf = nil
-	close(c.closedCh)
-	reader := c.reader
-	cancel := c.reqCancel
-	onClose := c.onClose
-	c.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if reader != nil {
-		_ = reader.Close()
-	}
-	select {
-	case res := <-c.respCh:
-		if res.Response != nil && res.Response.Body != nil {
-			_ = res.Response.Body.Close()
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		if err == nil {
+			err = net.ErrClosed
 		}
-	default:
-	}
-	if onClose != nil {
-		onClose()
-	}
+		c.abortErr = err
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+			c.readTimer = nil
+		}
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+			c.writeTimer = nil
+		}
+		c.sendBuf = nil
+		reader := c.reader
+		cancel := c.reqCancel
+		onClose := c.onClose
+		c.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		if reader != nil {
+			_ = reader.Close()
+		}
+		select {
+		case res := <-c.respCh:
+			if res.Response != nil && res.Response.Body != nil {
+				_ = res.Response.Body.Close()
+			}
+		default:
+		}
+		if onClose != nil {
+			onClose()
+		}
+		close(c.closedCh)
+	})
 }
 
 func (c *SplitH2ClientConn) Close() error {
-	c.closeOnce.Do(func() {
-		c.abort(net.ErrClosed)
-	})
+	c.abort(net.ErrClosed)
 	return nil
 }
 
