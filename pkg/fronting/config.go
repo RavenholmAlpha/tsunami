@@ -67,6 +67,18 @@ type Config struct {
 	// Site configures the site camouflage layer that answers unauthenticated
 	// fronting requests (built-in page or Caddy-like reverse proxy).
 	Site SiteConfig
+	// StrictSNI makes the server answer like a Caddy site block for the names
+	// on its certificate: a TLS handshake whose server name is missing or not
+	// covered by the certificate fails with internal_error, and a request
+	// whose Host is not covered gets an empty 200 instead of the site. Nil
+	// means enabled. Server only.
+	StrictSNI *bool
+}
+
+// StrictSNIEnabled reports whether strict SNI and Host matching is on, which
+// is the default.
+func (c Config) StrictSNIEnabled() bool {
+	return c.StrictSNI == nil || *c.StrictSNI
 }
 
 // Normalize fills default values and normalizes the site camouflage block.
@@ -340,6 +352,18 @@ func CaddyLikeTLSConfig(certs []tls.Certificate) *tls.Config {
 			tls.CurveP256,
 		},
 	}
+}
+
+// CaddyLikeStrictTLSConfig is CaddyLikeTLSConfig with Caddy's certificate
+// selection: only a client that names a site on the certificate (or, without
+// SNI, connects to an IP address on it) completes the handshake.
+func CaddyLikeStrictTLSConfig(selector *CertSelector) *tls.Config {
+	// Certificates stays empty on purpose: with a static certificate
+	// configured, crypto/tls skips GetCertificate for a ClientHello without
+	// SNI and serves that certificate.
+	cfg := CaddyLikeTLSConfig(nil)
+	cfg.GetCertificate = selector.GetCertificate
+	return cfg
 }
 
 func caddyLikeCipherSuites() []uint16 {

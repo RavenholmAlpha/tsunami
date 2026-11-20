@@ -44,6 +44,7 @@ func main() {
 		frontSiteURL   = flag.String("front-site-upstream", "", "Site camouflage upstream URL or host:port, for example 127.0.0.1:8080 or https://www.example.com")
 		frontPreserve  = newTriStateBool("front-site-preserve-host", "Preserve the client Host header for the site camouflage upstream (default: local=true, remote=false)")
 		frontInsecure  = newTriStateBool("front-site-insecure-skip-verify", "Skip TLS certificate verification for an HTTPS site camouflage upstream")
+		frontStrictSNI = newTriStateBool("front-strict-sni", "Fail TLS handshakes whose SNI is not on the certificate and answer other Host values with an empty 200, like a Caddy site block (default: true)")
 		allowAll       = flag.Bool("allow-all", false, "Allow proxying to private/reserved IP addresses")
 		maxStreams     = flag.Int("max-streams", 0, "Max concurrent streams per session (0 = built-in default)")
 		trafficShaping = flag.Bool("traffic-shaping", false, "Enable constant-rate traffic shaping")
@@ -104,6 +105,10 @@ func main() {
 	// the command line. Invalid combinations fail startup with a clear message.
 	if err := applyFrontingSiteFlags(&config.Fronting, *frontSiteMode, *frontSiteURL, frontPreserve, frontInsecure, *frontDecoy); err != nil {
 		log.Fatalf("tsunami-server: %v", err)
+	}
+	if frontStrictSNI.set {
+		strict := frontStrictSNI.value
+		config.Fronting.StrictSNI = &strict
 	}
 	if config.Fronting.Enabled {
 		log.Printf("tsunami-server: fronting site mode=%s upstream=%q preserve_host=%t",

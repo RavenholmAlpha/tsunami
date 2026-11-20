@@ -42,6 +42,7 @@ import (
 //	      "path": "/assets/update",
 //	      "secret": "front-secret",
 //	      "site_name": "Example",
+//	      "strict_sni": true,                 // optional; default true
 //	      "site": {
 //	        "mode": "local",                  // builtin | local | remote
 //	        "upstream": "http://127.0.0.1:8080",
@@ -114,6 +115,8 @@ type ServerConfig struct {
 				PreserveHost       *bool  `json:"preserve_host" yaml:"preserve-host"`
 				InsecureSkipVerify bool   `json:"insecure_skip_verify" yaml:"insecure-skip-verify"`
 			} `json:"site" yaml:"site"`
+			// StrictSNI defaults to true when omitted.
+			StrictSNI *bool `json:"strict_sni" yaml:"strict-sni"`
 		} `json:"fronting" yaml:"fronting"`
 		PaddingScheme string `json:"padding_scheme" yaml:"padding-scheme"`
 		AllowAll      bool   `json:"allow_all" yaml:"allow-all"`
@@ -249,6 +252,7 @@ func (c *ServerConfig) ToServerConfig() server.Config {
 				PreserveHost:       c.Server.Fronting.Site.PreserveHost,
 				InsecureSkipVerify: c.Server.Fronting.Site.InsecureSkipVerify,
 			},
+			StrictSNI: c.Server.Fronting.StrictSNI,
 		},
 		PaddingScheme: strings.TrimSpace(c.Server.PaddingScheme),
 		AllowAll:      c.Server.AllowAll,

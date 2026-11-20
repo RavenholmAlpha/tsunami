@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opening the status or client view in the management menu loaded the saved settings into the running shell, where the wizard mistook them for values fixed on the command line and skipped the TLS and site questions. Saved settings are now read separately and only real environment variables skip a question.
 - The local-site upstream prompt repeated forever when its input ended; it now gives up after ten empty answers.
 - After a mistyped domain, the next prompt lost its default, so pressing Enter selected the self-signed test mode. The default is kept.
+- Fronting completed the TLS handshake for any client, including one that sent no SNI (a scan of `https://<ip>/`) or the wrong one, and presented the site certificate, which reveals the domain. A stock Caddy fails those handshakes with the TLS `internal_error` alert. The fronting listener now does the same: only a server name on the certificate completes the handshake.
+- Fronting served the cover website for any `Host` header. A request whose `Host` is not on the certificate now gets an empty `200`, as Caddy does when no site matches. Authenticated tunnels are not affected.
 
 ### Changed
+- Clients must send an SNI that is on the server certificate (`--sni`, which defaults to the server hostname). A deployment where a CDN reaches the server without SNI, or where clients send another name, can restore the old behavior with `"strict_sni": false` under `fronting` or with `--front-strict-sni=false`. The auto-generated self-signed certificate is exempt. See [Strict SNI and Host matching](docs/fronting.md#strict-sni-and-host-matching).
 - A site name you set yourself is kept when the domain changes; a name that was derived from the old domain is derived again from the new one.
 - Non-interactive installs (`TSUNAMI_ASSUME_YES=1`, or piped without a terminal) are unchanged: they do not read the previous deployment.
 

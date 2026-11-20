@@ -118,6 +118,8 @@ type remoteFronting struct {
 	ServerHeader string `json:"server_header"`
 	SiteName     string `json:"site_name"`
 	DecoyProxy   string `json:"decoy_proxy"`
+	// StrictSNI defaults to true when the panel omits it.
+	StrictSNI *bool `json:"strict_sni"`
 }
 
 // ToServerConfig builds a data-plane server using the dynamic user store and
@@ -181,6 +183,7 @@ func (c RemoteConfig) ToServerConfig(users server.UserAuthenticator, traffic con
 			ServerHeader: c.Fronting.ServerHeader,
 			SiteName:     c.Fronting.SiteName,
 			DecoyProxy:   c.Fronting.DecoyProxy,
+			StrictSNI:    c.Fronting.StrictSNI,
 		},
 	}, nil
 }

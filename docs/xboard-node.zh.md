@@ -161,6 +161,8 @@ Authorization: Bearer long-lived-random-bearer-token
 
 支持的 `transport.mode` 为 `raw`、`h2` 和 `websocket`。`h2`/`websocket` 必须启用 `fronting` 并提供 `fronting.secret`；`raw` 不允许启用 fronting。
 
+`fronting.strict_sni` 可选，省略时为 `true`：节点只对证书上的域名完成 TLS 握手，`Host` 不在证书上的请求返回空的 `200`（见 [fronting.md](fronting.md#strict-sni-and-host-matching)）。CDN 回源不带 SNI，或 SNI 不在证书上时，下发 `false`。XBoard 面板扩展目前不下发这个字段。
+
 ### 用户、流量和在线设备
 
 用户快照只包含节点执行鉴权所需字段：
