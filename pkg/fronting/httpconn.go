@@ -142,6 +142,7 @@ type HTTPClientConn struct {
 	readDeadlineAt      time.Time
 	readDeadlineActive  bool
 	writeTimer          *time.Timer
+	writeTimerArmedAt   time.Time
 	writeDeadlineAt     time.Time
 	writeDeadlineActive bool
 	readExpired         atomic.Bool
@@ -360,15 +361,13 @@ func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
 	if t.IsZero() {
 		c.writeDeadlineActive = false
 		c.writeExpired.Store(false)
-		if c.writeTimer != nil {
-			c.writeTimer.Stop()
-		}
 		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		c.writeDeadlineActive = false
+		c.writeTimerArmedAt = time.Time{}
 		c.writeExpired.Store(true)
 		if c.writeTimer != nil {
 			c.writeTimer.Stop()
@@ -381,8 +380,10 @@ func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
 	c.writeDeadlineAt = t
 	c.writeDeadlineActive = true
 	if c.writeTimer == nil {
+		c.writeTimerArmedAt = t
 		c.writeTimer = time.AfterFunc(d, c.onWriteDeadline)
-	} else {
+	} else if c.writeTimerArmedAt.IsZero() || t.Before(c.writeTimerArmedAt) {
+		c.writeTimerArmedAt = t
 		c.writeTimer.Reset(d)
 	}
 	c.mu.Unlock()
@@ -391,7 +392,14 @@ func (c *HTTPClientConn) SetWriteDeadline(t time.Time) error {
 
 func (c *HTTPClientConn) onWriteDeadline() {
 	c.mu.Lock()
-	if c.closed || !c.writeDeadlineActive || time.Now().Before(c.writeDeadlineAt) {
+	c.writeTimerArmedAt = time.Time{}
+	if c.closed || !c.writeDeadlineActive {
+		c.mu.Unlock()
+		return
+	}
+	if remaining := time.Until(c.writeDeadlineAt); remaining > 0 {
+		c.writeTimerArmedAt = c.writeDeadlineAt
+		c.writeTimer.Reset(remaining)
 		c.mu.Unlock()
 		return
 	}

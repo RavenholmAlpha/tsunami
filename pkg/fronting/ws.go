@@ -16,7 +16,17 @@ import (
 	"time"
 )
 
-const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	websocketGUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	wsPooledFrameBufCap = 72 * 1024
+)
+
+var wsWriteBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, wsPooledFrameBufCap)
+		return &b
+	},
+}
 
 // IsWebSocketUpgrade reports whether r is a HTTP/1.1 WebSocket upgrade.
 func IsWebSocketUpgrade(r *http.Request) bool {
@@ -129,8 +139,9 @@ type WebSocketConn struct {
 	reader     *bufio.Reader
 	maskWrites bool
 
-	readBuf []byte
-	writeMu sync.Mutex
+	readBuf     []byte
+	readScratch []byte
+	writeMu     sync.Mutex
 }
 
 // NewWebSocketConn creates a WebSocket net.Conn wrapper.
@@ -216,14 +227,20 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 				return nil, err
 			}
 		}
-		payload := make([]byte, length)
+		var payload []byte
+		if length <= wsPooledFrameBufCap {
+			if cap(c.readScratch) < int(length) {
+				c.readScratch = make([]byte, wsPooledFrameBufCap)
+			}
+			payload = c.readScratch[:length]
+		} else {
+			payload = make([]byte, length)
+		}
 		if _, err := io.ReadFull(c.reader, payload); err != nil {
 			return nil, err
 		}
 		if masked {
-			for i := range payload {
-				payload[i] ^= mask[i%4]
-			}
+			xorMaskBytes(payload, mask)
 		}
 
 		switch opcode {
@@ -244,44 +261,70 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 }
 
 func (c *WebSocketConn) writeFrame(opcode byte, payload []byte) error {
-	header := []byte{0x80 | opcode, 0}
+	var headerBuf [14]byte
+	header := headerBuf[:2]
+	header[0] = 0x80 | opcode
 	payloadLen := len(payload)
 	switch {
 	case payloadLen < 126:
 		header[1] = byte(payloadLen)
 	case payloadLen <= 0xffff:
 		header[1] = 126
-		var ext [2]byte
-		binary.BigEndian.PutUint16(ext[:], uint16(payloadLen))
-		header = append(header, ext[:]...)
+		binary.BigEndian.PutUint16(headerBuf[2:4], uint16(payloadLen))
+		header = headerBuf[:4]
 	default:
 		header[1] = 127
-		var ext [8]byte
-		binary.BigEndian.PutUint64(ext[:], uint64(payloadLen))
-		header = append(header, ext[:]...)
+		binary.BigEndian.PutUint64(headerBuf[2:10], uint64(payloadLen))
+		header = headerBuf[:10]
 	}
 
+	var mask [4]byte
 	if c.maskWrites {
 		header[1] |= 0x80
-		var mask [4]byte
 		if _, err := rand.Read(mask[:]); err != nil {
 			return err
 		}
-		header = append(header, mask[:]...)
-		frame := make([]byte, len(header)+len(payload))
-		copy(frame, header)
-		for i := range payload {
-			frame[len(header)+i] = payload[i] ^ mask[i%4]
-		}
-		_, err := c.conn.Write(frame)
-		return err
+		hdrLen := len(header)
+		copy(headerBuf[hdrLen:hdrLen+4], mask[:])
+		header = headerBuf[:hdrLen+4]
 	}
 
-	frame := make([]byte, len(header)+len(payload))
+	totalLen := len(header) + payloadLen
+	var bufp *[]byte
+	var frame []byte
+	if totalLen <= wsPooledFrameBufCap {
+		bufp = wsWriteBufPool.Get().(*[]byte)
+		frame = (*bufp)[:totalLen]
+	} else {
+		frame = make([]byte, totalLen)
+	}
 	copy(frame, header)
-	copy(frame[len(header):], payload)
+	body := frame[len(header):]
+	copy(body, payload)
+	if c.maskWrites {
+		xorMaskBytes(body, mask)
+	}
 	_, err := c.conn.Write(frame)
+	if bufp != nil {
+		*bufp = (*bufp)[:wsPooledFrameBufCap]
+		wsWriteBufPool.Put(bufp)
+	}
 	return err
+}
+
+func xorMaskBytes(b []byte, mask [4]byte) {
+	if len(b) >= 8 {
+		m32 := binary.LittleEndian.Uint32(mask[:])
+		m64 := uint64(m32) | uint64(m32)<<32
+		for len(b) >= 8 {
+			v := binary.LittleEndian.Uint64(b[:8]) ^ m64
+			binary.LittleEndian.PutUint64(b[:8], v)
+			b = b[8:]
+		}
+	}
+	for i := range b {
+		b[i] ^= mask[i&3]
+	}
 }
 
 func websocketAccept(key string) string {

@@ -4,7 +4,6 @@ package client
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -258,12 +257,23 @@ func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 
 	h2Transport := &http2.Transport{
 		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
+		ReadIdleTimeout: time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
+		PingTimeout:     15 * time.Second,
 	}
 	cc, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
 		_ = tlsConn.Close()
 		h2Transport.CloseIdleConnections()
 		return nil, fmt.Errorf("fronting: split h2 client conn: %w", err)
+	}
+
+	var closeOnce sync.Once
+	closeFn := func() {
+		closeOnce.Do(func() {
+			_ = cc.Close()
+			_ = tlsConn.Close()
+			h2Transport.CloseIdleConnections()
+		})
 	}
 
 	host := frontingHost(cfg, c.config)
@@ -273,14 +283,10 @@ func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 		c.frontingKey(cfg),
 		c.config.TLS.Fingerprint,
 		cc.RoundTrip,
-		func() {
-			_ = cc.Close()
-			h2Transport.CloseIdleConnections()
-		},
+		closeFn,
 	)
 	if err != nil {
-		_ = cc.Close()
-		h2Transport.CloseIdleConnections()
+		closeFn()
 		return nil, err
 	}
 	return conn, nil
@@ -288,6 +294,34 @@ func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 
 func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 	endpoint := cfg.URL(c.config.ServerAddr)
+	tlsCfg := c.config.TLS
+	tlsCfg.ALPN = []string{"h2"}
+	tlsConn, err := c.dialUTLSConn(context.Background(), "tcp", c.config.ServerAddr, tlsCfg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	h2Transport := &http2.Transport{
+		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
+		ReadIdleTimeout: time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
+		PingTimeout:     15 * time.Second,
+	}
+	cc, err := h2Transport.NewClientConn(tlsConn)
+	if err != nil {
+		_ = tlsConn.Close()
+		h2Transport.CloseIdleConnections()
+		return nil, fmt.Errorf("fronting: h2 stream client conn: %w", err)
+	}
+
+	var closeOnce sync.Once
+	closeFn := func() {
+		closeOnce.Do(func() {
+			_ = cc.Close()
+			_ = tlsConn.Close()
+			h2Transport.CloseIdleConnections()
+		})
+	}
+
 	pr, pw := io.Pipe()
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
@@ -295,6 +329,7 @@ func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 	if err != nil {
 		reqCancel()
 		pw.Close()
+		closeFn()
 		return nil, err
 	}
 	applyFrontingHost(req, cfg, c.config)
@@ -304,23 +339,15 @@ func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 	if err := fronting.SignRequest(req, c.frontingKey(cfg), time.Now()); err != nil {
 		reqCancel()
 		pw.Close()
+		closeFn()
 		return nil, err
 	}
 
-	h2Transport := &http2.Transport{
-		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			tlsCfg := c.config.TLS
-			tlsCfg.ALPN = []string{"h2"}
-			return c.dialUTLSConn(ctx, network, addr, tlsCfg, nil)
-		},
-	}
-
 	respCh := make(chan fronting.HTTPResponseResult, 1)
-	conn := fronting.NewPendingHTTPClientConnWithCleanup(respCh, pw, c.config.ServerAddr, reqCancel, h2Transport.CloseIdleConnections)
+	conn := fronting.NewPendingHTTPClientConnWithCleanup(respCh, pw, c.config.ServerAddr, reqCancel, closeFn)
 
 	go func() {
-		resp, err := h2Transport.RoundTrip(req)
+		resp, err := cc.RoundTrip(req)
 		if err != nil {
 			respCh <- fronting.HTTPResponseResult{Err: fmt.Errorf("fronting: h2 request: %w", err)}
 			return
@@ -425,17 +452,33 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 	_ = tlsConn.SetWriteDeadline(time.Time{})
 
 	// Wait for auth confirmation: server sends CmdServerSettings on success.
-	// If auth failed, server does fallback/close → we get EOF or non-frame data.
+	// Tolerate CmdWaste or an early CmdUpdatePaddingScheme for interoperability.
 	_ = tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	frame, err := protocol.DecodeFrame(tlsConn)
-	_ = tlsConn.SetReadDeadline(time.Time{})
-	if err != nil {
-		session.Close()
-		authErr := newAuthReadError(c.config.ServerAddr, err)
-		log.Printf("tsunami client: auth failed server=%s reason=%s hint=%q detail=%v",
-			authErr.ServerAddr, authErr.Reason, authErr.Hint(), authErr.Err)
-		return nil, authErr
+	var frame *protocol.Frame
+	var err error
+	for {
+		frame, err = protocol.DecodeFrame(tlsConn)
+		if err != nil {
+			_ = tlsConn.SetReadDeadline(time.Time{})
+			session.Close()
+			authErr := newAuthReadError(c.config.ServerAddr, err)
+			log.Printf("tsunami client: auth failed server=%s reason=%s hint=%q detail=%v",
+				authErr.ServerAddr, authErr.Reason, authErr.Hint(), authErr.Err)
+			return nil, authErr
+		}
+		if frame.Command == protocol.CmdWaste {
+			continue
+		}
+		if frame.Command == protocol.CmdUpdatePaddingScheme {
+			if updated, parseErr := padding.Parse(string(frame.Data)); parseErr == nil {
+				c.UpdatePaddingScheme(updated)
+				scheme = updated
+			}
+			continue
+		}
+		break
 	}
+	_ = tlsConn.SetReadDeadline(time.Time{})
 	if frame.Command != protocol.CmdServerSettings || frame.StreamID != 0 || len(frame.Data) == 0 {
 		session.Close()
 		authErr := newUnexpectedAuthFrameError(c.config.ServerAddr, frame)
@@ -483,8 +526,20 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		return c.applyPaddingSchemeUpdate(data, pw)
 	})
 
+	var kg *padding.KeepaliveGenerator
+	if scheme.Keepalive != nil {
+		kg = padding.NewKeepaliveGenerator(scheme.Keepalive, session.WriteFrame)
+		kg.Start()
+		session.SetOnStreamCountChange(func(activeCount int) {
+			kg.SetActive(activeCount > 0)
+		})
+	}
+
 	// Start session event loop in background
 	go func() {
+		if kg != nil {
+			defer kg.Stop()
+		}
 		if err := session.RunEventLoop(); err != nil {
 			log.Printf("tsunami: session %d event loop ended: %v", seq, err)
 		}

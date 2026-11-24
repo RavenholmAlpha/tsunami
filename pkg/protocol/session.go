@@ -44,6 +44,7 @@ type Session struct {
 	// Idle tracking (atomic to avoid data races between event loop and write goroutines)
 	idleSince  atomic.Int64 // stores UnixNano; 0 = not idle
 	lastActive atomic.Int64 // stores UnixNano
+	lastRecv   atomic.Int64 // stores UnixNano; updated on any inbound frame
 	lastPong   atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
 
 	// Callbacks
@@ -87,6 +88,7 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 	}
 	now := time.Now().UnixNano()
 	s.lastActive.Store(now)
+	s.lastRecv.Store(now)
 	s.lastPong.Store(now)
 	return s
 }
@@ -225,6 +227,15 @@ func (s *Session) SetIdleSince(t time.Time) {
 // LastActive returns the time of last activity.
 func (s *Session) LastActive() time.Time {
 	ns := s.lastActive.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// LastRecv returns the time of the most recently received valid frame.
+func (s *Session) LastRecv() time.Time {
+	ns := s.lastRecv.Load()
 	if ns == 0 {
 		return time.Time{}
 	}
@@ -510,7 +521,9 @@ func (s *Session) RunEventLoop() error {
 			return fmt.Errorf("tsunami: read frame: %w", err)
 		}
 
-		s.lastActive.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		s.lastActive.Store(now)
+		s.lastRecv.Store(now)
 
 		if err := s.handleFramePooled(frame, poolBuf); err != nil {
 			return err

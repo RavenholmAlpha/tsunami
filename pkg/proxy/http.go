@@ -81,37 +81,93 @@ func (h *HTTPProxyServer) Addr() net.Addr {
 	return nil
 }
 
-// handleConn handles a single HTTP proxy client connection.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func ensureDefaultPort(hostPort, defaultPort string) string {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(hostPort); err == nil {
+		return hostPort
+	}
+	if strings.HasPrefix(hostPort, "[") && strings.HasSuffix(hostPort, "]") {
+		return hostPort + ":" + defaultPort
+	}
+	if strings.Count(hostPort, ":") > 1 {
+		return "[" + hostPort + "]:" + defaultPort
+	}
+	return net.JoinHostPort(hostPort, defaultPort)
+}
+
+func stripHopByHopHeaders(hdr http.Header) {
+	if hdr == nil {
+		return
+	}
+	for _, connVal := range hdr.Values("Connection") {
+		for _, token := range strings.Split(connVal, ",") {
+			if name := strings.TrimSpace(token); name != "" {
+				hdr.Del(name)
+			}
+		}
+	}
+	for _, h := range hopByHopHeaders {
+		hdr.Del(h)
+	}
+}
+
+// handleConn handles a single HTTP proxy client connection, supporting both
+// CONNECT tunnels and persistent HTTP/1.1 Keep-Alive plain HTTP requests.
 func (h *HTTPProxyServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	br := bufio.NewReader(conn)
+	for reqIdx := 0; ; reqIdx++ {
+		if reqIdx > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		}
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
 
-	// Read the HTTP request
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		return
-	}
-
-	if req.Method == "CONNECT" {
-		h.handleConnect(conn, br, req)
-	} else {
-		h.handleHTTP(conn, br, req)
+		if req.Method == http.MethodConnect {
+			h.handleConnect(conn, br, req)
+			return
+		}
+		if !h.handleHTTP(conn, req) {
+			return
+		}
 	}
 }
 
 // handleConnect handles HTTPS tunneling via CONNECT method.
 func (h *HTTPProxyServer) handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request) {
-	targetAddr := req.Host
-	if !strings.Contains(targetAddr, ":") {
-		targetAddr += ":443"
+	targetAddr := ensureDefaultPort(req.Host, "443")
+	if targetAddr == "" && req.URL != nil {
+		targetAddr = ensureDefaultPort(req.URL.Host, "443")
+	}
+	if targetAddr == "" {
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+		return
 	}
 
 	// Open TSUNAMI stream
 	stream, err := h.client.OpenStream(targetAddr)
 	if err != nil {
 		log.Printf("http proxy: CONNECT to %s: %v", targetAddr, err)
-		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
 		return
 	}
 
@@ -149,52 +205,103 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, br *bufio.Reader, req *ht
 	wg.Wait()
 }
 
-// handleHTTP handles plain HTTP requests (non-CONNECT).
-func (h *HTTPProxyServer) handleHTTP(conn net.Conn, br *bufio.Reader, req *http.Request) {
-	targetAddr := req.Host
-	if !strings.Contains(targetAddr, ":") {
-		targetAddr += ":80"
+// handleHTTP forwards a single plain HTTP request over its own TSUNAMI stream
+// and reports whether the client connection can be reused for subsequent requests.
+func (h *HTTPProxyServer) handleHTTP(conn net.Conn, req *http.Request) bool {
+	if req.Body != nil {
+		defer req.Body.Close()
 	}
 
-	// Open TSUNAMI stream
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	targetAddr := ensureDefaultPort(host, "80")
+	if targetAddr == "" {
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return false
+	}
+
+	isUpgrade := strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
+	clientKeepAlive := !req.Close &&
+		req.ProtoAtLeast(1, 1) &&
+		!strings.EqualFold(req.Header.Get("Proxy-Connection"), "close")
+
 	stream, err := h.client.OpenStream(targetAddr)
 	if err != nil {
 		log.Printf("http proxy: HTTP to %s: %v", targetAddr, err)
-		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return false
 	}
 	defer stream.Close()
 
-	// Forward the original request
 	outReq := req.Clone(req.Context())
 	outReq.RequestURI = ""
 	if outReq.URL != nil {
 		outReq.URL.Scheme = ""
 		outReq.URL.Host = ""
-	}
-	outReq.Write(stream)
-
-	// Relay response back
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, br, *bufp)
-		protocol.RelayBufPool.Put(bufp)
-	}()
-
-	go func() {
-		defer wg.Done()
-		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(conn, stream, *bufp)
-		protocol.RelayBufPool.Put(bufp)
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if outReq.URL.Path == "" {
+			outReq.URL.Path = "/"
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	}()
+	}
+	if isUpgrade {
+		outReq.Header.Del("Proxy-Connection")
+		outReq.Header.Del("Proxy-Authenticate")
+		outReq.Header.Del("Proxy-Authorization")
+	} else {
+		stripHopByHopHeaders(outReq.Header)
+		outReq.Close = true
+	}
 
-	wg.Wait()
+	if err := outReq.Write(stream); err != nil {
+		return false
+	}
+
+	streamReader := bufio.NewReader(stream)
+	resp, err := http.ReadResponse(streamReader, outReq)
+	if err != nil {
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+		return false
+	}
+	defer resp.Body.Close()
+
+	if isUpgrade && resp.StatusCode == http.StatusSwitchingProtocols {
+		if err := resp.Write(conn); err != nil {
+			return false
+		}
+		var srcStream io.Reader = stream
+		if streamReader.Buffered() > 0 {
+			srcStream = io.MultiReader(io.LimitReader(streamReader, int64(streamReader.Buffered())), stream)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			bufp := protocol.RelayBufPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(stream, conn, *bufp)
+			protocol.RelayBufPool.Put(bufp)
+			_ = stream.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			bufp := protocol.RelayBufPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(conn, srcStream, *bufp)
+			protocol.RelayBufPool.Put(bufp)
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.CloseWrite()
+			}
+		}()
+		wg.Wait()
+		return false
+	}
+
+	stripHopByHopHeaders(resp.Header)
+	resp.Close = !clientKeepAlive
+	if clientKeepAlive {
+		resp.Header.Set("Connection", "keep-alive")
+	}
+	if err := resp.Write(conn); err != nil {
+		return false
+	}
+	return clientKeepAlive
 }

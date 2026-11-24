@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -348,17 +349,12 @@ func (s *Server) handleConn(conn net.Conn) {
 	var authBuf bytes.Buffer
 	teeReader := io.TeeReader(conn, &authBuf)
 
-	// Read authentication request
-	authReq, err := protocol.DecodeAuthRequest(teeReader)
+	// Authenticate the 34-byte header BEFORE reading variable padding so HTTP/TLS
+	// visitors (whose bytes 32..33 look like a huge uint16 paddingLen) and short
+	// probes (< 34 bytes) fall back immediately instead of stalling for 10s.
+	user, authErrReason, err := s.readAndAuthenticateConn(conn, teeReader)
 	if err != nil {
-		s.doFallback(conn, "auth_decode_error", authBuf.Bytes(), err)
-		return
-	}
-
-	// Authenticate
-	user := s.auth.Authenticate(authReq.Hash)
-	if user == nil {
-		s.doFallback(conn, "auth_no_matching_user", authBuf.Bytes(), protocol.ErrAuthFailed)
+		s.doFallback(conn, authErrReason, authBuf.Bytes(), err)
 		return
 	}
 
@@ -517,6 +513,49 @@ func (s *Server) handleConn(conn net.Conn) {
 	if err := session.RunEventLoop(); err != nil {
 		log.Printf("tsunami server: session error for user '%s': %v", user.Name, err)
 	}
+}
+
+func (s *Server) readAndAuthenticateConn(deadlineConn net.Conn, r io.Reader) (*protocol.UserInfo, string, error) {
+	var header [protocol.AuthHashLen + 2]byte
+	n, err := r.Read(header[:])
+	if err != nil && n == 0 {
+		return nil, "auth_decode_error", fmt.Errorf("tsunami: read auth header: %w", err)
+	}
+	if n < len(header) {
+		followUp := 1500 * time.Millisecond
+		if looksLikePlainProbe(header[:n]) {
+			followUp = 150 * time.Millisecond
+		}
+		_ = deadlineConn.SetReadDeadline(time.Now().Add(followUp))
+		if _, err := io.ReadFull(r, header[n:]); err != nil {
+			return nil, "auth_decode_error", fmt.Errorf("tsunami: read auth header: %w", err)
+		}
+		_ = deadlineConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+
+	var hash [protocol.AuthHashLen]byte
+	copy(hash[:], header[:protocol.AuthHashLen])
+	user := s.auth.Authenticate(hash)
+	if user == nil {
+		return nil, "auth_no_matching_user", protocol.ErrAuthFailed
+	}
+
+	paddingLen := binary.BigEndian.Uint16(header[protocol.AuthHashLen : protocol.AuthHashLen+2])
+	if paddingLen > 0 {
+		if _, err := io.CopyN(io.Discard, r, int64(paddingLen)); err != nil {
+			return nil, "auth_decode_error", fmt.Errorf("tsunami: read auth padding: %w", err)
+		}
+	}
+	return user, "", nil
+}
+
+func looksLikePlainProbe(prefix []byte) bool {
+	for _, sig := range []string{"GET ", "HEAD ", "POST ", "PUT ", "DELETE ", "OPTIONS ", "CONNECT ", "PRI *", "SSH-", "\x16\x03"} {
+		if len(prefix) >= len(sig) && string(prefix[:len(sig)]) == sig {
+			return true
+		}
+	}
+	return false
 }
 
 // bindServerPadding wires a padding writer into a session: frame writes go

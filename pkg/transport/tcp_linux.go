@@ -4,13 +4,17 @@ package transport
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
+
+var bbrWarnOnce sync.Once
 
 func applyTCPBuffers(conn *net.TCPConn, cfg *TCPConfig) error {
 	rawConn, err := conn.SyscallConn()
@@ -77,8 +81,9 @@ func applyLinuxTCPOptions(conn *net.TCPConn, cfg *TCPConfig) error {
 
 	return rawConn.Control(func(fd uintptr) {
 		if e := unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, "bbr"); e != nil {
-			// BBR may not be available — non-fatal
-			fmt.Printf("tsunami: failed to set BBR: %v (falling back to system default)\n", e)
+			bbrWarnOnce.Do(func() {
+				log.Printf("tsunami: failed to set BBR: %v (falling back to system default)", e)
+			})
 		}
 	})
 }

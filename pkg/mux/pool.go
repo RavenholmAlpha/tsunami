@@ -547,7 +547,11 @@ func (p *Pool) runHeartbeat(now time.Time) {
 		}
 
 		st := p.heartbeatState[s]
-		action, next := heartbeatDecision(now, s.LastActive(), s.LastPong(), st, p.config, p.randDuration)
+		lastInbound := s.LastPong()
+		if lr := s.LastRecv(); lr.After(lastInbound) {
+			lastInbound = lr
+		}
+		action, next := heartbeatDecision(now, s.LastActive(), lastInbound, st, p.config, p.randDuration)
 		switch action {
 		case heartbeatSend:
 			sends = append(sends, s)
