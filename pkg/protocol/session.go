@@ -507,7 +507,7 @@ func (s *Session) notifyStreamCountChange(count int) {
 func (s *Session) RunEventLoop() error {
 	defer s.Close()
 
-	reader := NewBufferedFrameReader(s.conn, 64*1024)
+	reader := NewBufferedFrameReader(s.conn, 128*1024)
 	for {
 		if s.closed.Load() {
 			return nil

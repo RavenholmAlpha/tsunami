@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	// DefaultStreamWindow is the default per-stream sliding flow-control window (2 MiB).
-	DefaultStreamWindow = 2 << 20
-	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (4 MiB).
-	DefaultMaxStreamRecvBytes = 4 << 20
+	// DefaultStreamWindow is the default per-stream sliding flow-control window (4 MiB).
+	DefaultStreamWindow = 4 << 20
+	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (8 MiB).
+	DefaultMaxStreamRecvBytes = 8 << 20
 
 	minStreamWindow = 64 << 10
 	maxStreamWindow = 8 << 20
@@ -174,7 +174,16 @@ func (s *Stream) ID() uint32 {
 }
 
 // Read reads data from the stream, implementing io.Reader.
+// Ready chunks in recvRing are coalesced in a single non-blocking pass.
 func (s *Stream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		if s.localClosed.Load() {
+			return 0, ErrStreamClosed
+		}
+		return 0, nil
+	}
+
+	total := 0
 	if len(s.recvLeftChunk.data) > 0 {
 		n := copy(p, s.recvLeftChunk.data)
 		s.recvLeftChunk.data = s.recvLeftChunk.data[n:]
@@ -182,25 +191,41 @@ func (s *Stream) Read(p []byte) (int, error) {
 			putRecvPayloadBuf(s.recvLeftChunk.poolBuf)
 			s.recvLeftChunk.poolBuf = nil
 		}
-		s.bytesRead.Add(int64(n))
-		s.maybeSendWindowUpdate(n)
-		return n, nil
+		total += n
+		if total == len(p) {
+			s.bytesRead.Add(int64(total))
+			s.maybeSendWindowUpdate(total)
+			return total, nil
+		}
 	}
 
 	for {
 		s.recvMu.Lock()
 		if s.localClosed.Load() {
 			s.recvMu.Unlock()
+			if total > 0 {
+				s.bytesRead.Add(int64(total))
+				s.maybeSendWindowUpdate(total)
+				return total, nil
+			}
 			return 0, ErrStreamClosed
 		}
-		if s.recvCount > 0 {
+		for total < len(p) && s.recvCount > 0 {
 			chunk := s.popRecvLocked()
 			s.recvBytes -= len(chunk.data)
+			n := copy(p[total:], chunk.data)
+			if n < len(chunk.data) {
+				s.recvLeftChunk = recvChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
+			} else if chunk.poolBuf != nil {
+				putRecvPayloadBuf(chunk.poolBuf)
+			}
+			total += n
+		}
+		if total > 0 {
 			s.recvMu.Unlock()
-
-			n := s.consumeReadData(p, chunk)
-			s.maybeSendWindowUpdate(n)
-			return n, nil
+			s.bytesRead.Add(int64(total))
+			s.maybeSendWindowUpdate(total)
+			return total, nil
 		}
 		if s.recvErr != nil {
 			err := s.recvErr

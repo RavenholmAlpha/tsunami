@@ -22,14 +22,14 @@ const (
 	maxPendingSplitSessions = 256
 	splitPairingTimeout     = 10 * time.Second
 	maxSplitUplinkGap       = 48
-	maxSplitUplinkBytes     = 4 << 20 // 4 MiB server-side uplink reorder buffer
+	maxSplitUplinkBytes     = 8 << 20 // 8 MiB server-side uplink reorder buffer
 
 	// MaxSplitChunkSize caps a single Split-H2 uplink POST body.
 	MaxSplitChunkSize = 512 << 10
 
-	splitClientMaxSendBuf  = 2 << 20   // 2 MiB client-side send buffer
-	splitClientMaxChunk    = 128 << 10 // 128 KiB per POST chunk
-	splitClientMaxInFlight = 12
+	splitClientMaxSendBuf  = 4 << 20   // 4 MiB client-side send buffer
+	splitClientMaxChunk    = 256 << 10 // 256 KiB per POST chunk (<= 512 KiB server cap)
+	splitClientMaxInFlight = 16
 )
 
 var (
@@ -879,12 +879,20 @@ func (c *SplitH2ClientConn) appendSendRingLocked(src []byte) {
 	c.sendLen += len(src)
 }
 
+type splitUploadJob struct {
+	seq  uint64
+	bufp *[]byte
+	n    int
+}
+
 func (c *SplitH2ClientConn) uploadLoop() {
-	sem := make(chan struct{}, splitClientMaxInFlight)
+	jobCh := make(chan splitUploadJob)
+	var workers int
 
 	for {
 		bufp, n, seq, ok := c.nextUploadChunk()
 		if !ok {
+			close(jobCh)
 			return
 		}
 
@@ -892,24 +900,43 @@ func (c *SplitH2ClientConn) uploadLoop() {
 		// the server always sees seq == 0 before any seq > 0 arrives.
 		if seq == 0 {
 			if err := c.sendChunk(seq, bufp, n); err != nil {
+				close(jobCh)
 				c.abort(err)
 				return
 			}
 			continue
 		}
 
+		job := splitUploadJob{seq: seq, bufp: bufp, n: n}
 		select {
-		case sem <- struct{}{}:
-		case <-c.closedCh:
-			return
+		case jobCh <- job:
+			continue
+		default:
 		}
 
-		go func(seqNum uint64, bp *[]byte, size int) {
-			defer func() { <-sem }()
-			if err := c.sendChunk(seqNum, bp, size); err != nil {
-				c.abort(err)
-			}
-		}(seq, bufp, n)
+		if workers < splitClientMaxInFlight {
+			workers++
+			go func(first splitUploadJob) {
+				if err := c.sendChunk(first.seq, first.bufp, first.n); err != nil {
+					c.abort(err)
+					return
+				}
+				for next := range jobCh {
+					if err := c.sendChunk(next.seq, next.bufp, next.n); err != nil {
+						c.abort(err)
+						return
+					}
+				}
+			}(job)
+			continue
+		}
+
+		select {
+		case jobCh <- job:
+		case <-c.closedCh:
+			close(jobCh)
+			return
+		}
 	}
 }
 

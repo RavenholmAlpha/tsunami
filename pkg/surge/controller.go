@@ -49,7 +49,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Mode:              ModeAuto,
-		Threshold:         8,
+		Threshold:         2,
 		MaxConnections:    4,
 		IdleDowngradeTime: 30 * time.Second,
 	}
@@ -294,26 +294,37 @@ func (c *Controller) expandAsync() {
 	go c.expandPool(c.config.MaxConnections)
 }
 
-// expandPool asynchronously creates additional sessions up to MaxConnections.
+// expandPool asynchronously creates additional sessions in parallel up to maxConnections.
 func (c *Controller) expandPool(maxConnections int) {
 	c.expandMu.Lock()
 	defer c.expandMu.Unlock()
 
-	for c.pool.SessionCount() < maxConnections {
+	cur := c.pool.SessionCount()
+	need := maxConnections - cur
+	if need <= 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < need; i++ {
 		select {
 		case <-c.stopCh:
+			wg.Wait()
 			return
 		default:
 		}
-
-		_, err := c.pool.CreateNewSession()
-		if err != nil {
-			log.Printf("tsunami surge: expand pool failed: %v", err)
-			return
-		}
-		log.Printf("tsunami surge: expanded pool (%d/%d connections)",
-			c.pool.SessionCount(), c.config.MaxConnections)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.pool.CreateNewSession(); err != nil {
+				log.Printf("tsunami surge: expand pool failed: %v", err)
+				return
+			}
+			log.Printf("tsunami surge: expanded pool (%d/%d connections)",
+				c.pool.SessionCount(), c.config.MaxConnections)
+		}()
 	}
+	wg.Wait()
 }
 
 // Stop stops the Surge controller.

@@ -493,7 +493,7 @@ func (pw *Writer) writePSHRawLocked(streamID uint32, data []byte) error {
 // maxReusableRawBuf bounds the encoding buffer retained per Writer. Writes up
 // to this size are encoded without allocating; larger writes fall back to the
 // shared pooled encoder so one huge write does not pin memory for the session.
-const maxReusableRawBuf = 128 * 1024
+const maxReusableRawBuf = 264 * 1024
 
 // writeFramesRawLocked encodes frames into the Writer's reusable buffer and
 // writes them in one call without padding. pw.mu must be held. The reusable

@@ -273,7 +273,12 @@ func (s *Server) startFronting() error {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
-	if err := http2.ConfigureServer(httpSrv, &http2.Server{}); err != nil {
+	if err := http2.ConfigureServer(httpSrv, &http2.Server{
+		MaxConcurrentStreams:         256,
+		MaxReadFrameSize:             256 << 10,
+		MaxUploadBufferPerConnection: 16 << 20,
+		MaxUploadBufferPerStream:     4 << 20,
+	}); err != nil {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
 	}

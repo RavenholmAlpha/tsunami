@@ -2,6 +2,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -256,9 +257,11 @@ func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 	}
 
 	h2Transport := &http2.Transport{
-		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
-		ReadIdleTimeout: time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
-		PingTimeout:     15 * time.Second,
+		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
+		DisableCompression: true,
+		MaxReadFrameSize:   256 << 10,
+		ReadIdleTimeout:    time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
+		PingTimeout:        15 * time.Second,
 	}
 	cc, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
@@ -302,9 +305,11 @@ func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 	}
 
 	h2Transport := &http2.Transport{
-		TLSClientConfig: c.config.TLS.BuildClientTLSConfig(),
-		ReadIdleTimeout: time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
-		PingTimeout:     15 * time.Second,
+		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
+		DisableCompression: true,
+		MaxReadFrameSize:   256 << 10,
+		ReadIdleTimeout:    time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
+		PingTimeout:        15 * time.Second,
 	}
 	cc, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
@@ -420,21 +425,14 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		return nil, fmt.Errorf("generate auth padding: %w", err)
 	}
 
-	_ = tlsConn.SetWriteDeadline(time.Now().Add(authWriteTimeout))
-	if err := protocol.EncodeAuthRequest(tlsConn, c.passwordHash, padding0); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("send auth: %w", err)
-	}
-
-	// Create session
+	// Create session before writing so AuthRequest + CmdSettings can be sent
+	// in a single coalesced write (saves 1 full network RTT on Split-H2 seq=0).
 	seq := c.pool.NextSeq()
 	session := protocol.NewSession(tlsConn, seq)
 	// The client is the stream opener; unlimited local concurrency, while the
 	// server still enforces its own per-session limit.
 	session.SetMaxStreams(0)
 
-	// Send client settings (handshake stays unpadded so settings framing cleanly
-	// separates from post-handshake traffic shaping / padding v2).
 	settings := &protocol.ClientSettings{
 		Version:      protocol.CurrentVersion,
 		Client:       "http-client/1.0",
@@ -445,9 +443,22 @@ func (c *Client) startSession(tlsConn net.Conn) (*protocol.Session, error) {
 		StreamWindow: protocol.DefaultStreamWindow,
 		FastOpen:     true,
 	}
-	if err := session.SendSettings(settings); err != nil {
+	settingsPayload := protocol.EncodeClientSettings(settings)
+	var handshakeBuf bytes.Buffer
+	handshakeBuf.Grow(protocol.AuthOverhead + len(padding0) + protocol.FrameHeaderLen + len(settingsPayload))
+	if err := protocol.EncodeAuthRequest(&handshakeBuf, c.passwordHash, padding0); err != nil {
 		session.Close()
-		return nil, fmt.Errorf("send settings: %w", err)
+		return nil, fmt.Errorf("encode auth: %w", err)
+	}
+	if err := protocol.EncodeFrame(&handshakeBuf, protocol.NewFrame(protocol.CmdSettings, 0, settingsPayload)); err != nil {
+		session.Close()
+		return nil, fmt.Errorf("encode settings: %w", err)
+	}
+
+	_ = tlsConn.SetWriteDeadline(time.Now().Add(authWriteTimeout))
+	if _, err := tlsConn.Write(handshakeBuf.Bytes()); err != nil {
+		session.Close()
+		return nil, fmt.Errorf("send handshake: %w", err)
 	}
 	_ = tlsConn.SetWriteDeadline(time.Time{})
 
