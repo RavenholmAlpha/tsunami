@@ -167,25 +167,34 @@ func StripAuthHeaders(h http.Header) {
 	h.Del(HeaderStreamSeq)
 }
 
+var staticAuthVersionSlice = []string{authVersion}
+
 // SignRequest adds HTTP-layer authentication headers. When HeaderSessionID or
 // HeaderStreamSeq are set on req, they are bound into the HMAC signature.
 func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
-	nonce, err := randomNonce()
-	if err != nil {
-		return err
+	var rawNonce [16]byte
+	if _, err := rand.Read(rawNonce[:]); err != nil {
+		return fmt.Errorf("fronting: nonce: %w", err)
 	}
-	ts := strconv.FormatInt(now.Unix(), 10)
+	var nonceHex [32]byte
+	hex.Encode(nonceHex[:], rawNonce[:])
+	nonce := string(nonceHex[:])
+
+	var tsBuf [24]byte
+	ts := string(strconv.AppendInt(tsBuf[:0], now.Unix(), 10))
 
 	sid := req.Header.Get(HeaderSessionID)
 	seq := req.Header.Get(HeaderStreamSeq)
 
-	req.Header.Set(headerVersion, authVersion)
-	req.Header.Set(headerDate, ts)
-	req.Header.Set(headerNonce, nonce)
+	req.Header[headerVersion] = staticAuthVersionSlice
+	req.Header[headerDate] = []string{ts}
+	req.Header[headerNonce] = []string{nonce}
 	sum := computeMACBytes(req.Method, req.URL.EscapedPath(), req.Host, ts, nonce, sid, seq, key)
-	var hexSig [sha256.Size * 2]byte
-	hex.Encode(hexSig[:], sum[:])
-	req.Header.Set(headerAuth, "HMAC-SHA256 Signature="+string(hexSig[:]))
+	const sigPrefix = "HMAC-SHA256 Signature="
+	var authBuf [len(sigPrefix) + sha256.Size*2]byte
+	copy(authBuf[:], sigPrefix)
+	hex.Encode(authBuf[len(sigPrefix):], sum[:])
+	req.Header[headerAuth] = []string{string(authBuf[:])}
 	return nil
 }
 
@@ -360,12 +369,4 @@ func decodeHex32(s string, dst *[sha256.Size]byte) bool {
 		dst[i] = (hi << 4) | lo
 	}
 	return true
-}
-
-func randomNonce() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("fronting: nonce: %w", err)
-	}
-	return hex.EncodeToString(b[:]), nil
 }

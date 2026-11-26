@@ -160,7 +160,9 @@ func (r *Relay) resolveCached(target string, now time.Time) (netip.AddrPort, boo
 func (r *Relay) streamToUDP() {
 	defer r.cleanupNAT()
 
-	br := bufio.NewReaderSize(r.stream, 64*1024)
+	// Use a compact 4 KiB reader instead of 64 KiB: protocol.Stream already
+	// buffers frames in memory, while 4 KiB coalesces small tests/pipes cleanly.
+	br := bufio.NewReaderSize(r.stream, 4*1024)
 	payloadBuf := make([]byte, 65535)
 	var domainScratch [258]byte
 

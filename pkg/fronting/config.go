@@ -65,6 +65,19 @@ func UserAgentForFingerprint(fingerprint string) string {
 	}
 }
 
+var (
+	hdrUAFirefox    = []string{FirefoxUserAgent}
+	hdrUASafari     = []string{SafariUserAgent}
+	hdrUADefault    = []string{DefaultUserAgent}
+	hdrAcceptAll    = []string{"*/*"}
+	hdrAcceptLang   = []string{"en-US,en;q=0.9"}
+	hdrSecFetchDest = []string{"empty"}
+	hdrSecFetchMode = []string{"cors"}
+	hdrSecFetchSite = []string{"same-origin"}
+	hdrOctetStream  = []string{"application/octet-stream"}
+	hdrCacheNoStore = []string{"no-store"}
+)
+
 // ApplyBrowserHeaders populates realistic browser request headers consistent
 // with the selected TLS fingerprint.
 func ApplyBrowserHeaders(h http.Header, fingerprint string) {
@@ -72,13 +85,20 @@ func ApplyBrowserHeaders(h http.Header, fingerprint string) {
 		return
 	}
 	fp := strings.ToLower(strings.TrimSpace(fingerprint))
-	h.Set("User-Agent", UserAgentForFingerprint(fp))
-	h.Set("Accept", "*/*")
-	h.Set("Accept-Language", "en-US,en;q=0.9")
+	switch fp {
+	case "firefox":
+		h["User-Agent"] = hdrUAFirefox
+	case "safari":
+		h["User-Agent"] = hdrUASafari
+	default:
+		h["User-Agent"] = hdrUADefault
+	}
+	h["Accept"] = hdrAcceptAll
+	h["Accept-Language"] = hdrAcceptLang
 	if fp == "" || fp == "chrome" || fp == "none" || fp == "random" {
-		h.Set("Sec-Fetch-Dest", "empty")
-		h.Set("Sec-Fetch-Mode", "cors")
-		h.Set("Sec-Fetch-Site", "same-origin")
+		h["Sec-Fetch-Dest"] = hdrSecFetchDest
+		h["Sec-Fetch-Mode"] = hdrSecFetchMode
+		h["Sec-Fetch-Site"] = hdrSecFetchSite
 	}
 }
 

@@ -131,20 +131,13 @@ func (c *Client) OpenStream(target string) (*protocol.Stream, error) {
 			return nil, fmt.Errorf("tsunami: get session: %w", err)
 		}
 
-		stream, err := session.OpenStream()
+		stream, err := session.OpenStreamWithTarget(addrData)
 		if err != nil {
 			if errors.Is(err, protocol.ErrStreamRejected) || errors.Is(err, protocol.ErrTooManyStreams) {
 				return nil, fmt.Errorf("tsunami: open stream: %w", err)
 			}
 			c.pool.RemoveSession(session)
 			lastErr = fmt.Errorf("tsunami: open stream: %w", err)
-			continue
-		}
-
-		if _, err := stream.Write(addrData); err != nil {
-			_ = stream.Close()
-			c.pool.RemoveSession(session)
-			lastErr = fmt.Errorf("tsunami: send target addr: %w", err)
 			continue
 		}
 
@@ -568,6 +561,7 @@ func bindClientPadding(session *protocol.Session, pw *padding.Writer) {
 		return pw.WriteFramesWithPadding(frames)
 	})
 	session.SetPaddingPSHWriteFn(pw.WritePSH)
+	session.SetPaddingSYNTargetWriteFn(pw.WriteSYNWithTarget)
 	session.SetOnStreamClosed(func(id uint32) {
 		pw.ForgetStream(id)
 	})

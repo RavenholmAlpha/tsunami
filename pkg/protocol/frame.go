@@ -258,8 +258,10 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 
 // FrameReader provides frame reading from a connection.
 type FrameReader struct {
-	r     io.Reader
-	waste []byte
+	r       io.Reader
+	waste   []byte
+	scratch Frame
+	ctrlBuf [64]byte
 }
 
 // NewFrameReader creates a new FrameReader.
@@ -292,7 +294,8 @@ func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
 	dataLen := int(binary.BigEndian.Uint16(header[5:7]))
 
 	if dataLen == 0 {
-		return &Frame{Command: cmd, StreamID: streamID}, nil, nil
+		fr.scratch = Frame{Command: cmd, StreamID: streamID}
+		return &fr.scratch, nil, nil
 	}
 
 	if cmd == CmdWaste {
@@ -302,7 +305,8 @@ func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
 		if _, err := io.ReadFull(fr.r, fr.waste[:dataLen]); err != nil {
 			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
 		}
-		return &Frame{Command: CmdWaste}, nil, nil
+		fr.scratch = Frame{Command: CmdWaste}
+		return &fr.scratch, nil, nil
 	}
 
 	if cmd == CmdPSH {
@@ -311,12 +315,23 @@ func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
 			putRecvPayloadBuf(bufp)
 			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
 		}
-		return &Frame{Command: cmd, StreamID: streamID, Data: payload}, bufp, nil
+		fr.scratch = Frame{Command: cmd, StreamID: streamID, Data: payload}
+		return &fr.scratch, bufp, nil
+	}
+
+	if dataLen <= len(fr.ctrlBuf) {
+		data := fr.ctrlBuf[:dataLen]
+		if _, err := io.ReadFull(fr.r, data); err != nil {
+			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+		}
+		fr.scratch = Frame{Command: cmd, StreamID: streamID, Data: data}
+		return &fr.scratch, nil, nil
 	}
 
 	data := make([]byte, dataLen)
 	if _, err := io.ReadFull(fr.r, data); err != nil {
 		return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
 	}
-	return &Frame{Command: cmd, StreamID: streamID, Data: data}, nil, nil
+	fr.scratch = Frame{Command: cmd, StreamID: streamID, Data: data}
+	return &fr.scratch, nil, nil
 }

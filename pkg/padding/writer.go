@@ -180,6 +180,65 @@ func (pw *Writer) WritePSH(streamID uint32, data []byte) error {
 	return err
 }
 
+// WriteSYNWithTarget coalesces CmdSYN + the initial target-address CmdPSH into a
+// single padded record using stream rule 0 (e.g. c0=~80-200), advancing the
+// stream's epoch to idx=1 so the subsequent inner TLS ClientHello still hits c1.
+func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
+	if streamID == 0 || len(addrData) == 0 || len(addrData) > protocol.MaxFrameDataLen {
+		return protocol.ErrInvalidFrame
+	}
+
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	total := protocol.FrameHeaderLen*2 + len(addrData)
+	if cap(pw.serializeBuf) < total {
+		pw.serializeBuf = make([]byte, 0, total)
+	}
+	buf := pw.serializeBuf[:total]
+	buf[0] = byte(protocol.CmdSYN)
+	binary.BigEndian.PutUint32(buf[1:5], streamID)
+	buf[5] = 0
+	buf[6] = 0
+
+	off := protocol.FrameHeaderLen
+	buf[off] = byte(protocol.CmdPSH)
+	binary.BigEndian.PutUint32(buf[off+1:off+5], streamID)
+	binary.BigEndian.PutUint16(buf[off+5:off+7], uint16(len(addrData)))
+	copy(buf[off+protocol.FrameHeaderLen:], addrData)
+
+	if pw.scheme == nil {
+		_, err := pw.w.Write(buf)
+		return err
+	}
+
+	state := pw.streams[streamID]
+	if state == nil {
+		pw.nextSeq++
+		state = &streamState{insertedAt: time.Now(), seq: pw.nextSeq}
+		pw.streams[streamID] = state
+		pw.pruneStreamsLocked()
+	}
+	idx := state.idx
+	state.idx++
+
+	var segments []Segment
+	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
+	}
+	if segments == nil {
+		_, err := pw.w.Write(buf)
+		if err == nil {
+			state.bytes += len(buf)
+		}
+		return err
+	}
+
+	written, err := pw.applySegments(buf, segments)
+	state.bytes += written
+	return err
+}
+
 // writeStreamLocked applies the per-stream epoch to a data write.
 func (pw *Writer) writeStreamLocked(frames []*protocol.Frame, id uint32) error {
 	state := pw.streams[id]

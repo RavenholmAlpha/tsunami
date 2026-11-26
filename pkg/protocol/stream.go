@@ -274,17 +274,6 @@ func (s *Stream) popRecvLocked() recvChunk {
 	return ch
 }
 
-func (s *Stream) consumeReadData(p []byte, chunk recvChunk) int {
-	n := copy(p, chunk.data)
-	if n < len(chunk.data) {
-		s.recvLeftChunk = recvChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
-	} else if chunk.poolBuf != nil {
-		putRecvPayloadBuf(chunk.poolBuf)
-	}
-	s.bytesRead.Add(int64(n))
-	return n
-}
-
 func (s *Stream) maybeSendWindowUpdate(consumed int) {
 	if consumed <= 0 || s.closed.Load() || !s.flowControl.Load() {
 		return

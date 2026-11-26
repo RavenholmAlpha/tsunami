@@ -989,17 +989,25 @@ func (c *SplitH2ClientConn) nextUploadChunk() (*[]byte, int, uint64, bool) {
 
 func (c *SplitH2ClientConn) sendChunk(seq uint64, bufp *[]byte, n int) error {
 	data := (*bufp)[:n]
-	req, err := http.NewRequestWithContext(c.reqCtx, http.MethodPost, c.endpoint.String(), bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.ContentLength = int64(n)
-	req.Host = c.host
-	ApplyBrowserHeaders(req.Header, c.fingerprint)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Cache-Control", "no-store")
-	req.Header.Set(HeaderSessionID, c.sid)
-	req.Header.Set(HeaderStreamSeq, strconv.FormatUint(seq, 10))
+	hdr := make(http.Header, 14)
+	ApplyBrowserHeaders(hdr, c.fingerprint)
+	hdr["Content-Type"] = hdrOctetStream
+	hdr["Cache-Control"] = hdrCacheNoStore
+	hdr[HeaderSessionID] = []string{c.sid}
+	var seqBuf [20]byte
+	hdr[HeaderStreamSeq] = []string{string(strconv.AppendUint(seqBuf[:0], seq, 10))}
+
+	req := (&http.Request{
+		Method:        http.MethodPost,
+		URL:           c.endpoint,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        hdr,
+		Body:          io.NopCloser(bytes.NewReader(data)),
+		ContentLength: int64(n),
+		Host:          c.host,
+	}).WithContext(c.reqCtx)
 	if err := SignRequest(req, c.key, time.Now()); err != nil {
 		return err
 	}

@@ -57,10 +57,11 @@ type Session struct {
 	// Optional padding-aware write functions.
 	// When set, frame writes route through these instead of the raw FrameWriter.
 	// Callbacks are invoked under writeMu and must not call writeFrame.
-	paddingWriteFn    func(frames []*Frame) error
-	paddingPSHWriteFn func(streamID uint32, data []byte) error
-	hasCustomWriteFn  atomic.Bool
-	hasPSHWriteFn     atomic.Bool
+	paddingWriteFn          func(frames []*Frame) error
+	paddingPSHWriteFn       func(streamID uint32, data []byte) error
+	paddingSYNTargetWriteFn func(streamID uint32, addrData []byte) error
+	hasCustomWriteFn        atomic.Bool
+	hasPSHWriteFn           atomic.Bool
 
 	// Error channel
 	errCh chan error
@@ -190,6 +191,60 @@ func (s *Session) OpenStream() (*Stream, error) {
 		}
 	}
 
+	s.lastActive.Store(time.Now().UnixNano())
+	return stream, nil
+}
+
+// OpenStreamWithTarget opens a stream and sends its initial target-address payload.
+// When FastOpen is active, CmdSYN and the target address are coalesced into a
+// single lock acquisition and single padded record on the wire.
+func (s *Session) OpenStreamWithTarget(addrData []byte) (*Stream, error) {
+	if len(addrData) == 0 || len(addrData) > MaxFrameDataLen || !s.fastOpen.Load() {
+		stream, err := s.OpenStream()
+		if err != nil {
+			return nil, err
+		}
+		if len(addrData) > 0 {
+			if _, err := stream.Write(addrData); err != nil {
+				_ = stream.Close()
+				return nil, err
+			}
+		}
+		return stream, nil
+	}
+
+	s.openMu.Lock()
+	if s.closed.Load() {
+		s.openMu.Unlock()
+		return nil, ErrSessionClosed
+	}
+	if limit := s.MaxStreams(); limit > 0 && s.streamCount() >= limit {
+		s.openMu.Unlock()
+		return nil, ErrTooManyStreams
+	}
+
+	id := s.nextID.Add(1)
+	stream := newStream(id, s)
+
+	s.streamMu.Lock()
+	if s.flowControl.Load() {
+		stream.initFlowControl(s.localStreamWindow, s.remoteStreamWindow)
+		stream.sendWindow -= int64(len(addrData))
+	}
+	s.streams[id] = stream
+	count := len(s.streams)
+	s.streamMu.Unlock()
+
+	s.notifyStreamCountChange(count)
+
+	if err := s.writeSYNWithTarget(id, addrData); err != nil {
+		s.openMu.Unlock()
+		stream.closeByRemote(err)
+		return nil, fmt.Errorf("tsunami: send SYN+target: %w", err)
+	}
+	s.openMu.Unlock()
+
+	stream.bytesWritten.Add(int64(len(addrData)))
 	s.lastActive.Store(time.Now().UnixNano())
 	return stream, nil
 }
@@ -371,6 +426,39 @@ func (s *Session) writePSHData(streamID uint32, data []byte) error {
 	return err
 }
 
+func (s *Session) writeSYNWithTarget(streamID uint32, addrData []byte) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	s.writeMu.Lock()
+	s.lastActive.Store(time.Now().UnixNano())
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	}
+	var err error
+	if s.paddingSYNTargetWriteFn != nil {
+		err = s.paddingSYNTargetWriteFn(streamID, addrData)
+	} else {
+		frames := []*Frame{
+			NewFrame(CmdSYN, streamID, nil),
+			NewFrame(CmdPSH, streamID, addrData),
+		}
+		if s.paddingWriteFn != nil {
+			err = s.paddingWriteFn(frames)
+		} else {
+			err = s.writer.WriteFrames(frames)
+		}
+	}
+	if nc, ok := s.conn.(net.Conn); ok {
+		nc.SetWriteDeadline(time.Time{})
+	}
+	s.writeMu.Unlock()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
+	return err
+}
+
 func (s *Session) writeRawPSHLocked(streamID uint32, data []byte) error {
 	if len(data) <= MaxFrameDataLen {
 		poolBufp := frameBufPool.Get().(*[]byte)
@@ -492,6 +580,14 @@ func (s *Session) SetPaddingPSHWriteFn(fn func(streamID uint32, data []byte) err
 	s.writeMu.Lock()
 	s.paddingPSHWriteFn = fn
 	s.hasPSHWriteFn.Store(fn != nil)
+	s.writeMu.Unlock()
+}
+
+// SetPaddingSYNTargetWriteFn sets an optional callback to coalesce CmdSYN + target
+// address into a single padded record while preserving stream padding epochs.
+func (s *Session) SetPaddingSYNTargetWriteFn(fn func(streamID uint32, addrData []byte) error) {
+	s.writeMu.Lock()
+	s.paddingSYNTargetWriteFn = fn
 	s.writeMu.Unlock()
 }
 
