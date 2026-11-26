@@ -10,13 +10,13 @@ import (
 )
 
 const (
-	// DefaultStreamWindow is the default per-stream sliding flow-control window (4 MiB).
-	DefaultStreamWindow = 4 << 20
-	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (8 MiB).
-	DefaultMaxStreamRecvBytes = 8 << 20
+	// DefaultStreamWindow is the default per-stream sliding flow-control window (8 MiB).
+	DefaultStreamWindow = 8 << 20
+	// DefaultMaxStreamRecvBytes is the hard safety cap for buffered receive data on a single stream (16 MiB).
+	DefaultMaxStreamRecvBytes = 16 << 20
 
 	minStreamWindow = 64 << 10
-	maxStreamWindow = 8 << 20
+	maxStreamWindow = 16 << 20
 	maxWriteBatch   = 256 << 10
 )
 
@@ -399,6 +399,69 @@ func (s *Stream) Write(p []byte) (int, error) {
 	return off, nil
 }
 
+// WritePreframedSingle writes a single CmdPSH frame whose 7-byte header space is
+// already contiguous in front of the payload (len(framed) == FrameHeaderLen+payloadLen),
+// avoiding a 64 KiB payload copy once the stream's handshake padding epoch finishes.
+func (s *Stream) WritePreframedSingle(framed []byte, payloadLen int) error {
+	if s.closed.Load() {
+		return ErrStreamClosed
+	}
+	if payloadLen <= 0 {
+		return nil
+	}
+	if payloadLen > MaxFrameDataLen || len(framed) != FrameHeaderLen+payloadLen || !s.session.canWritePSHDirect() {
+		_, err := s.Write(framed[FrameHeaderLen:])
+		return err
+	}
+
+	fc, grant := s.acquireSendWindow(payloadLen)
+	if fc && grant < payloadLen {
+		if grant > 0 {
+			s.addSendWindow(int64(grant))
+		}
+		_, err := s.Write(framed[FrameHeaderLen:])
+		return err
+	}
+
+	framed[0] = byte(CmdPSH)
+	binary.BigEndian.PutUint32(framed[1:5], s.id)
+	binary.BigEndian.PutUint16(framed[5:7], uint16(payloadLen))
+	if err := s.session.writePSHPreframed(s.id, framed, payloadLen); err != nil {
+		return err
+	}
+	s.bytesWritten.Add(int64(payloadLen))
+	return nil
+}
+
+// CopyToStream copies from src into dst using a pre-framed 7B+65535B buffer so
+// steady-state relay writes avoid an extra 64 KiB payload copy per frame.
+func CopyToStream(dst *Stream, src io.Reader) (int64, error) {
+	bufp := PreframedRelayBufPool.Get().(*[]byte)
+	buf := *bufp
+	payloadBuf := buf[FrameHeaderLen : FrameHeaderLen+MaxFrameDataLen]
+	var written int64
+	var err error
+	for {
+		nr, er := src.Read(payloadBuf)
+		if nr > 0 {
+			if ew := dst.WritePreframedSingle(buf[:FrameHeaderLen+nr], nr); ew != nil {
+				err = ew
+				break
+			}
+			written += int64(nr)
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	*bufp = buf[:FrameHeaderLen+MaxFrameDataLen]
+	PreframedRelayBufPool.Put(bufp)
+	return written, err
+}
+
 func buildPSHFrames(streamID uint32, p []byte) []*Frame {
 	var frames []*Frame
 	for off := 0; off < len(p); {
@@ -415,9 +478,8 @@ func buildPSHFrames(streamID uint32, p []byte) []*Frame {
 // Close closes the stream by sending cmdFIN.
 func (s *Stream) Close() error {
 	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-
 	if s.closed.Load() {
+		s.closeMu.Unlock()
 		return nil
 	}
 	s.localClosed.Store(true)
@@ -436,10 +498,12 @@ func (s *Stream) Close() error {
 	s.recvBytes = 0
 	s.recvMu.Unlock()
 
-	// Send FIN to remote (best effort).
-	_ = s.session.writeFrame(NewFrame(CmdFIN, s.id, nil))
-
 	s.closeReadBuf()
+	s.closeMu.Unlock()
+
+	// Send FIN and unregister outside closeMu so concurrent closeByRemote in
+	// Session.RunEventLoop never blocks on closeMu while network writes backpressure.
+	_ = s.session.writeFrame(NewFrame(CmdFIN, s.id, nil))
 	s.session.removeStream(s.id)
 
 	return nil
@@ -488,9 +552,8 @@ func (s *Stream) deliverDataPooled(data []byte, poolBuf *[]byte) error {
 // closeByRemote is called when the remote sends cmdFIN or the stream is aborted.
 func (s *Stream) closeByRemote(err error) {
 	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-
 	if s.closed.Load() {
+		s.closeMu.Unlock()
 		return
 	}
 	s.closed.Store(true)
@@ -508,6 +571,8 @@ func (s *Stream) closeByRemote(err error) {
 	s.recvMu.Unlock()
 
 	s.closeReadBuf()
+	s.closeMu.Unlock()
+
 	s.session.removeStream(s.id)
 }
 

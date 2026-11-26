@@ -800,3 +800,50 @@ func TestWriterWriteRaw(t *testing.T) {
 		t.Fatalf("WriteRaw created %d stream states, want 0", tracked)
 	}
 }
+
+func TestWriterCanCoalescePSHAndUpdateScheme(t *testing.T) {
+	scheme := mustParseScheme(t, "stop=2\nstream_bytes=0\n0=~60-60\n1=~60-60")
+	out := &recordingWriter{}
+	pw := NewWriter(out, scheme)
+
+	if pw.CanCoalescePSH(0) {
+		t.Fatal("stream 0 (control bucket) must never coalesce")
+	}
+	if pw.CanCoalescePSH(7) {
+		t.Fatal("fresh stream 7 must not coalesce before completing stop epoch")
+	}
+	if err := pw.WritePSH(7, make([]byte, 10)); err != nil {
+		t.Fatalf("write 0: %v", err)
+	}
+	if pw.CanCoalescePSH(7) {
+		t.Fatal("stream 7 must not coalesce after only 1 of 2 padded packets")
+	}
+	if err := pw.WritePSH(7, make([]byte, 10)); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	if !pw.CanCoalescePSH(7) {
+		t.Fatal("stream 7 should be coalesce-ready after reaching stop=2")
+	}
+
+	// Updating to a scheme with larger stop must invalidate readySet immediately.
+	longer := mustParseScheme(t, "stop=4\nstream_bytes=0\n0=~60-60\n1=~60-60\n2=~60-60\n3=~60-60")
+	pw.UpdateScheme(longer)
+	if pw.CanCoalescePSH(7) {
+		t.Fatal("UpdateScheme must clear readySet until stream re-crosses new stop")
+	}
+	if err := pw.WritePSH(7, make([]byte, 10)); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	if err := pw.WritePSH(7, make([]byte, 10)); err != nil {
+		t.Fatalf("write 3: %v", err)
+	}
+	if !pw.CanCoalescePSH(7) {
+		t.Fatal("stream 7 should become coalesce-ready again after reaching stop=4")
+	}
+
+	// ForgetStream drops ready status so reused stream IDs start fresh.
+	pw.ForgetStream(7)
+	if pw.CanCoalescePSH(7) {
+		t.Fatal("ForgetStream must clear coalesce readiness")
+	}
+}

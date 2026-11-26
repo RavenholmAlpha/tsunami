@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 const (
 	websocketGUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	wsPooledFrameBufCap = 72 * 1024
+	wsReadBufSize       = 32 * 1024
 )
 
 var wsWriteBufPool = sync.Pool{
@@ -112,7 +114,7 @@ func ClientWebSocketHandshakeWithUserAgent(conn net.Conn, endpoint *url.URL, hos
 		return nil, fmt.Errorf("fronting: websocket request: %w", err)
 	}
 
-	br := bufio.NewReader(conn)
+	br := bufio.NewReaderSize(conn, wsReadBufSize)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		return nil, fmt.Errorf("fronting: websocket response: %w", err)
@@ -142,14 +144,21 @@ type WebSocketConn struct {
 	readBuf     []byte
 	readScratch []byte
 	writeMu     sync.Mutex
+	maskRng     *mrand.ChaCha8
 }
 
 // NewWebSocketConn creates a WebSocket net.Conn wrapper.
 func NewWebSocketConn(conn net.Conn, reader *bufio.Reader, maskWrites bool) *WebSocketConn {
 	if reader == nil {
-		reader = bufio.NewReader(conn)
+		reader = bufio.NewReaderSize(conn, wsReadBufSize)
 	}
-	return &WebSocketConn{conn: conn, reader: reader, maskWrites: maskWrites}
+	var maskRng *mrand.ChaCha8
+	if maskWrites {
+		var seed [32]byte
+		_, _ = rand.Read(seed[:])
+		maskRng = mrand.NewChaCha8(seed)
+	}
+	return &WebSocketConn{conn: conn, reader: reader, maskWrites: maskWrites, maskRng: maskRng}
 }
 
 func (c *WebSocketConn) Read(p []byte) (int, error) {
@@ -281,7 +290,9 @@ func (c *WebSocketConn) writeFrame(opcode byte, payload []byte) error {
 	var mask [4]byte
 	if c.maskWrites {
 		header[1] |= 0x80
-		if _, err := rand.Read(mask[:]); err != nil {
+		if c.maskRng != nil {
+			binary.LittleEndian.PutUint32(mask[:], uint32(c.maskRng.Uint64()))
+		} else if _, err := rand.Read(mask[:]); err != nil {
 			return err
 		}
 		hdrLen := len(header)

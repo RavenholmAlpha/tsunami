@@ -14,6 +14,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const defaultTCPNotSentLowat = 32 * 1024
+
 var bbrWarnOnce sync.Once
 
 func applyTCPBuffers(conn *net.TCPConn, cfg *TCPConfig) error {
@@ -24,6 +26,10 @@ func applyTCPBuffers(conn *net.TCPConn, cfg *TCPConfig) error {
 
 	var warnings []string
 	controlErr := rawConn.Control(func(fd uintptr) {
+		// Prevent kernel TCP send-queue bufferbloat on multiplexed tunnel sockets
+		// without limiting in-flight BDP congestion window.
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, defaultTCPNotSentLowat)
+
 		if cfg.SendBufferSize > 0 {
 			if warning := setLinuxSocketBuffer(int(fd), unix.SO_SNDBUF, unix.SO_SNDBUFFORCE, cfg.SendBufferSize, "/proc/sys/net/core/wmem_max"); warning != "" {
 				warnings = append(warnings, "send: "+warning)

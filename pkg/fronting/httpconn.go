@@ -119,11 +119,17 @@ func (c *HTTPServerConn) SetWriteDeadline(t time.Time) error {
 	return err
 }
 
+// PipeWriteCloser represents a request-body stream writer supporting error propagation.
+type PipeWriteCloser interface {
+	io.WriteCloser
+	CloseWithError(err error) error
+}
+
 // HTTPClientConn adapts an HTTP response body and request pipe into net.Conn
 // with real timer-driven read/write deadlines and leak-free cleanup.
 type HTTPClientConn struct {
 	reader    io.ReadCloser
-	writer    *io.PipeWriter
+	writer    PipeWriteCloser
 	respCh    <-chan HTTPResponseResult
 	reqCancel context.CancelFunc
 	onClose   func()
@@ -158,7 +164,7 @@ type HTTPResponseResult struct {
 }
 
 // NewHTTPClientConn returns a net.Conn backed by resp.Body and the request body pipe.
-func NewHTTPClientConn(resp *http.Response, writer *io.PipeWriter) *HTTPClientConn {
+func NewHTTPClientConn(resp *http.Response, writer PipeWriteCloser) *HTTPClientConn {
 	remote := ""
 	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
 		remote = resp.Request.URL.Host
@@ -174,13 +180,13 @@ func NewHTTPClientConn(resp *http.Response, writer *io.PipeWriter) *HTTPClientCo
 
 // NewPendingHTTPClientConn returns a net.Conn that can write request body data
 // before the HTTP response headers have arrived. Reads wait for the response.
-func NewPendingHTTPClientConn(respCh <-chan HTTPResponseResult, writer *io.PipeWriter, remote string) *HTTPClientConn {
+func NewPendingHTTPClientConn(respCh <-chan HTTPResponseResult, writer PipeWriteCloser, remote string) *HTTPClientConn {
 	return NewPendingHTTPClientConnWithCleanup(respCh, writer, remote, nil, nil)
 }
 
 // NewPendingHTTPClientConnWithCleanup creates an HTTPClientConn with request
 // cancellation and transport cleanup hooks invoked on Close or deadline expiry.
-func NewPendingHTTPClientConnWithCleanup(respCh <-chan HTTPResponseResult, writer *io.PipeWriter, remote string, cancel context.CancelFunc, onClose func()) *HTTPClientConn {
+func NewPendingHTTPClientConnWithCleanup(respCh <-chan HTTPResponseResult, writer PipeWriteCloser, remote string, cancel context.CancelFunc, onClose func()) *HTTPClientConn {
 	return &HTTPClientConn{
 		respCh:    respCh,
 		writer:    writer,
@@ -462,4 +468,238 @@ func (a simpleAddr) String() string  { return string(a) }
 
 func addrString(s string) net.Addr {
 	return simpleAddr(s)
+}
+
+type bufferedPipe struct {
+	mu          sync.Mutex
+	buf         []byte
+	head        int
+	size        int
+	maxBytes    int
+	rClosed     bool
+	rErr        error
+	wClosed     bool
+	wErr        error
+	readNotify  chan struct{}
+	spaceNotify chan struct{}
+	wClosedCh   chan struct{}
+	rClosedCh   chan struct{}
+	wCloseOnce  sync.Once
+	rCloseOnce  sync.Once
+}
+
+// BufferedPipeReader reads from an in-memory bounded ring pipe.
+type BufferedPipeReader struct {
+	p *bufferedPipe
+}
+
+// BufferedPipeWriter writes to an in-memory bounded ring pipe without per-write synchronous handoff.
+type BufferedPipeWriter struct {
+	p *bufferedPipe
+}
+
+// NewBufferedPipe returns an asynchronous bounded in-memory pipe up to maxBytes.
+func NewBufferedPipe(maxBytes int) (*BufferedPipeReader, *BufferedPipeWriter) {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+	p := &bufferedPipe{
+		maxBytes:    maxBytes,
+		readNotify:  make(chan struct{}, 1),
+		spaceNotify: make(chan struct{}, 1),
+		wClosedCh:   make(chan struct{}),
+		rClosedCh:   make(chan struct{}),
+	}
+	return &BufferedPipeReader{p: p}, &BufferedPipeWriter{p: p}
+}
+
+func (r *BufferedPipeReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	p := r.p
+	for {
+		p.mu.Lock()
+		if p.rClosed {
+			p.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		}
+		if p.size > 0 {
+			n := len(dst)
+			if n > p.size {
+				n = p.size
+			}
+			first := len(p.buf) - p.head
+			if first > n {
+				first = n
+			}
+			copy(dst, p.buf[p.head:p.head+first])
+			if first < n {
+				copy(dst[first:], p.buf[:n-first])
+			}
+			p.head = (p.head + n) % len(p.buf)
+			p.size -= n
+			if p.size == 0 {
+				p.head = 0
+			}
+			p.mu.Unlock()
+
+			select {
+			case p.spaceNotify <- struct{}{}:
+			default:
+			}
+			return n, nil
+		}
+		if p.wClosed {
+			err := p.wErr
+			if err == nil {
+				err = io.EOF
+			}
+			p.mu.Unlock()
+			return 0, err
+		}
+		p.mu.Unlock()
+
+		select {
+		case <-p.readNotify:
+		case <-p.wClosedCh:
+		case <-p.rClosedCh:
+		}
+	}
+}
+
+func (r *BufferedPipeReader) Close() error {
+	return r.CloseWithError(nil)
+}
+
+func (r *BufferedPipeReader) CloseWithError(err error) error {
+	p := r.p
+	p.mu.Lock()
+	if !p.rClosed {
+		p.rClosed = true
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+		p.rErr = err
+		p.buf = nil
+		p.head = 0
+		p.size = 0
+	}
+	p.mu.Unlock()
+	p.rCloseOnce.Do(func() {
+		close(p.rClosedCh)
+	})
+	return nil
+}
+
+func (w *BufferedPipeWriter) Write(src []byte) (int, error) {
+	p := w.p
+	if len(src) == 0 {
+		p.mu.Lock()
+		closed := p.rClosed || p.wClosed
+		rErr := p.rErr
+		p.mu.Unlock()
+		if closed {
+			if rErr != nil {
+				return 0, rErr
+			}
+			return 0, io.ErrClosedPipe
+		}
+		return 0, nil
+	}
+
+	off := 0
+	for off < len(src) {
+		p.mu.Lock()
+		if p.rClosed {
+			err := p.rErr
+			if err == nil {
+				err = io.ErrClosedPipe
+			}
+			p.mu.Unlock()
+			return off, err
+		}
+		if p.wClosed {
+			p.mu.Unlock()
+			return off, io.ErrClosedPipe
+		}
+		avail := p.maxBytes - p.size
+		if avail <= 0 {
+			p.mu.Unlock()
+			select {
+			case <-p.spaceNotify:
+				continue
+			case <-p.rClosedCh:
+				continue
+			case <-p.wClosedCh:
+				return off, io.ErrClosedPipe
+			}
+		}
+		chunk := len(src) - off
+		if chunk > avail {
+			chunk = avail
+		}
+		need := p.size + chunk
+		if need > len(p.buf) {
+			newCap := len(p.buf) * 2
+			if newCap < 64<<10 {
+				newCap = 64 << 10
+			}
+			for newCap < need {
+				newCap *= 2
+			}
+			if newCap > p.maxBytes {
+				newCap = p.maxBytes
+			}
+			newBuf := make([]byte, newCap)
+			if p.size > 0 {
+				first := len(p.buf) - p.head
+				if first > p.size {
+					first = p.size
+				}
+				copy(newBuf, p.buf[p.head:p.head+first])
+				if first < p.size {
+					copy(newBuf[first:], p.buf[:p.size-first])
+				}
+			}
+			p.buf = newBuf
+			p.head = 0
+		}
+		tail := (p.head + p.size) % len(p.buf)
+		first := len(p.buf) - tail
+		if first > chunk {
+			first = chunk
+		}
+		copy(p.buf[tail:], src[off : off+first])
+		if first < chunk {
+			copy(p.buf, src[off+first : off+chunk])
+		}
+		p.size += chunk
+		off += chunk
+		p.mu.Unlock()
+
+		select {
+		case p.readNotify <- struct{}{}:
+		default:
+		}
+	}
+	return off, nil
+}
+
+func (w *BufferedPipeWriter) Close() error {
+	return w.CloseWithError(nil)
+}
+
+func (w *BufferedPipeWriter) CloseWithError(err error) error {
+	p := w.p
+	p.mu.Lock()
+	if !p.wClosed {
+		p.wClosed = true
+		p.wErr = err
+	}
+	p.mu.Unlock()
+	p.wCloseOnce.Do(func() {
+		close(p.wClosedCh)
+	})
+	return nil
 }

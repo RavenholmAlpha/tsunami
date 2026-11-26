@@ -54,10 +54,12 @@ func DialUTLS(conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
 	}
 
 	utlsCfg := &utls.Config{
-		ServerName:         cfg.ServerName,
-		InsecureSkipVerify: cfg.SkipVerify,
-		NextProtos:         cfg.ALPN,
-		MinVersion:         cfg.MinVersion,
+		ServerName:                         cfg.ServerName,
+		InsecureSkipVerify:                 cfg.SkipVerify,
+		NextProtos:                         cfg.ALPN,
+		MinVersion:                         cfg.MinVersion,
+		ClientSessionCache:                 cfg.UTLSSessionCache,
+		PreferSkipResumptionOnNilExtension: true,
 	}
 
 	uconn := utls.UClient(conn, utlsCfg, *helloID)
@@ -90,10 +92,12 @@ func DialUTLSWithALPN(conn net.Conn, cfg *TLSConfig, alpn []string) (net.Conn, e
 	}
 
 	utlsCfg := &utls.Config{
-		ServerName:         cfg.ServerName,
-		InsecureSkipVerify: cfg.SkipVerify,
-		NextProtos:         alpn,
-		MinVersion:         cfg.MinVersion,
+		ServerName:                         cfg.ServerName,
+		InsecureSkipVerify:                 cfg.SkipVerify,
+		NextProtos:                         alpn,
+		MinVersion:                         cfg.MinVersion,
+		ClientSessionCache:                 cfg.UTLSSessionCache,
+		PreferSkipResumptionOnNilExtension: true,
 	}
 
 	// Resolve the fingerprint ClientHelloSpec first, patch its ALPN extension,

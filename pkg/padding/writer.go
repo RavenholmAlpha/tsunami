@@ -23,6 +23,7 @@ type streamState struct {
 	bytes      int       // bytes written for this stream (payload + padding)
 	insertedAt time.Time // used to prune the oldest entries
 	seq        uint64    // tie-breaker when timestamps are equal
+	ready      bool      // true once permanently past handshake padding under current scheme
 }
 
 // Writer wraps a TLS connection writer and applies the PaddingScheme to
@@ -45,6 +46,15 @@ type Writer struct {
 	rawBuf       []byte // reusable encoding buffer for unpadded frame writes
 	serializeBuf []byte // reusable serialization buffer for padded writes
 	padBuf       []byte // reusable pad-to assembly buffer
+
+	// Lock-free / leaf-locked steady-state cache so Session can check whether
+	// a stream is past its handshake padding epoch without blocking on pw.mu
+	// while a TLS/H2 write is in flight. Lock order: pw.mu -> pw.readyMu.
+	noStreamPadding  atomic.Bool
+	hasPendingForget atomic.Bool
+	readyMu          sync.RWMutex
+	readySet         map[uint32]struct{}
+	pendingForget    []uint32
 }
 
 // NewWriter creates a new padding-aware writer for the client role.
@@ -57,13 +67,16 @@ func NewWriter(w io.Writer, scheme *Scheme) *Writer {
 // NewWriterForRole creates a padding-aware writer for the given direction.
 // role selects the directional c<idx> / s<idx> padding rules.
 func NewWriterForRole(w io.Writer, scheme *Scheme, role Role) *Writer {
-	return &Writer{
-		w:       w,
-		scheme:  scheme,
-		role:    role,
-		fw:      protocol.NewFrameWriter(w),
-		streams: make(map[uint32]*streamState),
+	pw := &Writer{
+		w:        w,
+		scheme:   scheme,
+		role:     role,
+		fw:       protocol.NewFrameWriter(w),
+		streams:  make(map[uint32]*streamState),
+		readySet: make(map[uint32]struct{}),
 	}
+	pw.noStreamPadding.Store(scheme == nil || scheme.Stop <= 0)
+	return pw
 }
 
 // UpdateScheme replaces the current padding scheme. It takes effect from the
@@ -71,16 +84,83 @@ func NewWriterForRole(w io.Writer, scheme *Scheme, role Role) *Writer {
 func (pw *Writer) UpdateScheme(scheme *Scheme) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
+	pw.drainPendingForgetsLocked()
 	pw.scheme = scheme
+	pw.noStreamPadding.Store(scheme == nil || scheme.Stop <= 0)
+	for _, st := range pw.streams {
+		st.ready = false
+	}
+	pw.readyMu.Lock()
+	clear(pw.readySet)
+	pw.readyMu.Unlock()
 }
 
 // ForgetStream drops the padding epoch of a stream. Sessions call it when the
 // stream closes so closed streams do not occupy the bounded epoch table and so
 // a future stream reusing the ID starts with a fresh epoch.
+//
+// If a network write currently holds pw.mu, ForgetStream defers deletion of
+// pw.streams[id] instead of blocking the caller (e.g. Session.RunEventLoop),
+// while immediately clearing readySet so the ID cannot coalesce.
 func (pw *Writer) ForgetStream(id uint32) {
-	pw.mu.Lock()
-	delete(pw.streams, id)
-	pw.mu.Unlock()
+	pw.readyMu.Lock()
+	delete(pw.readySet, id)
+	pw.readyMu.Unlock()
+
+	if pw.mu.TryLock() {
+		delete(pw.streams, id)
+		pw.drainPendingForgetsLocked()
+		pw.mu.Unlock()
+		return
+	}
+
+	pw.readyMu.Lock()
+	pw.pendingForget = append(pw.pendingForget, id)
+	pw.hasPendingForget.Store(true)
+	pw.readyMu.Unlock()
+}
+
+func (pw *Writer) drainPendingForgetsLocked() {
+	if !pw.hasPendingForget.Load() {
+		return
+	}
+	pw.readyMu.Lock()
+	ids := pw.pendingForget
+	pw.pendingForget = nil
+	pw.hasPendingForget.Store(false)
+	pw.readyMu.Unlock()
+	for _, id := range ids {
+		delete(pw.streams, id)
+	}
+}
+
+// CanCoalescePSH reports whether streamID is permanently past its handshake
+// padding epoch under the current scheme and may therefore be safely coalesced
+// into a multi-stream raw CmdPSH write batch under contention.
+// It never acquires pw.mu, so callers do not block on in-flight conn writes.
+func (pw *Writer) CanCoalescePSH(streamID uint32) bool {
+	if streamID == 0 {
+		return false
+	}
+	if pw.noStreamPadding.Load() {
+		return true
+	}
+	pw.readyMu.RLock()
+	_, ok := pw.readySet[streamID]
+	pw.readyMu.RUnlock()
+	return ok
+}
+
+func (pw *Writer) markReadyIfPastEpochLocked(streamID uint32, state *streamState) {
+	if state == nil || state.ready || pw.scheme == nil {
+		return
+	}
+	if state.idx >= pw.scheme.Stop || (pw.scheme.StreamBytes > 0 && state.bytes >= pw.scheme.StreamBytes) {
+		state.ready = true
+		pw.readyMu.Lock()
+		pw.readySet[streamID] = struct{}{}
+		pw.readyMu.Unlock()
+	}
 }
 
 // WriteFramesWithPadding writes frames applying the PaddingScheme rules.
@@ -110,6 +190,7 @@ func (pw *Writer) WriteFramesWithPadding(frames []*protocol.Frame) error {
 
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
+	pw.drainPendingForgetsLocked()
 
 	if pw.scheme == nil {
 		return pw.writeFramesRawLocked(frames)
@@ -147,6 +228,7 @@ func (pw *Writer) WritePSH(streamID uint32, data []byte) error {
 
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
+	pw.drainPendingForgetsLocked()
 
 	if pw.scheme == nil {
 		return pw.writePSHRawLocked(streamID, data)
@@ -172,12 +254,55 @@ func (pw *Writer) WritePSH(streamID uint32, data []byte) error {
 			return err
 		}
 		state.bytes += pshWireLen(len(data))
+		pw.markReadyIfPastEpochLocked(streamID, state)
 		return nil
 	}
 
 	written, err := pw.applySegments(pw.serializePSHLocked(streamID, data), segments)
 	state.bytes += written
+	pw.markReadyIfPastEpochLocked(streamID, state)
 	return err
+}
+
+// WritePSHPreframed writes an already header-prefixed single CmdPSH frame in-place
+// with zero payload copy once the stream's handshake padding epoch has completed.
+// If the stream still requires handshake padding, it returns handled=false without
+// mutating epoch state so the caller can fall back to WritePSH.
+func (pw *Writer) WritePSHPreframed(streamID uint32, framed []byte, payloadLen int) (bool, error) {
+	if streamID == 0 || payloadLen <= 0 || payloadLen > protocol.MaxFrameDataLen || len(framed) != protocol.FrameHeaderLen+payloadLen {
+		return false, nil
+	}
+
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	pw.drainPendingForgetsLocked()
+
+	if pw.scheme == nil {
+		_, err := pw.w.Write(framed)
+		return true, err
+	}
+
+	state := pw.streams[streamID]
+	if state == nil {
+		pw.nextSeq++
+		state = &streamState{insertedAt: time.Now(), seq: pw.nextSeq}
+		pw.streams[streamID] = state
+		pw.pruneStreamsLocked()
+	}
+
+	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+		if segments := pw.scheme.GetSegmentsFor(pw.role, state.idx); segments != nil {
+			return false, nil
+		}
+	}
+
+	state.idx++
+	_, err := pw.w.Write(framed)
+	if err == nil {
+		state.bytes += len(framed)
+		pw.markReadyIfPastEpochLocked(streamID, state)
+	}
+	return true, err
 }
 
 // WriteSYNWithTarget coalesces CmdSYN + the initial target-address CmdPSH into a
@@ -190,6 +315,7 @@ func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
 
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
+	pw.drainPendingForgetsLocked()
 
 	total := protocol.FrameHeaderLen*2 + len(addrData)
 	if cap(pw.serializeBuf) < total {
@@ -230,12 +356,14 @@ func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
 		_, err := pw.w.Write(buf)
 		if err == nil {
 			state.bytes += len(buf)
+			pw.markReadyIfPastEpochLocked(streamID, state)
 		}
 		return err
 	}
 
 	written, err := pw.applySegments(buf, segments)
 	state.bytes += written
+	pw.markReadyIfPastEpochLocked(streamID, state)
 	return err
 }
 
@@ -262,11 +390,13 @@ func (pw *Writer) writeStreamLocked(frames []*protocol.Frame, id uint32) error {
 			return err
 		}
 		state.bytes += wireLen(frames)
+		pw.markReadyIfPastEpochLocked(id, state)
 		return nil
 	}
 
 	written, err := pw.applySegments(pw.serializeFramesLocked(frames), segments)
 	state.bytes += written
+	pw.markReadyIfPastEpochLocked(id, state)
 	return err
 }
 
@@ -603,6 +733,9 @@ func (pw *Writer) pruneStreamsLocked() {
 		}
 	}
 	delete(pw.streams, oldestID)
+	pw.readyMu.Lock()
+	delete(pw.readySet, oldestID)
+	pw.readyMu.Unlock()
 }
 
 // dataStreamBucket reports the stream a write belongs to when every frame is

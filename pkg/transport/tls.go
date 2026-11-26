@@ -8,6 +8,8 @@ import (
 	"net"
 	"runtime"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // TLSConfig holds TSUNAMI TLS configuration.
@@ -28,6 +30,11 @@ type TLSConfig struct {
 	// Shared
 	ALPN       []string
 	MinVersion uint16
+
+	// Client session caches enable standard TLS 1.3 1-RTT session ticket
+	// resumption (no 0-RTT early data) across pooled/reconnected sessions.
+	SessionCache     tls.ClientSessionCache
+	UTLSSessionCache utls.ClientSessionCache
 }
 
 // DefaultTLSConfig returns the default TSUNAMI TLS settings.
@@ -45,6 +52,7 @@ func (c *TLSConfig) BuildClientTLSConfig() *tls.Config {
 		InsecureSkipVerify: c.SkipVerify,
 		NextProtos:         c.ALPN,
 		MinVersion:         c.MinVersion,
+		ClientSessionCache: c.SessionCache,
 	}
 }
 

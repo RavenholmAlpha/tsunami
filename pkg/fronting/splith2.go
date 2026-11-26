@@ -389,14 +389,8 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 	if c.readExpired.Load() {
 		return 0, os.ErrDeadlineExceeded
 	}
-	if len(c.readLeftChunk.data) > 0 {
-		n := copy(p, c.readLeftChunk.data)
-		c.readLeftChunk.data = c.readLeftChunk.data[n:]
-		if len(c.readLeftChunk.data) == 0 && c.readLeftChunk.poolBuf != nil {
-			recycleServerSplitChunk(c.readLeftChunk.poolBuf)
-			c.readLeftChunk.poolBuf = nil
-		}
-		return n, nil
+	if len(p) == 0 {
+		return 0, nil
 	}
 
 	for {
@@ -405,7 +399,18 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 			c.mu.Unlock()
 			return 0, os.ErrDeadlineExceeded
 		}
-		if c.readQueueHead < len(c.readQueue) {
+		total := 0
+		poppedQueue := false
+		if len(c.readLeftChunk.data) > 0 {
+			n := copy(p, c.readLeftChunk.data)
+			c.readLeftChunk.data = c.readLeftChunk.data[n:]
+			if len(c.readLeftChunk.data) == 0 && c.readLeftChunk.poolBuf != nil {
+				recycleServerSplitChunk(c.readLeftChunk.poolBuf)
+				c.readLeftChunk.poolBuf = nil
+			}
+			total += n
+		}
+		for total < len(p) && c.readQueueHead < len(c.readQueue) {
 			chunk := c.readQueue[c.readQueueHead]
 			c.readQueue[c.readQueueHead] = splitChunk{}
 			c.readQueueHead++
@@ -414,20 +419,25 @@ func (c *SplitH2ServerConn) Read(p []byte) (int, error) {
 				c.readQueueHead = 0
 			}
 			c.bufferedBytes -= len(chunk.data)
-			c.mu.Unlock()
+			poppedQueue = true
 
-			select {
-			case c.spaceNotify <- struct{}{}:
-			default:
-			}
-
-			n := copy(p, chunk.data)
+			n := copy(p[total:], chunk.data)
 			if n < len(chunk.data) {
 				c.readLeftChunk = splitChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
 			} else if chunk.poolBuf != nil {
 				recycleServerSplitChunk(chunk.poolBuf)
 			}
-			return n, nil
+			total += n
+		}
+		if total > 0 {
+			c.mu.Unlock()
+			if poppedQueue {
+				select {
+				case c.spaceNotify <- struct{}{}:
+				default:
+				}
+			}
+			return total, nil
 		}
 		if c.closed {
 			c.mu.Unlock()
@@ -480,12 +490,18 @@ func (c *SplitH2ServerConn) Close() error {
 		if c.readQueueHead < len(c.readQueue) {
 			queued = c.readQueue[c.readQueueHead:]
 		}
+		leftBuf := c.readLeftChunk.poolBuf
+		c.readLeftChunk = splitChunk{}
 		c.readQueue = nil
 		c.readQueueHead = 0
 		c.bufferedBytes = 0
 		rc := c.rc
 		close(c.closedCh)
 		c.mu.Unlock()
+
+		if leftBuf != nil {
+			recycleServerSplitChunk(leftBuf)
+		}
 
 		for _, ch := range pending {
 			if ch.poolBuf != nil {
@@ -621,8 +637,8 @@ type SplitH2ClientConn struct {
 	closed              bool
 	closedCh            chan struct{}
 	abortErr            error
-	sendRing            []byte
-	sendHead            int
+	sendChunks          []clientSendChunk
+	sendChunksHead      int
 	sendLen             int
 	nextSeq             uint64
 	sendNotify          chan struct{}
@@ -826,7 +842,7 @@ func (c *SplitH2ClientConn) Write(p []byte) (int, error) {
 		if chunk > avail {
 			chunk = avail
 		}
-		c.appendSendRingLocked(p[off : off+chunk])
+		c.appendSendChunksLocked(p[off : off+chunk])
 		off += chunk
 		c.mu.Unlock()
 
@@ -839,44 +855,37 @@ func (c *SplitH2ClientConn) Write(p []byte) (int, error) {
 	return off, nil
 }
 
-func (c *SplitH2ClientConn) appendSendRingLocked(src []byte) {
-	need := c.sendLen + len(src)
-	if need > len(c.sendRing) {
-		newCap := len(c.sendRing) * 2
-		if newCap < 64<<10 {
-			newCap = 64 << 10
-		}
-		for newCap < need {
-			newCap *= 2
-		}
-		if newCap > splitClientMaxSendBuf {
-			newCap = splitClientMaxSendBuf
-		}
-		newRing := make([]byte, newCap)
-		if c.sendLen > 0 {
-			first := len(c.sendRing) - c.sendHead
-			if first > c.sendLen {
-				first = c.sendLen
-			}
-			copy(newRing, c.sendRing[c.sendHead:c.sendHead+first])
-			if first < c.sendLen {
-				copy(newRing[first:], c.sendRing[:c.sendLen-first])
-			}
-		}
-		c.sendRing = newRing
-		c.sendHead = 0
-	}
+type clientSendChunk struct {
+	bufp *[]byte
+	len  int
+}
 
-	tail := (c.sendHead + c.sendLen) % len(c.sendRing)
-	first := len(c.sendRing) - tail
-	if first > len(src) {
-		first = len(src)
+func (c *SplitH2ClientConn) appendSendChunksLocked(src []byte) {
+	if c.sendChunksHead >= 32 && c.sendChunksHead*2 >= len(c.sendChunks) {
+		rem := copy(c.sendChunks, c.sendChunks[c.sendChunksHead:])
+		clear(c.sendChunks[rem:])
+		c.sendChunks = c.sendChunks[:rem]
+		c.sendChunksHead = 0
 	}
-	copy(c.sendRing[tail:], src[:first])
-	if first < len(src) {
-		copy(c.sendRing, src[first:])
+	for len(src) > 0 {
+		if c.sendChunksHead < len(c.sendChunks) {
+			tail := &c.sendChunks[len(c.sendChunks)-1]
+			if tail.len < splitClientMaxChunk {
+				n := copy((*tail.bufp)[tail.len:splitClientMaxChunk], src)
+				tail.len += n
+				c.sendLen += n
+				src = src[n:]
+				if len(src) == 0 {
+					return
+				}
+			}
+		}
+		bufp := splitClientChunkPool.Get().(*[]byte)
+		n := copy((*bufp)[:splitClientMaxChunk], src)
+		c.sendChunks = append(c.sendChunks, clientSendChunk{bufp: bufp, len: n})
+		c.sendLen += n
+		src = src[n:]
 	}
-	c.sendLen += len(src)
 }
 
 type splitUploadJob struct {
@@ -947,26 +956,15 @@ func (c *SplitH2ClientConn) nextUploadChunk() (*[]byte, int, uint64, bool) {
 			c.mu.Unlock()
 			return nil, 0, 0, false
 		}
-		if c.sendLen > 0 {
-			n := c.sendLen
-			if n > splitClientMaxChunk {
-				n = splitClientMaxChunk
+		if c.sendChunksHead < len(c.sendChunks) {
+			front := c.sendChunks[c.sendChunksHead]
+			c.sendChunks[c.sendChunksHead] = clientSendChunk{}
+			c.sendChunksHead++
+			if c.sendChunksHead == len(c.sendChunks) {
+				c.sendChunks = c.sendChunks[:0]
+				c.sendChunksHead = 0
 			}
-			bufp := splitClientChunkPool.Get().(*[]byte)
-			dst := (*bufp)[:n]
-			first := len(c.sendRing) - c.sendHead
-			if first > n {
-				first = n
-			}
-			copy(dst, c.sendRing[c.sendHead:c.sendHead+first])
-			if first < n {
-				copy(dst[first:], c.sendRing[:n-first])
-			}
-			c.sendHead = (c.sendHead + n) % len(c.sendRing)
-			c.sendLen -= n
-			if c.sendLen == 0 {
-				c.sendHead = 0
-			}
+			c.sendLen -= front.len
 			seq := c.nextSeq
 			c.nextSeq++
 			c.mu.Unlock()
@@ -975,7 +973,7 @@ func (c *SplitH2ClientConn) nextUploadChunk() (*[]byte, int, uint64, bool) {
 			case c.spaceNotify <- struct{}{}:
 			default:
 			}
-			return bufp, n, seq, true
+			return front.bufp, front.len, seq, true
 		}
 		c.mu.Unlock()
 
@@ -1049,13 +1047,24 @@ func (c *SplitH2ClientConn) abort(err error) {
 		if c.writeTimer != nil {
 			c.writeTimer.Stop()
 		}
-		c.sendRing = nil
-		c.sendHead = 0
+		var unsent []clientSendChunk
+		if c.sendChunksHead < len(c.sendChunks) {
+			unsent = c.sendChunks[c.sendChunksHead:]
+		}
+		c.sendChunks = nil
+		c.sendChunksHead = 0
 		c.sendLen = 0
 		reader := c.reader
 		cancel := c.reqCancel
 		onClose := c.onClose
 		c.mu.Unlock()
+
+		for _, ch := range unsent {
+			if ch.bufp != nil && cap(*ch.bufp) >= splitClientMaxChunk {
+				*ch.bufp = (*ch.bufp)[:splitClientMaxChunk]
+				splitClientChunkPool.Put(ch.bufp)
+			}
+		}
 
 		if cancel != nil {
 			cancel()

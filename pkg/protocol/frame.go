@@ -56,6 +56,16 @@ var RelayBufPool = sync.Pool{
 	},
 }
 
+// PreframedRelayBufPool provides [FrameHeaderLen + MaxFrameDataLen]-byte buffers
+// so relay loops can read payload at offset FrameHeaderLen and write the 7-byte
+// CmdPSH header in-place without a second 64 KiB copy.
+var PreframedRelayBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, FrameHeaderLen+MaxFrameDataLen)
+		return &buf
+	},
+}
+
 // writeCoalesceBufPool provides buffers for WriteFrames coalescing.
 var writeCoalesceBufPool = sync.Pool{
 	New: func() any {

@@ -28,6 +28,7 @@ import (
 const (
 	resolveCacheTTL        = 30 * time.Second
 	maxResolveCacheEntries = 256
+	uotUDPSocketBufBytes   = 4 << 20
 )
 
 // UDPPacket represents a single UDP packet in the UoT stream.
@@ -87,6 +88,9 @@ func (r *Relay) Run() error {
 	if err != nil {
 		return fmt.Errorf("uot: listen UDP: %w", err)
 	}
+	// Best-effort enlarge kernel UDP socket buffers to absorb QUIC/HTTP3 bursts.
+	_ = r.udpConn.SetReadBuffer(uotUDPSocketBufBytes)
+	_ = r.udpConn.SetWriteBuffer(uotUDPSocketBufBytes)
 	defer r.closeUDP()
 
 	var wg sync.WaitGroup
@@ -204,8 +208,9 @@ func (r *Relay) streamToUDP() {
 	}
 }
 
-// udpToStream reads UDP replies and writes them back as UoT packets.
-func (r *Relay) udpToStream() {
+// udpToStreamSingle reads UDP replies one datagram at a time and writes them
+// back as UoT packets.
+func (r *Relay) udpToStreamSingle() {
 	const maxHeader = 1 + 16 + 2 + 2 // 21 bytes for IPv6 header
 	pktBuf := make([]byte, maxHeader+65535)
 	readBuf := pktBuf[maxHeader:]

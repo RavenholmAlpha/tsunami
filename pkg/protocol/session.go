@@ -32,6 +32,7 @@ type Session struct {
 	closed    atomic.Bool
 	closeMu   sync.Mutex
 	closeOnce sync.Once
+	doneCh    chan struct{}
 
 	// Negotiated settings
 	localVersion       int
@@ -41,11 +42,12 @@ type Session struct {
 	localStreamWindow  int
 	remoteStreamWindow int
 
-	// Idle tracking (atomic to avoid data races between event loop and write goroutines)
-	idleSince  atomic.Int64 // stores UnixNano; 0 = not idle
-	lastActive atomic.Int64 // stores UnixNano
-	lastRecv   atomic.Int64 // stores UnixNano; updated on any inbound frame
-	lastPong   atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
+	// Idle & write-stall tracking (atomic to avoid per-frame SetWriteDeadline syscalls)
+	idleSince    atomic.Int64 // stores UnixNano; 0 = not idle
+	lastActive   atomic.Int64 // stores UnixNano
+	lastRecv     atomic.Int64 // stores UnixNano; updated on any inbound frame
+	lastPong     atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
+	writingSince atomic.Int64 // stores UnixNano while blocked in conn.Write; 0 = idle
 
 	// Callbacks
 	onStreamOpen          func(s *Stream)         // Called when server receives a new stream
@@ -59,15 +61,48 @@ type Session struct {
 	// Callbacks are invoked under writeMu and must not call writeFrame.
 	paddingWriteFn          func(frames []*Frame) error
 	paddingPSHWriteFn       func(streamID uint32, data []byte) error
+	paddingPSHPreframedFn   func(streamID uint32, framed []byte, payloadLen int) (bool, error)
 	paddingSYNTargetWriteFn func(streamID uint32, addrData []byte) error
+	paddingCoalesce         atomic.Pointer[paddingCoalesceFuncs]
 	hasCustomWriteFn        atomic.Bool
 	hasPSHWriteFn           atomic.Bool
+
+	// Write priority gate: prevents bulk stream writes from starving control frames
+	// (CmdWindowUpdate, CmdSYN, CmdSYNACK, CmdFIN, heartbeats) and small interactive PSH.
+	highPriWaiters atomic.Int32
+	bulkWaiting    atomic.Int32
+	highPriMu      sync.Mutex
+	highPriCond    *sync.Cond
+
+	// Contention-coalescing batch writer for steady-state unpadded bulk CmdPSH.
+	// Uncontended writes bypass this completely with zero extra copy or delay.
+	batchMu       sync.Mutex
+	batchBusy     bool
+	batchBusyFast atomic.Bool
+	batchBuf      []byte
+	batchAltBuf   []byte
+	batchWaiter   *writeBatchWaiter
 
 	// Error channel
 	errCh chan error
 }
 
-const sessionWriteDeadline = 30 * time.Second
+type paddingCoalesceFuncs struct {
+	canCoalesce func(streamID uint32) bool
+	writeRaw    func(data []byte) error
+}
+
+type writeBatchWaiter struct {
+	done chan struct{}
+	err  error
+}
+
+const (
+	sessionWriteDeadline   = 30 * time.Second
+	highPriPSHMaxBytes     = 2048
+	maxCoalesceBatchBytes  = 256 << 10
+	maxCoalesceDrainRounds = 4
+)
 
 // DefaultMaxStreams bounds how many streams one session may carry at once.
 // It is deliberately far above real browsing concurrency but low enough that a
@@ -83,10 +118,12 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 		writer:       NewFrameWriter(conn),
 		reader:       NewFrameReader(conn),
 		streams:      make(map[uint32]*Stream),
+		doneCh:       make(chan struct{}),
 		localVersion: CurrentVersion,
 		maxStreams:   DefaultMaxStreams,
 		errCh:        make(chan error, 1),
 	}
+	s.highPriCond = sync.NewCond(&s.highPriMu)
 	now := time.Now().UnixNano()
 	s.lastActive.Store(now)
 	s.lastRecv.Store(now)
@@ -318,6 +355,201 @@ func (s *Session) IsAlive(timeout time.Duration) bool {
 	return time.Since(lp) < timeout
 }
 
+func (s *Session) lockWriteHighPri() {
+	s.highPriWaiters.Add(1)
+	s.writeMu.Lock()
+}
+
+func (s *Session) unlockWriteHighPri() {
+	s.writeMu.Unlock()
+	if s.highPriWaiters.Add(-1) == 0 && s.bulkWaiting.Load() > 0 {
+		s.highPriMu.Lock()
+		s.highPriCond.Broadcast()
+		s.highPriMu.Unlock()
+	}
+}
+
+func (s *Session) lockWriteBulk() {
+	if s.highPriWaiters.Load() > 0 && !s.closed.Load() {
+		s.highPriMu.Lock()
+		s.bulkWaiting.Add(1)
+		for s.highPriWaiters.Load() > 0 && !s.closed.Load() {
+			s.highPriCond.Wait()
+		}
+		s.bulkWaiting.Add(-1)
+		s.highPriMu.Unlock()
+	}
+	s.writeMu.Lock()
+}
+
+func (s *Session) unlockWriteBulk() {
+	s.writeMu.Unlock()
+}
+
+func (s *Session) canSessionCoalesce() bool {
+	if s.paddingCoalesce.Load() != nil {
+		return true
+	}
+	return !s.hasCustomWriteFn.Load() && !s.hasPSHWriteFn.Load()
+}
+
+func (s *Session) canCoalescePSH(streamID uint32) bool {
+	if streamID == 0 {
+		return false
+	}
+	if fns := s.paddingCoalesce.Load(); fns != nil {
+		return fns.canCoalesce(streamID)
+	}
+	return !s.hasCustomWriteFn.Load() && !s.hasPSHWriteFn.Load()
+}
+
+func (s *Session) writeRawCoalescedLocked(data []byte) error {
+	if fns := s.paddingCoalesce.Load(); fns != nil {
+		return fns.writeRaw(data)
+	}
+	_, err := s.writer.w.Write(data)
+	return err
+}
+
+func (s *Session) tryEnqueueBulkPSH(streamID uint32, framed []byte, payload []byte) (bool, error) {
+	if !s.batchBusyFast.Load() || s.highPriWaiters.Load() > 0 || s.closed.Load() {
+		return false, nil
+	}
+	var wireSize int
+	if framed != nil {
+		wireSize = len(framed)
+	} else {
+		chunks := (len(payload) + MaxFrameDataLen - 1) / MaxFrameDataLen
+		wireSize = chunks*FrameHeaderLen + len(payload)
+	}
+	if wireSize <= 0 || wireSize > maxCoalesceBatchBytes {
+		return false, nil
+	}
+	if !s.canCoalescePSH(streamID) {
+		return false, nil
+	}
+
+	s.batchMu.Lock()
+	if !s.batchBusy || s.highPriWaiters.Load() > 0 || s.closed.Load() || len(s.batchBuf)+wireSize > maxCoalesceBatchBytes {
+		s.batchMu.Unlock()
+		return false, nil
+	}
+	if s.batchBuf == nil {
+		initCap := 64 * 1024
+		if wireSize > initCap {
+			initCap = wireSize
+		}
+		if initCap > maxCoalesceBatchBytes {
+			initCap = maxCoalesceBatchBytes
+		}
+		s.batchBuf = make([]byte, 0, initCap)
+	}
+	if framed != nil {
+		s.batchBuf = append(s.batchBuf, framed...)
+	} else {
+		var hdr [FrameHeaderLen]byte
+		for off := 0; off < len(payload); {
+			n := len(payload) - off
+			if n > MaxFrameDataLen {
+				n = MaxFrameDataLen
+			}
+			hdr[0] = byte(CmdPSH)
+			binary.BigEndian.PutUint32(hdr[1:5], streamID)
+			binary.BigEndian.PutUint16(hdr[5:7], uint16(n))
+			s.batchBuf = append(s.batchBuf, hdr[:]...)
+			s.batchBuf = append(s.batchBuf, payload[off:off+n]...)
+			off += n
+		}
+	}
+	waiter := s.batchWaiter
+	if waiter == nil {
+		waiter = &writeBatchWaiter{done: make(chan struct{})}
+		s.batchWaiter = waiter
+	}
+	s.batchMu.Unlock()
+
+	<-waiter.done
+	return true, waiter.err
+}
+
+func (s *Session) markBatchBusy() {
+	s.batchMu.Lock()
+	if s.batchBuf == nil && s.batchAltBuf != nil {
+		s.batchBuf = s.batchAltBuf[:0]
+		s.batchAltBuf = nil
+	}
+	s.batchBusy = true
+	s.batchBusyFast.Store(true)
+	s.batchMu.Unlock()
+}
+
+func (s *Session) drainCoalescedBatches(prevErr error) {
+	for rounds := 0; ; rounds++ {
+		s.batchMu.Lock()
+		if len(s.batchBuf) == 0 {
+			s.batchBusy = false
+			s.batchBusyFast.Store(false)
+			s.batchMu.Unlock()
+			return
+		}
+		toFlush := s.batchBuf
+		waiter := s.batchWaiter
+		s.batchWaiter = nil
+
+		stopAfterThis := prevErr != nil ||
+			s.closed.Load() ||
+			s.highPriWaiters.Load() > 0 ||
+			rounds >= maxCoalesceDrainRounds-1
+		if stopAfterThis {
+			s.batchBusy = false
+			s.batchBusyFast.Store(false)
+			s.batchBuf = nil
+		} else {
+			if s.batchAltBuf != nil {
+				s.batchBuf = s.batchAltBuf[:0]
+				s.batchAltBuf = nil
+			} else {
+				s.batchBuf = nil
+			}
+		}
+		s.batchMu.Unlock()
+
+		var flushErr error
+		if prevErr != nil {
+			flushErr = prevErr
+		} else if s.closed.Load() {
+			flushErr = ErrSessionClosed
+		} else {
+			now := time.Now().UnixNano()
+			s.lastActive.Store(now)
+			s.writingSince.Store(now)
+			flushErr = s.writeRawCoalescedLocked(toFlush)
+			s.writingSince.Store(0)
+			if flushErr != nil {
+				prevErr = flushErr
+				if !s.closed.Load() {
+					go func() { _ = s.Close() }()
+				}
+			}
+		}
+
+		waiter.err = flushErr
+		close(waiter.done)
+
+		if cap(toFlush) <= maxCoalesceBatchBytes+FrameHeaderLen {
+			s.batchMu.Lock()
+			if s.batchAltBuf == nil {
+				s.batchAltBuf = toFlush[:0]
+			}
+			s.batchMu.Unlock()
+		}
+
+		if stopAfterThis {
+			return
+		}
+	}
+}
+
 // writeFrame writes a frame to the underlying TLS connection.
 // It is safe for concurrent use by multiple goroutines.
 // If a paddingWriteFn is set, frames are routed through it for padding.
@@ -331,21 +563,22 @@ func (s *Session) writeFrame(f *Frame) error {
 	if len(f.Data) > MaxFrameDataLen {
 		return ErrFrameTooLarge
 	}
-	s.lastActive.Store(time.Now().UnixNano())
-	s.writeMu.Lock()
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	s.lockWriteHighPri()
+	if s.closed.Load() {
+		s.unlockWriteHighPri()
+		return ErrSessionClosed
 	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn([]*Frame{f})
 	} else {
 		err = s.writer.WriteFrame(f)
 	}
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Time{})
-	}
-	s.writeMu.Unlock()
+	s.writingSince.Store(0)
+	s.unlockWriteHighPri()
 	if err != nil && !s.closed.Load() {
 		go func() { _ = s.Close() }()
 	}
@@ -373,21 +606,22 @@ func (s *Session) writeFrames(frames []*Frame) error {
 			return ErrFrameTooLarge
 		}
 	}
-	s.writeMu.Lock()
-	s.lastActive.Store(time.Now().UnixNano())
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	s.lockWriteBulk()
+	if s.closed.Load() {
+		s.unlockWriteBulk()
+		return ErrSessionClosed
 	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
 	var err error
 	if s.paddingWriteFn != nil {
 		err = s.paddingWriteFn(frames)
 	} else {
 		err = s.writer.WriteFrames(frames)
 	}
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Time{})
-	}
-	s.writeMu.Unlock()
+	s.writingSince.Store(0)
+	s.unlockWriteBulk()
 	if err != nil && !s.closed.Load() {
 		go func() { _ = s.Close() }()
 	}
@@ -405,24 +639,131 @@ func (s *Session) writePSHData(streamID uint32, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
-	s.writeMu.Lock()
-	s.lastActive.Store(time.Now().UnixNano())
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	if len(data) <= highPriPSHMaxBytes {
+		s.lockWriteHighPri()
+		if s.closed.Load() {
+			s.unlockWriteHighPri()
+			return ErrSessionClosed
+		}
+		now := time.Now().UnixNano()
+		s.lastActive.Store(now)
+		s.writingSince.Store(now)
+		var err error
+		if s.paddingPSHWriteFn != nil {
+			err = s.paddingPSHWriteFn(streamID, data)
+		} else {
+			err = s.writeRawPSHLocked(streamID, data)
+		}
+		s.writingSince.Store(0)
+		s.unlockWriteHighPri()
+		if err != nil && !s.closed.Load() {
+			go func() { _ = s.Close() }()
+		}
+		return err
 	}
+
+	if ok, err := s.tryEnqueueBulkPSH(streamID, nil, data); ok {
+		return err
+	}
+
+	s.lockWriteBulk()
+	if s.closed.Load() {
+		s.unlockWriteBulk()
+		return ErrSessionClosed
+	}
+	coalesce := s.canSessionCoalesce()
+	if coalesce {
+		s.markBatchBusy()
+	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
 	var err error
 	if s.paddingPSHWriteFn != nil {
 		err = s.paddingPSHWriteFn(streamID, data)
 	} else {
 		err = s.writeRawPSHLocked(streamID, data)
 	}
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Time{})
+	s.writingSince.Store(0)
+	if coalesce {
+		s.drainCoalescedBatches(err)
 	}
-	s.writeMu.Unlock()
+	s.unlockWriteBulk()
 	if err != nil && !s.closed.Load() {
 		go func() { _ = s.Close() }()
 	}
+	return err
+}
+
+func (s *Session) writePSHPreframed(streamID uint32, framed []byte, payloadLen int) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	if payloadLen <= highPriPSHMaxBytes {
+		s.lockWriteHighPri()
+		if s.closed.Load() {
+			s.unlockWriteHighPri()
+			return ErrSessionClosed
+		}
+		now := time.Now().UnixNano()
+		s.lastActive.Store(now)
+		s.writingSince.Store(now)
+		err := s.writePSHPreframedLocked(streamID, framed, payloadLen)
+		s.writingSince.Store(0)
+		s.unlockWriteHighPri()
+		if err != nil && !s.closed.Load() {
+			go func() { _ = s.Close() }()
+		}
+		return err
+	}
+
+	if ok, err := s.tryEnqueueBulkPSH(streamID, framed, nil); ok {
+		return err
+	}
+
+	s.lockWriteBulk()
+	if s.closed.Load() {
+		s.unlockWriteBulk()
+		return ErrSessionClosed
+	}
+	coalesce := s.canSessionCoalesce()
+	if coalesce {
+		s.markBatchBusy()
+	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
+	err := s.writePSHPreframedLocked(streamID, framed, payloadLen)
+	s.writingSince.Store(0)
+	if coalesce {
+		s.drainCoalescedBatches(err)
+	}
+	s.unlockWriteBulk()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
+	return err
+}
+
+func (s *Session) writePSHPreframedLocked(streamID uint32, framed []byte, payloadLen int) error {
+	if s.paddingPSHPreframedFn != nil {
+		handled, err := s.paddingPSHPreframedFn(streamID, framed, payloadLen)
+		if !handled && err == nil {
+			payload := framed[FrameHeaderLen:]
+			if s.paddingPSHWriteFn != nil {
+				return s.paddingPSHWriteFn(streamID, payload)
+			}
+			return s.writeRawPSHLocked(streamID, payload)
+		}
+		return err
+	}
+	if s.paddingPSHWriteFn != nil {
+		return s.paddingPSHWriteFn(streamID, framed[FrameHeaderLen:])
+	}
+	if s.paddingWriteFn != nil {
+		return s.paddingWriteFn([]*Frame{NewFrame(CmdPSH, streamID, framed[FrameHeaderLen:])})
+	}
+	_, err := s.writer.w.Write(framed)
 	return err
 }
 
@@ -430,11 +771,14 @@ func (s *Session) writeSYNWithTarget(streamID uint32, addrData []byte) error {
 	if s.closed.Load() {
 		return ErrSessionClosed
 	}
-	s.writeMu.Lock()
-	s.lastActive.Store(time.Now().UnixNano())
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Now().Add(sessionWriteDeadline))
+	s.lockWriteHighPri()
+	if s.closed.Load() {
+		s.unlockWriteHighPri()
+		return ErrSessionClosed
 	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
 	var err error
 	if s.paddingSYNTargetWriteFn != nil {
 		err = s.paddingSYNTargetWriteFn(streamID, addrData)
@@ -449,10 +793,8 @@ func (s *Session) writeSYNWithTarget(streamID uint32, addrData []byte) error {
 			err = s.writer.WriteFrames(frames)
 		}
 	}
-	if nc, ok := s.conn.(net.Conn); ok {
-		nc.SetWriteDeadline(time.Time{})
-	}
-	s.writeMu.Unlock()
+	s.writingSince.Store(0)
+	s.unlockWriteHighPri()
 	if err != nil && !s.closed.Load() {
 		go func() { _ = s.Close() }()
 	}
@@ -583,11 +925,32 @@ func (s *Session) SetPaddingPSHWriteFn(fn func(streamID uint32, data []byte) err
 	s.writeMu.Unlock()
 }
 
+// SetPaddingPSHPreframedWriteFn sets an optional zero-copy callback for single
+// CmdPSH frames that already have 7 bytes of header space reserved in-place.
+func (s *Session) SetPaddingPSHPreframedWriteFn(fn func(streamID uint32, framed []byte, payloadLen int) (bool, error)) {
+	s.writeMu.Lock()
+	s.paddingPSHPreframedFn = fn
+	s.writeMu.Unlock()
+}
+
 // SetPaddingSYNTargetWriteFn sets an optional callback to coalesce CmdSYN + target
 // address into a single padded record while preserving stream padding epochs.
 func (s *Session) SetPaddingSYNTargetWriteFn(fn func(streamID uint32, addrData []byte) error) {
 	s.writeMu.Lock()
 	s.paddingSYNTargetWriteFn = fn
+	s.writeMu.Unlock()
+}
+
+// SetPaddingCoalesceFns wires the steady-state padding epoch predicate and raw
+// write callback so multi-stream bulk CmdPSH frames past their handshake epoch
+// can coalesce into a single write under contention without altering padding.
+func (s *Session) SetPaddingCoalesceFns(canFn func(streamID uint32) bool, rawFn func(data []byte) error) {
+	s.writeMu.Lock()
+	if canFn != nil && rawFn != nil {
+		s.paddingCoalesce.Store(&paddingCoalesceFuncs{canCoalesce: canFn, writeRaw: rawFn})
+	} else {
+		s.paddingCoalesce.Store(nil)
+	}
 	s.writeMu.Unlock()
 }
 
@@ -603,7 +966,11 @@ func (s *Session) notifyStreamCountChange(count int) {
 func (s *Session) RunEventLoop() error {
 	defer s.Close()
 
-	reader := NewBufferedFrameReader(s.conn, 128*1024)
+	stopWatch := make(chan struct{})
+	go s.runWriteWatchdog(stopWatch)
+	defer close(stopWatch)
+
+	reader := NewBufferedFrameReader(s.conn, 32*1024)
 	for {
 		if s.closed.Load() {
 			return nil
@@ -623,6 +990,28 @@ func (s *Session) RunEventLoop() error {
 
 		if err := s.handleFramePooled(frame, poolBuf); err != nil {
 			return err
+		}
+	}
+}
+
+func (s *Session) runWriteWatchdog(stopCh <-chan struct{}) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-s.doneCh:
+			return
+		case <-ticker.C:
+			ws := s.writingSince.Load()
+			if ws != 0 && time.Now().UnixNano()-ws > int64(sessionWriteDeadline) {
+				if nc, ok := s.conn.(net.Conn); ok {
+					_ = nc.SetWriteDeadline(time.Unix(1, 0))
+				}
+				_ = s.Close()
+				return
+			}
 		}
 	}
 }
@@ -789,6 +1178,10 @@ func (s *Session) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
+		s.highPriMu.Lock()
+		s.highPriCond.Broadcast()
+		s.highPriMu.Unlock()
+		close(s.doneCh)
 
 		// Close all streams
 		s.streamMu.Lock()
@@ -800,6 +1193,11 @@ func (s *Session) Close() error {
 		s.streams = make(map[uint32]*Stream)
 		s.streamMu.Unlock()
 
+		if s.writingSince.Load() != 0 {
+			if nc, ok := s.conn.(net.Conn); ok {
+				_ = nc.SetWriteDeadline(time.Unix(1, 0))
+			}
+		}
 		// Close underlying connection
 		err = s.conn.Close()
 	})

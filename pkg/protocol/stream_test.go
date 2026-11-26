@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -323,5 +324,153 @@ func TestSessionOverflowIsolationWithoutFlowControl(t *testing.T) {
 	}
 	if !bytes.Equal(got, msg) {
 		t.Fatalf("stream 2 = %q, want %q", got, msg)
+	}
+}
+
+type slowCountingConn struct {
+	net.Conn
+	delay       time.Duration
+	writeCalls  atomic.Int64
+	writeBytes  atomic.Int64
+}
+
+func (c *slowCountingConn) Write(p []byte) (int, error) {
+	c.writeCalls.Add(1)
+	c.writeBytes.Add(int64(len(p)))
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
+	return c.Conn.Write(p)
+}
+
+func TestSessionCoalescedMultiStreamAndPriorityGate(t *testing.T) {
+	cRaw, sRaw := tcpPipeProtocol(t)
+	counted := &slowCountingConn{Conn: cRaw, delay: 400 * time.Microsecond}
+
+	clientSess := NewSession(counted, 1)
+	serverSess := NewSession(sRaw, 1)
+	clientSess.EnableFlowControl(DefaultStreamWindow, DefaultStreamWindow)
+	serverSess.EnableFlowControl(DefaultStreamWindow, DefaultStreamWindow)
+	clientSess.EnableFastOpen()
+	serverSess.EnableFastOpen()
+
+	const numStreams = 8
+	const chunksPerStream = 12
+	const chunkSize = 16 * 1024
+
+	serverDone := make(chan error, numStreams)
+	serverSess.SetOnStreamOpen(func(st *Stream) {
+		defer st.Close()
+		expectedByte := byte(st.ID() & 0xFF)
+		wantTotal := chunksPerStream * chunkSize
+		var buf [32 * 1024]byte
+		gotTotal := 0
+		for gotTotal < wantTotal {
+			n, err := st.Read(buf[:])
+			if n > 0 {
+				for i := 0; i < n; i++ {
+					if buf[i] != expectedByte {
+						serverDone <- errors.New("payload corruption across coalesced streams")
+						return
+					}
+				}
+				gotTotal += n
+			}
+			if err != nil {
+				if gotTotal == wantTotal {
+					break
+				}
+				serverDone <- err
+				return
+			}
+		}
+		serverDone <- nil
+	})
+
+	go func() { _ = clientSess.RunEventLoop() }()
+	go func() { _ = serverSess.RunEventLoop() }()
+	defer clientSess.Close()
+	defer serverSess.Close()
+
+	streams := make([]*Stream, numStreams)
+	for i := 0; i < numStreams; i++ {
+		st, err := clientSess.OpenStream()
+		if err != nil {
+			t.Fatalf("open stream %d: %v", i, err)
+		}
+		streams[i] = st
+	}
+
+	writesBefore := counted.writeCalls.Load()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	writeErrCh := make(chan error, numStreams+1)
+
+	for i, st := range streams {
+		wg.Add(1)
+		go func(idx int, s *Stream) {
+			defer wg.Done()
+			payload := bytes.Repeat([]byte{byte(s.ID() & 0xFF)}, chunkSize)
+			preframed := make([]byte, FrameHeaderLen+chunkSize)
+			copy(preframed[FrameHeaderLen:], payload)
+			<-start
+			for c := 0; c < chunksPerStream; c++ {
+				if (idx+c)%2 == 0 {
+					if err := s.WritePreframedSingle(preframed, chunkSize); err != nil {
+						writeErrCh <- err
+						return
+					}
+				} else {
+					if _, err := s.Write(payload); err != nil {
+						writeErrCh <- err
+						return
+					}
+				}
+			}
+			_ = s.Close()
+		}(i, st)
+	}
+
+	// Interleave high-priority heartbeats during bulk flood and verify prompt completion.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 4; i++ {
+			time.Sleep(1 * time.Millisecond)
+			t0 := time.Now()
+			if err := clientSess.SendHeartbeat(); err != nil {
+				writeErrCh <- err
+				return
+			}
+			if d := time.Since(t0); d > 150*time.Millisecond {
+				writeErrCh <- errors.New("high-priority heartbeat starved by bulk writers")
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	close(writeErrCh)
+	for err := range writeErrCh {
+		t.Fatalf("writer error: %v", err)
+	}
+
+	for i := 0; i < numStreams; i++ {
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatalf("server stream error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for server stream %d", i)
+		}
+	}
+
+	totalBulkWrites := int64(numStreams * chunksPerStream)
+	actualConnWrites := counted.writeCalls.Load() - writesBefore
+	if actualConnWrites >= totalBulkWrites {
+		t.Fatalf("expected multi-stream coalescing to reduce conn.Write calls below %d, got %d", totalBulkWrites, actualConnWrites)
 	}
 }

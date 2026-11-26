@@ -215,9 +215,7 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, src, *bufp)
-		protocol.RelayBufPool.Put(bufp)
+		_, _ = protocol.CopyToStream(stream, src)
 		stream.Close()
 	}()
 

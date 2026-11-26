@@ -121,13 +121,16 @@ func (c *Controller) GetSession() (*protocol.Session, error) {
 		return c.pool.GetOrCreateSession()
 	}
 
-	if c.shouldUpgradeForNextStream() {
+	switch c.checkExpansionForNextStream() {
+	case expandSync:
 		session, err := c.createExpansionSession()
 		if err == nil {
 			c.expandAsync()
 			return session, nil
 		}
 		log.Printf("tsunami surge: immediate expansion failed: %v", err)
+	case expandAsyncOnly:
+		c.expandAsync()
 	}
 
 	layer := c.currentLayer.Load()
@@ -137,7 +140,7 @@ func (c *Controller) GetSession() (*protocol.Session, error) {
 		return c.pool.GetOrCreateSession()
 	}
 
-	// Layer 2: distribute to least-loaded session
+	// Layer 2: distribute to least-loaded session without blocking
 	session, err := c.pool.GetLeastLoadedSession()
 	if err != nil {
 		// No sessions yet — create the first one
@@ -247,30 +250,47 @@ func (c *Controller) evaluate() {
 	}
 }
 
-func (c *Controller) shouldUpgradeForNextStream() bool {
+type expandDecision uint8
+
+const (
+	expandNone expandDecision = iota
+	expandAsyncOnly
+	expandSync
+)
+
+func (c *Controller) checkExpansionForNextStream() expandDecision {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	totalStreams := c.pool.ActiveStreamCount()
 	sessionCount := c.pool.SessionCount()
-	if sessionCount >= c.config.MaxConnections {
-		return false
+	if sessionCount >= c.config.MaxConnections || sessionCount == 0 {
+		return expandNone
 	}
-	if totalStreams < c.config.Threshold {
-		return false
+	// Pre-warm additional connections asynchronously as soon as the stream
+	// about to open reaches Threshold (zero blocking latency for caller).
+	if totalStreams+1 < c.config.Threshold {
+		return expandNone
 	}
 
 	now := time.Now()
 	if c.currentLayer.Load() == 1 {
 		if !c.lastDowngrade.IsZero() && now.Sub(c.lastDowngrade) < surgeCooldown {
-			return false
+			return expandNone
 		}
-		log.Printf("tsunami surge: upgrading to Layer 2 immediately (next stream would exceed threshold=%d)",
-			c.config.Threshold)
+		log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d threshold=%d)",
+			totalStreams, c.config.Threshold)
 		c.currentLayer.Store(2)
 		c.lastUpgrade = now
 	}
-	return true
+	// If only 1 session exists and active streams already reached Threshold,
+	// expand immediately so the caller gets an unloaded connection; once 2+
+	// sessions exist or while pre-warming at Threshold-1, expand asynchronously
+	// so caller streams never stall on TLS/H2 handshakes.
+	if sessionCount == 1 && totalStreams >= c.config.Threshold {
+		return expandSync
+	}
+	return expandAsyncOnly
 }
 
 func (c *Controller) createExpansionSession() (*protocol.Session, error) {

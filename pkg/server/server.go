@@ -162,7 +162,7 @@ func New(config Config) (*Server, error) {
 		config.MaxConnections = 4
 	}
 	if config.SurgeThreshold == 0 {
-		config.SurgeThreshold = 8
+		config.SurgeThreshold = 2
 	}
 	if config.SurgeMode == "" {
 		config.SurgeMode = "auto"
@@ -276,8 +276,8 @@ func (s *Server) startFronting() error {
 	if err := http2.ConfigureServer(httpSrv, &http2.Server{
 		MaxConcurrentStreams:         256,
 		MaxReadFrameSize:             256 << 10,
-		MaxUploadBufferPerConnection: 16 << 20,
-		MaxUploadBufferPerStream:     4 << 20,
+		MaxUploadBufferPerConnection: 32 << 20,
+		MaxUploadBufferPerStream:     16 << 20,
 	}); err != nil {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
@@ -572,6 +572,8 @@ func bindServerPadding(session *protocol.Session, pw *padding.Writer) {
 		return pw.WriteFramesWithPadding(frames)
 	})
 	session.SetPaddingPSHWriteFn(pw.WritePSH)
+	session.SetPaddingPSHPreframedWriteFn(pw.WritePSHPreframed)
+	session.SetPaddingCoalesceFns(pw.CanCoalescePSH, pw.WriteRaw)
 	session.SetOnStreamClosed(func(id uint32) {
 		pw.ForgetStream(id)
 	})
@@ -754,10 +756,8 @@ func (s *Server) handleStream(stream *protocol.Stream, user *protocol.UserInfo) 
 	// Target → Stream
 	go func() {
 		defer wg.Done()
-		bufp := protocol.RelayBufPool.Get().(*[]byte)
 		downloadReader := s.traffic.WrapReader(targetConn, user, control.DirectionDownload)
-		io.CopyBuffer(stream, downloadReader, *bufp)
-		protocol.RelayBufPool.Put(bufp)
+		_, _ = protocol.CopyToStream(stream, downloadReader)
 		_ = stream.Close()
 	}()
 

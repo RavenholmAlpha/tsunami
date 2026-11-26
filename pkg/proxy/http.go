@@ -185,9 +185,7 @@ func (h *HTTPProxyServer) handleConnect(conn net.Conn, br *bufio.Reader, req *ht
 
 	go func() {
 		defer wg.Done()
-		bufp := protocol.RelayBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, src, *bufp)
-		protocol.RelayBufPool.Put(bufp)
+		_, _ = protocol.CopyToStream(stream, src)
 		stream.Close()
 	}()
 
@@ -277,9 +275,7 @@ func (h *HTTPProxyServer) handleHTTP(conn net.Conn, req *http.Request) bool {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			bufp := protocol.RelayBufPool.Get().(*[]byte)
-			_, _ = io.CopyBuffer(stream, conn, *bufp)
-			protocol.RelayBufPool.Put(bufp)
+			_, _ = protocol.CopyToStream(stream, conn)
 			_ = stream.Close()
 		}()
 		go func() {

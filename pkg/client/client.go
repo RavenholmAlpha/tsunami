@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"github.com/tsunami-protocol/tsunami/pkg/fronting"
 	"github.com/tsunami-protocol/tsunami/pkg/mux"
 	"github.com/tsunami-protocol/tsunami/pkg/padding"
@@ -90,6 +91,13 @@ func New(config Config) (*Client, error) {
 	}
 	if config.Password == "" {
 		return nil, fmt.Errorf("tsunami: password is required")
+	}
+
+	if config.TLS.SessionCache == nil {
+		config.TLS.SessionCache = tls.NewLRUClientSessionCache(64)
+	}
+	if config.TLS.UTLSSessionCache == nil {
+		config.TLS.UTLSSessionCache = utls.NewLRUClientSessionCache(64)
 	}
 
 	c := &Client{
@@ -236,6 +244,40 @@ func (c *Client) dialFrontedSession() (*protocol.Session, error) {
 	return c.startSession(conn)
 }
 
+func (c *Client) newFrontingH2ClientConn(tlsConn net.Conn) (*http2.ClientConn, func(), error) {
+	t1 := &http.Transport{
+		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
+		DisableCompression: true,
+		HTTP2: &http.HTTP2Config{
+			MaxReceiveBufferPerStream:     16 << 20, // 16 MiB downlink stream window (4x Go default)
+			MaxReceiveBufferPerConnection: 32 << 20, // 32 MiB conn window (browser-scale vs Go 1 GiB)
+			MaxReadFrameSize:              256 << 10,
+			SendPingTimeout:               time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
+			PingTimeout:                   15 * time.Second,
+		},
+	}
+	h2Transport, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		return nil, nil, err
+	}
+	cc, err := h2Transport.NewClientConn(tlsConn)
+	if err != nil {
+		h2Transport.CloseIdleConnections()
+		t1.CloseIdleConnections()
+		return nil, nil, err
+	}
+	var closeOnce sync.Once
+	closeFn := func() {
+		closeOnce.Do(func() {
+			_ = cc.Close()
+			_ = tlsConn.Close()
+			h2Transport.CloseIdleConnections()
+			t1.CloseIdleConnections()
+		})
+	}
+	return cc, closeFn, nil
+}
+
 func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 	endpointURL, err := url.Parse(cfg.URL(c.config.ServerAddr))
 	if err != nil {
@@ -249,27 +291,10 @@ func (c *Client) dialFrontedH2Split(cfg fronting.Config) (net.Conn, error) {
 		return nil, err
 	}
 
-	h2Transport := &http2.Transport{
-		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
-		DisableCompression: true,
-		MaxReadFrameSize:   256 << 10,
-		ReadIdleTimeout:    time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
-		PingTimeout:        15 * time.Second,
-	}
-	cc, err := h2Transport.NewClientConn(tlsConn)
+	cc, closeFn, err := c.newFrontingH2ClientConn(tlsConn)
 	if err != nil {
 		_ = tlsConn.Close()
-		h2Transport.CloseIdleConnections()
 		return nil, fmt.Errorf("fronting: split h2 client conn: %w", err)
-	}
-
-	var closeOnce sync.Once
-	closeFn := func() {
-		closeOnce.Do(func() {
-			_ = cc.Close()
-			_ = tlsConn.Close()
-			h2Transport.CloseIdleConnections()
-		})
 	}
 
 	host := frontingHost(cfg, c.config)
@@ -297,30 +322,13 @@ func (c *Client) dialFrontedH2Stream(cfg fronting.Config) (net.Conn, error) {
 		return nil, err
 	}
 
-	h2Transport := &http2.Transport{
-		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
-		DisableCompression: true,
-		MaxReadFrameSize:   256 << 10,
-		ReadIdleTimeout:    time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
-		PingTimeout:        15 * time.Second,
-	}
-	cc, err := h2Transport.NewClientConn(tlsConn)
+	cc, closeFn, err := c.newFrontingH2ClientConn(tlsConn)
 	if err != nil {
 		_ = tlsConn.Close()
-		h2Transport.CloseIdleConnections()
 		return nil, fmt.Errorf("fronting: h2 stream client conn: %w", err)
 	}
 
-	var closeOnce sync.Once
-	closeFn := func() {
-		closeOnce.Do(func() {
-			_ = cc.Close()
-			_ = tlsConn.Close()
-			h2Transport.CloseIdleConnections()
-		})
-	}
-
-	pr, pw := io.Pipe()
+	pr, pw := fronting.NewBufferedPipe(1 << 20)
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, pr)
@@ -561,7 +569,9 @@ func bindClientPadding(session *protocol.Session, pw *padding.Writer) {
 		return pw.WriteFramesWithPadding(frames)
 	})
 	session.SetPaddingPSHWriteFn(pw.WritePSH)
+	session.SetPaddingPSHPreframedWriteFn(pw.WritePSHPreframed)
 	session.SetPaddingSYNTargetWriteFn(pw.WriteSYNWithTarget)
+	session.SetPaddingCoalesceFns(pw.CanCoalescePSH, pw.WriteRaw)
 	session.SetOnStreamClosed(func(id uint32) {
 		pw.ForgetStream(id)
 	})

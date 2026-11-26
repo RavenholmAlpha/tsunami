@@ -59,7 +59,7 @@ func TestDialTargetBlocksPrivateLiteral(t *testing.T) {
 }
 
 func TestDialHappyEyeballsFastFallback(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,10 +74,10 @@ func TestDialHappyEyeballsFastFallback(t *testing.T) {
 		}
 	}()
 
-	// RFC5737 TEST-NET-1 (192.0.2.1) either fails fast or drops packets; stagger
-	// 50ms ensures working 127.0.0.1 wins well under 1s instead of waiting 10s.
+	// ::1 has no listener on this tcp4-only port (never hijacked by host TUN routes),
+	// exercising both IPv6/IPv4 interleaving and fast fallback to 127.0.0.1.
 	addrs := interleaveAddresses([]netip.Addr{
-		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("::1"),
 		netip.MustParseAddr("127.0.0.1"),
 	})
 	start := time.Now()
@@ -95,5 +95,17 @@ func TestDialHappyEyeballsFastFallback(t *testing.T) {
 	}
 	if elapsed > 1*time.Second {
 		t.Fatalf("Happy Eyeballs fallback took too long: %v", elapsed)
+	}
+}
+
+func TestTargetDNSCacheLookupAndExpiry(t *testing.T) {
+	addrs, err := resolveTargetIPs(context.Background(), "localhost")
+	if err != nil || len(addrs) == 0 {
+		t.Fatalf("resolveTargetIPs(localhost) = (%v, %v)", addrs, err)
+	}
+	// Second lookup must hit cache cleanly.
+	addrs2, err := resolveTargetIPs(context.Background(), "LOCALHOST.")
+	if err != nil || len(addrs2) != len(addrs) {
+		t.Fatalf("cached resolveTargetIPs(LOCALHOST.) = (%v, %v), want %v", addrs2, err, addrs)
 	}
 }

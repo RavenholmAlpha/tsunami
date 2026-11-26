@@ -8,8 +8,104 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+const (
+	targetDNSCacheTTL        = 30 * time.Second
+	maxTargetDNSCacheEntries = 2048
+)
+
+type cachedDNSResult struct {
+	addrs      []netip.Addr
+	expireAtNs int64
+}
+
+type dnsInflightCall struct {
+	done  chan struct{}
+	addrs []netip.Addr
+	err   error
+}
+
+type targetDNSCache struct {
+	mu       sync.Mutex
+	entries  map[string]cachedDNSResult
+	inflight map[string]*dnsInflightCall
+}
+
+var globalTargetDNSCache = &targetDNSCache{
+	entries:  make(map[string]cachedDNSResult),
+	inflight: make(map[string]*dnsInflightCall),
+}
+
+func (c *targetDNSCache) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	nowNs := time.Now().UnixNano()
+	c.mu.Lock()
+	if cached, ok := c.entries[host]; ok {
+		if nowNs < cached.expireAtNs {
+			c.mu.Unlock()
+			return cached.addrs, nil
+		}
+		delete(c.entries, host)
+	}
+	if call, ok := c.inflight[host]; ok {
+		c.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.addrs, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &dnsInflightCall{done: make(chan struct{})}
+	c.inflight[host] = call
+	c.mu.Unlock()
+
+	lookupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip", host)
+	cancel()
+
+	if err != nil {
+		call.err = fmt.Errorf("resolve %q: %w", host, err)
+	} else if len(addrs) == 0 {
+		call.err = fmt.Errorf("resolve %q: no addresses", host)
+	} else {
+		res := make([]netip.Addr, 0, len(addrs))
+		for _, a := range addrs {
+			res = append(res, a.Unmap())
+		}
+		call.addrs = res
+	}
+
+	c.mu.Lock()
+	delete(c.inflight, host)
+	if call.err == nil && len(call.addrs) > 0 {
+		expireNs := time.Now().Add(targetDNSCacheTTL).UnixNano()
+		if len(c.entries) >= maxTargetDNSCacheEntries {
+			curNs := time.Now().UnixNano()
+			for k, v := range c.entries {
+				if curNs >= v.expireAtNs {
+					delete(c.entries, k)
+				}
+			}
+			if len(c.entries) >= maxTargetDNSCacheEntries {
+				for k := range c.entries {
+					delete(c.entries, k)
+					break
+				}
+			}
+		}
+		c.entries[host] = cachedDNSResult{addrs: call.addrs, expireAtNs: expireNs}
+	}
+	close(call.done)
+	c.mu.Unlock()
+
+	if ctxErr := ctx.Err(); ctxErr != nil && call.err != nil {
+		return nil, ctxErr
+	}
+	return call.addrs, call.err
+}
 
 // errBlockedTarget is returned when a destination is rejected by the
 // private/reserved address policy.
@@ -126,28 +222,17 @@ func splitTarget(target string) (host, port string, err error) {
 	return host, port, nil
 }
 
-// resolveTargetIPs resolves host once. IP literals do not hit the resolver.
+// resolveTargetIPs resolves host using a bounded short-TTL cache with concurrent
+// singleflight deduplication. IP literals do not hit the resolver or cache.
 func resolveTargetIPs(ctx context.Context, host string) ([]netip.Addr, error) {
-	if addr, err := netip.ParseAddr(host); err == nil {
+	key := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if addr, err := netip.ParseAddr(key); err == nil {
 		if addr.Zone() != "" {
 			return nil, errBlockedTarget
 		}
 		return []netip.Addr{addr.Unmap()}, nil
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip", host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %q: %w", host, err)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("resolve %q: no addresses", host)
-	}
-	result := make([]netip.Addr, 0, len(addrs))
-	for _, addr := range addrs {
-		result = append(result, addr.Unmap())
-	}
-	return result, nil
+	return globalTargetDNSCache.lookup(ctx, key)
 }
 
 const (
@@ -163,6 +248,15 @@ const (
 // an internal address inside net.Dial.
 func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error) {
 	if s.config.AllowAll {
+		if host, port, err := splitTarget(target); err == nil {
+			if addresses, rErr := resolveTargetIPs(ctx, host); rErr == nil {
+				if len(addresses) == 1 {
+					dialer := &net.Dialer{Timeout: targetDialTimeout, KeepAlive: 30 * time.Second}
+					return dialer.DialContext(ctx, "tcp", net.JoinHostPort(addresses[0].String(), port))
+				}
+				return dialHappyEyeballs(ctx, interleaveAddresses(addresses), port, happyEyeballsDelay, targetDialTimeout)
+			}
+		}
 		dialer := &net.Dialer{
 			Timeout:       targetDialTimeout,
 			KeepAlive:     30 * time.Second,
