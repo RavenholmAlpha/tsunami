@@ -133,3 +133,31 @@ func TestApplyServerSettings(t *testing.T) {
 	}
 	c.mu.Unlock()
 }
+
+func TestExpandPoolDialsInParallel(t *testing.T) {
+	var seq atomic.Uint64
+	pool := mux.NewPool(mux.DefaultPoolConfig(), func() (*protocol.Session, error) {
+		time.Sleep(60 * time.Millisecond)
+		return newTestSession(seq.Add(1)), nil
+	})
+	defer pool.Close()
+
+	c := NewController(Config{
+		Mode:           ModeAuto,
+		Threshold:      2,
+		MaxConnections: 4,
+	}, pool)
+	defer c.Stop()
+
+	start := time.Now()
+	c.expandPool(4)
+	elapsed := time.Since(start)
+
+	if got := pool.SessionCount(); got != 4 {
+		t.Fatalf("SessionCount = %d, want 4", got)
+	}
+	// Serialized dialing of 4 x 60ms would take >= 240ms; parallel dialing finishes in ~60-120ms.
+	if elapsed >= 180*time.Millisecond {
+		t.Fatalf("expandPool(4) took %v, expected parallel dials (< 180ms)", elapsed)
+	}
+}

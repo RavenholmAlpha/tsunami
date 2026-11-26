@@ -125,6 +125,8 @@ type Pool struct {
 	mu         sync.Mutex
 	createMu   sync.Mutex
 	seqCounter atomic.Uint64
+	rrCursor   atomic.Uint64
+	dialing    atomic.Int32
 	stopCh     chan struct{}
 	stopped    atomic.Bool
 
@@ -205,16 +207,24 @@ func (p *Pool) GetOrCreateSession() (*protocol.Session, error) {
 	return p.createSession()
 }
 
-// GetLeastLoadedSession returns the session with the fewest active streams.
+// GetLeastLoadedSession returns the session with the fewest active streams,
+// breaking ties in round-robin order so short concurrent streams spread evenly.
 // Used by Surge bonded mode for stream distribution.
 func (p *Pool) GetLeastLoadedSession() (*protocol.Session, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	n := len(p.sessions)
+	if n == 0 {
+		return nil, fmt.Errorf("tsunami: no available sessions in pool")
+	}
+
 	var best *protocol.Session
 	bestCount := int(^uint(0) >> 1) // max int
+	start := int(p.rrCursor.Add(1) % uint64(n))
 
-	for _, s := range p.sessions {
+	for i := 0; i < n; i++ {
+		s := p.sessions[(start+i)%n]
 		if s.IsClosed() {
 			continue
 		}
@@ -232,13 +242,23 @@ func (p *Pool) GetLeastLoadedSession() (*protocol.Session, error) {
 	return nil, fmt.Errorf("tsunami: no available sessions in pool")
 }
 
+// DialingCount returns the number of session dials currently in flight.
+func (p *Pool) DialingCount() int {
+	if c := int(p.dialing.Load()); c > 0 {
+		return c
+	}
+	return 0
+}
+
 // createSession dials a new TLS connection and adds it to the pool.
 func (p *Pool) createSession() (*protocol.Session, error) {
 	if p.stopped.Load() {
 		return nil, fmt.Errorf("tsunami: session pool is closed")
 	}
 
+	p.dialing.Add(1)
 	session, err := p.dialFn()
+	p.dialing.Add(-1)
 	if err != nil {
 		return nil, fmt.Errorf("tsunami: dial new session: %w", err)
 	}
@@ -262,11 +282,9 @@ func (p *Pool) createSession() (*protocol.Session, error) {
 }
 
 // CreateNewSession forces creation of a new TLS connection and adds it to the pool.
-// Unlike GetOrCreateSession which reuses existing sessions, this always dials.
-// Used by Surge controller for intentional pool expansion.
+// Unlike GetOrCreateSession which reuses existing sessions, this always dials
+// concurrently without serializing parallel Surge pool expansions.
 func (p *Pool) CreateNewSession() (*protocol.Session, error) {
-	p.createMu.Lock()
-	defer p.createMu.Unlock()
 	return p.createSession()
 }
 
@@ -582,16 +600,43 @@ func (p *Pool) runHeartbeat(now time.Time) {
 	p.mu.Unlock()
 
 	// Session writes/closes can block on the connection: never hold the pool
-	// mutex while doing them.
-	for _, s := range sends {
+	// mutex while doing them, and run multiple sessions concurrently so one
+	// stalled connection cannot delay heartbeats on healthy siblings.
+	if len(sends) == 1 {
+		s := sends[0]
 		if err := s.SendHeartbeat(); err != nil && !errors.Is(err, protocol.ErrSessionClosed) {
 			log.Printf("tsunami: heartbeat send failed session=%d: %v", s.Seq(), err)
 			p.RemoveSession(s)
 		}
+	} else if len(sends) > 1 {
+		var wg sync.WaitGroup
+		wg.Add(len(sends))
+		for _, s := range sends {
+			go func(sess *protocol.Session) {
+				defer wg.Done()
+				if err := sess.SendHeartbeat(); err != nil && !errors.Is(err, protocol.ErrSessionClosed) {
+					log.Printf("tsunami: heartbeat send failed session=%d: %v", sess.Seq(), err)
+					p.RemoveSession(sess)
+				}
+			}(s)
+		}
+		wg.Wait()
 	}
-	for _, s := range closes {
+	if len(closes) == 1 {
+		s := closes[0]
 		log.Printf("tsunami: closing unresponsive session %d (no heartbeat response within %v)", s.Seq(), p.config.HeartbeatTimeout)
 		_ = s.Close()
+	} else if len(closes) > 1 {
+		var wg sync.WaitGroup
+		wg.Add(len(closes))
+		for _, s := range closes {
+			go func(sess *protocol.Session) {
+				defer wg.Done()
+				log.Printf("tsunami: closing unresponsive session %d (no heartbeat response within %v)", sess.Seq(), p.config.HeartbeatTimeout)
+				_ = sess.Close()
+			}(s)
+		}
+		wg.Wait()
 	}
 }
 

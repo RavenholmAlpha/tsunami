@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -198,16 +197,11 @@ func NewAuthenticator(users []*UserInfo) *Authenticator {
 	return a
 }
 
-// Authenticate checks the provided hash against known users.
+// Authenticate checks the provided hash against known users in O(1) time.
 // Returns the matched UserInfo or nil if authentication fails.
 func (a *Authenticator) Authenticate(hash [AuthHashLen]byte) *UserInfo {
-	var matched *UserInfo
-	for knownHash, user := range a.users {
-		if subtle.ConstantTimeCompare(hash[:], knownHash[:]) == 1 {
-			matched = user
-		}
-	}
-	if matched == nil {
+	matched, ok := a.users[hash]
+	if !ok || matched == nil {
 		return nil
 	}
 	if ok, _ := matched.IsUsable(time.Now()); !ok {

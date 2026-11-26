@@ -20,10 +20,42 @@ const maxTrackedStreams = 1024
 // streamState is the padding epoch of a single data stream.
 type streamState struct {
 	idx        int       // number of data writes seen for this stream
-	bytes      int       // bytes written for this stream (payload + padding)
+	bytes      int64     // bytes written for this stream (payload + padding)
 	insertedAt time.Time // used to prune the oldest entries
 	seq        uint64    // tie-breaker when timestamps are equal
 	ready      bool      // true once permanently past handshake padding under current scheme
+}
+
+// paddingEncodeBufPool pools temporary frame-serialization and padding assembly
+// buffers across sessions so idle sessions pin zero large scratch memory while
+// active sessions stay allocation-free.
+var paddingEncodeBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 16*1024)
+		return &buf
+	},
+}
+
+func getPaddingBuf(minCap int) (*[]byte, []byte) {
+	if minCap > maxReusableRawBuf {
+		return nil, make([]byte, 0, minCap)
+	}
+	bufp := paddingEncodeBufPool.Get().(*[]byte)
+	buf := *bufp
+	if cap(buf) < minCap {
+		buf = make([]byte, 0, minCap)
+	}
+	return bufp, buf[:0]
+}
+
+func putPaddingBuf(bufp *[]byte, buf []byte) {
+	if bufp == nil {
+		return
+	}
+	if cap(buf) <= maxReusableRawBuf {
+		*bufp = buf[:0]
+		paddingEncodeBufPool.Put(bufp)
+	}
 }
 
 // Writer wraps a TLS connection writer and applies the PaddingScheme to
@@ -38,14 +70,11 @@ type Writer struct {
 	role   Role
 	fw     *protocol.FrameWriter
 
-	mu           sync.Mutex
-	ctlIdx       int   // control-bucket write counter (PacketIndex)
-	ctlBytes     int64 // bytes written for control writes (observability)
-	streams      map[uint32]*streamState
-	nextSeq      uint64
-	rawBuf       []byte // reusable encoding buffer for unpadded frame writes
-	serializeBuf []byte // reusable serialization buffer for padded writes
-	padBuf       []byte // reusable pad-to assembly buffer
+	mu       sync.Mutex
+	ctlIdx   int   // control-bucket write counter (PacketIndex)
+	ctlBytes int64 // bytes written for control writes (observability)
+	streams  map[uint32]*streamState
+	nextSeq  uint64
 
 	// Lock-free / leaf-locked steady-state cache so Session can check whether
 	// a stream is past its handshake padding epoch without blocking on pw.mu
@@ -155,7 +184,7 @@ func (pw *Writer) markReadyIfPastEpochLocked(streamID uint32, state *streamState
 	if state == nil || state.ready || pw.scheme == nil {
 		return
 	}
-	if state.idx >= pw.scheme.Stop || (pw.scheme.StreamBytes > 0 && state.bytes >= pw.scheme.StreamBytes) {
+	if state.idx >= pw.scheme.Stop || (pw.scheme.StreamBytes > 0 && state.bytes >= int64(pw.scheme.StreamBytes)) {
 		state.ready = true
 		pw.readyMu.Lock()
 		pw.readySet[streamID] = struct{}{}
@@ -246,31 +275,42 @@ func (pw *Writer) WritePSH(streamID uint32, data []byte) error {
 	state.idx++
 
 	var segments []Segment
-	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+	if pw.scheme.StreamBytes <= 0 || state.bytes < int64(pw.scheme.StreamBytes) {
 		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
 	}
 	if segments == nil {
 		if err := pw.writePSHRawLocked(streamID, data); err != nil {
 			return err
 		}
-		state.bytes += pshWireLen(len(data))
+		state.bytes += int64(pshWireLen(len(data)))
 		pw.markReadyIfPastEpochLocked(streamID, state)
 		return nil
 	}
 
-	written, err := pw.applySegments(pw.serializePSHLocked(streamID, data), segments)
-	state.bytes += written
+	bufp, serialized := serializePSHPooled(streamID, data)
+	written, err := pw.applySegments(serialized, segments, true)
+	putPaddingBuf(bufp, serialized)
+	state.bytes += int64(written)
 	pw.markReadyIfPastEpochLocked(streamID, state)
 	return err
 }
 
 // WritePSHPreframed writes an already header-prefixed single CmdPSH frame in-place
 // with zero payload copy once the stream's handshake padding epoch has completed.
-// If the stream still requires handshake padding, it returns handled=false without
-// mutating epoch state so the caller can fall back to WritePSH.
+// If the stream is still within its handshake padding epoch, it applies the epoch
+// rules directly under the same lock without mutating caller bytes past len(framed).
 func (pw *Writer) WritePSHPreframed(streamID uint32, framed []byte, payloadLen int) (bool, error) {
 	if streamID == 0 || payloadLen <= 0 || payloadLen > protocol.MaxFrameDataLen || len(framed) != protocol.FrameHeaderLen+payloadLen {
 		return false, nil
+	}
+
+	// Ultra-fast steady-state path: stream is already permanently past its
+	// handshake padding epoch under the current scheme.
+	if pw.CanCoalescePSH(streamID) {
+		pw.mu.Lock()
+		_, err := pw.w.Write(framed)
+		pw.mu.Unlock()
+		return true, err
 	}
 
 	pw.mu.Lock()
@@ -290,18 +330,25 @@ func (pw *Writer) WritePSHPreframed(streamID uint32, framed []byte, payloadLen i
 		pw.pruneStreamsLocked()
 	}
 
-	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
-		if segments := pw.scheme.GetSegmentsFor(pw.role, state.idx); segments != nil {
-			return false, nil
+	idx := state.idx
+	state.idx++
+
+	var segments []Segment
+	if pw.scheme.StreamBytes <= 0 || state.bytes < int64(pw.scheme.StreamBytes) {
+		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
+	}
+	if segments == nil {
+		_, err := pw.w.Write(framed)
+		if err == nil {
+			state.bytes += int64(len(framed))
+			pw.markReadyIfPastEpochLocked(streamID, state)
 		}
+		return true, err
 	}
 
-	state.idx++
-	_, err := pw.w.Write(framed)
-	if err == nil {
-		state.bytes += len(framed)
-		pw.markReadyIfPastEpochLocked(streamID, state)
-	}
+	written, err := pw.applySegments(framed, segments, false)
+	state.bytes += int64(written)
+	pw.markReadyIfPastEpochLocked(streamID, state)
 	return true, err
 }
 
@@ -318,10 +365,12 @@ func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
 	pw.drainPendingForgetsLocked()
 
 	total := protocol.FrameHeaderLen*2 + len(addrData)
-	if cap(pw.serializeBuf) < total {
-		pw.serializeBuf = make([]byte, 0, total)
+	minCap := total
+	if minCap < MaxPadTarget {
+		minCap = MaxPadTarget
 	}
-	buf := pw.serializeBuf[:total]
+	bufp, raw := getPaddingBuf(minCap)
+	buf := raw[:total]
 	buf[0] = byte(protocol.CmdSYN)
 	binary.BigEndian.PutUint32(buf[1:5], streamID)
 	buf[5] = 0
@@ -332,6 +381,7 @@ func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
 	binary.BigEndian.PutUint32(buf[off+1:off+5], streamID)
 	binary.BigEndian.PutUint16(buf[off+5:off+7], uint16(len(addrData)))
 	copy(buf[off+protocol.FrameHeaderLen:], addrData)
+	defer putPaddingBuf(bufp, buf)
 
 	if pw.scheme == nil {
 		_, err := pw.w.Write(buf)
@@ -349,20 +399,20 @@ func (pw *Writer) WriteSYNWithTarget(streamID uint32, addrData []byte) error {
 	state.idx++
 
 	var segments []Segment
-	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+	if pw.scheme.StreamBytes <= 0 || state.bytes < int64(pw.scheme.StreamBytes) {
 		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
 	}
 	if segments == nil {
 		_, err := pw.w.Write(buf)
 		if err == nil {
-			state.bytes += len(buf)
+			state.bytes += int64(len(buf))
 			pw.markReadyIfPastEpochLocked(streamID, state)
 		}
 		return err
 	}
 
-	written, err := pw.applySegments(buf, segments)
-	state.bytes += written
+	written, err := pw.applySegments(buf, segments, true)
+	state.bytes += int64(written)
 	pw.markReadyIfPastEpochLocked(streamID, state)
 	return err
 }
@@ -381,21 +431,22 @@ func (pw *Writer) writeStreamLocked(frames []*protocol.Frame, id uint32) error {
 	state.idx++
 
 	var segments []Segment
-	if pw.scheme.StreamBytes <= 0 || state.bytes < pw.scheme.StreamBytes {
+	if pw.scheme.StreamBytes <= 0 || state.bytes < int64(pw.scheme.StreamBytes) {
 		segments = pw.scheme.GetSegmentsFor(pw.role, idx)
 	}
 	if segments == nil {
-		// Unpadded fast path: encode into the Writer's reusable buffer.
 		if err := pw.writeFramesRawLocked(frames); err != nil {
 			return err
 		}
-		state.bytes += wireLen(frames)
+		state.bytes += int64(wireLen(frames))
 		pw.markReadyIfPastEpochLocked(id, state)
 		return nil
 	}
 
-	written, err := pw.applySegments(pw.serializeFramesLocked(frames), segments)
-	state.bytes += written
+	bufp, serialized := serializeFramesPooled(frames)
+	written, err := pw.applySegments(serialized, segments, true)
+	putPaddingBuf(bufp, serialized)
+	state.bytes += int64(written)
 	pw.markReadyIfPastEpochLocked(id, state)
 	return err
 }
@@ -417,14 +468,17 @@ func (pw *Writer) writeControlLocked(frames []*protocol.Frame) error {
 		return nil
 	}
 
-	written, err := pw.applySegments(pw.serializeFramesLocked(frames), segments)
+	bufp, serialized := serializeFramesPooled(frames)
+	written, err := pw.applySegments(serialized, segments, true)
+	putPaddingBuf(bufp, serialized)
 	pw.ctlBytes += int64(written)
 	return err
 }
 
 // applySegments applies a padding rule to the serialized write and returns the
-// number of bytes written to the underlying writer.
-func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error) {
+// number of bytes written to the underlying writer. When inPlace is true,
+// userData is owned by this writer and writePadTo may append waste in-place.
+func (pw *Writer) applySegments(userData []byte, segments []Segment, inPlace bool) (int, error) {
 	written := 0
 	offset := 0
 	remaining := len(userData)
@@ -432,7 +486,7 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 	for _, seg := range segments {
 		if seg.IsPadTo {
 			// Pad-to consumes the rest of the payload and ends the rule.
-			n, err := pw.writePadTo(userData[offset:], seg)
+			n, err := pw.writePadTo(userData[offset:], seg, inPlace && offset == 0)
 			written += n
 			return written, err
 		}
@@ -464,7 +518,8 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 			// Subtract FrameHeaderLen because the waste frame wire format adds its own header
 			wasteSize := clampWasteSize(targetLen - remaining - protocol.FrameHeaderLen)
 			totalLen := remaining + protocol.FrameHeaderLen + wasteSize
-			out := pw.allocPadBufLocked(totalLen)
+			bufp, raw := getPaddingBuf(totalLen)
+			out := raw[:totalLen]
 			copy(out, userData[offset:offset+remaining])
 			waste := out[remaining:]
 			waste[0] = byte(protocol.CmdWaste)
@@ -476,6 +531,7 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 			clear(waste[protocol.FrameHeaderLen:])
 
 			n, err := pw.w.Write(out)
+			putPaddingBuf(bufp, out)
 			written += n
 			if err != nil {
 				return written, err
@@ -486,7 +542,8 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 			// No user data left — send pure waste padding
 			wasteSize := clampWasteSize(targetLen - protocol.FrameHeaderLen)
 			totalLen := protocol.FrameHeaderLen + wasteSize
-			out := pw.allocPadBufLocked(totalLen)
+			bufp, raw := getPaddingBuf(totalLen)
+			out := raw[:totalLen]
 			out[0] = byte(protocol.CmdWaste)
 			out[1] = 0
 			out[2] = 0
@@ -496,6 +553,7 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 			clear(out[protocol.FrameHeaderLen:])
 
 			n, err := pw.w.Write(out)
+			putPaddingBuf(bufp, out)
 			if err != nil {
 				return written, err
 			}
@@ -524,7 +582,7 @@ func (pw *Writer) applySegments(userData []byte, segments []Segment) (int, error
 // If the payload is already at least as large as the requested target, it is
 // written unchanged (one record, no waste frame, never split). The same applies
 // when the payload leaves no room for a waste header below MaxPadTarget.
-func (pw *Writer) writePadTo(payload []byte, seg Segment) (int, error) {
+func (pw *Writer) writePadTo(payload []byte, seg Segment, inPlace bool) (int, error) {
 	target := RandomInRange(seg.MinSize, seg.MaxSize)
 	if len(payload) >= target {
 		// Already at least as large as the wanted record: nothing to add.
@@ -547,7 +605,23 @@ func (pw *Writer) writePadTo(payload []byte, seg Segment) (int, error) {
 	}
 	wasteSize := target - minTarget
 
-	out := pw.allocPadBufLocked(target)
+	// Fast path: append CmdWaste in-place inside our pooled serialization buffer
+	// to avoid a second full payload copy on every ctl / c0..c5 / s0..s5 write.
+	if inPlace && cap(payload) >= target {
+		out := payload[:target]
+		waste := out[len(payload):]
+		waste[0] = byte(protocol.CmdWaste)
+		waste[1] = 0
+		waste[2] = 0
+		waste[3] = 0
+		waste[4] = 0
+		binary.BigEndian.PutUint16(waste[5:7], uint16(wasteSize))
+		clear(waste[protocol.FrameHeaderLen:])
+		return pw.w.Write(out)
+	}
+
+	bufp, raw := getPaddingBuf(target)
+	out := raw[:target]
 	copy(out, payload)
 	waste := out[len(payload):]
 	waste[0] = byte(protocol.CmdWaste)
@@ -555,22 +629,12 @@ func (pw *Writer) writePadTo(payload []byte, seg Segment) (int, error) {
 	waste[2] = 0
 	waste[3] = 0
 	waste[4] = 0
-	// the length is the waste payload size.
 	binary.BigEndian.PutUint16(waste[5:7], uint16(wasteSize))
 	clear(waste[protocol.FrameHeaderLen:])
 
 	n, err := pw.w.Write(out)
+	putPaddingBuf(bufp, out)
 	return n, err
-}
-
-func (pw *Writer) allocPadBufLocked(total int) []byte {
-	if total <= maxReusableRawBuf {
-		if cap(pw.padBuf) < total {
-			pw.padBuf = make([]byte, total)
-		}
-		return pw.padBuf[:total]
-	}
-	return make([]byte, total)
 }
 
 func pshWireLen(dataLen int) int {
@@ -581,17 +645,13 @@ func pshWireLen(dataLen int) int {
 	return chunks*protocol.FrameHeaderLen + dataLen
 }
 
-func (pw *Writer) serializeFramesLocked(frames []*protocol.Frame) []byte {
+func serializeFramesPooled(frames []*protocol.Frame) (*[]byte, []byte) {
 	size := wireLen(frames)
-	var buf []byte
-	if size <= maxReusableRawBuf {
-		if cap(pw.serializeBuf) < size {
-			pw.serializeBuf = make([]byte, 0, size)
-		}
-		buf = pw.serializeBuf[:0]
-	} else {
-		buf = make([]byte, 0, size)
+	minCap := size
+	if minCap < MaxPadTarget {
+		minCap = MaxPadTarget
 	}
+	bufp, buf := getPaddingBuf(minCap)
 	var header [protocol.FrameHeaderLen]byte
 	for _, f := range frames {
 		header[0] = byte(f.Command)
@@ -604,23 +664,16 @@ func (pw *Writer) serializeFramesLocked(frames []*protocol.Frame) []byte {
 		buf = append(buf, header[:]...)
 		buf = append(buf, f.Data...)
 	}
-	if size <= maxReusableRawBuf {
-		pw.serializeBuf = buf[:0]
-	}
-	return buf
+	return bufp, buf
 }
 
-func (pw *Writer) serializePSHLocked(streamID uint32, data []byte) []byte {
+func serializePSHPooled(streamID uint32, data []byte) (*[]byte, []byte) {
 	size := pshWireLen(len(data))
-	var buf []byte
-	if size <= maxReusableRawBuf {
-		if cap(pw.serializeBuf) < size {
-			pw.serializeBuf = make([]byte, 0, size)
-		}
-		buf = pw.serializeBuf[:0]
-	} else {
-		buf = make([]byte, 0, size)
+	minCap := size
+	if minCap < MaxPadTarget {
+		minCap = MaxPadTarget
 	}
+	bufp, buf := getPaddingBuf(minCap)
 	var header [protocol.FrameHeaderLen]byte
 	for off := 0; off < len(data); {
 		n := len(data) - off
@@ -638,23 +691,12 @@ func (pw *Writer) serializePSHLocked(streamID uint32, data []byte) []byte {
 		buf = append(buf, data[off:off+n]...)
 		off += n
 	}
-	if size <= maxReusableRawBuf {
-		pw.serializeBuf = buf[:0]
-	}
-	return buf
+	return bufp, buf
 }
 
 func (pw *Writer) writePSHRawLocked(streamID uint32, data []byte) error {
 	total := pshWireLen(len(data))
-	var buf []byte
-	if total <= maxReusableRawBuf {
-		if cap(pw.rawBuf) < total {
-			pw.rawBuf = make([]byte, 0, total)
-		}
-		buf = pw.rawBuf[:0]
-	} else {
-		buf = make([]byte, 0, total)
-	}
+	bufp, buf := getPaddingBuf(total)
 	var header [protocol.FrameHeaderLen]byte
 	for off := 0; off < len(data); {
 		n := len(data) - off
@@ -673,31 +715,23 @@ func (pw *Writer) writePSHRawLocked(streamID uint32, data []byte) error {
 		off += n
 	}
 	_, err := pw.w.Write(buf)
-	if total <= maxReusableRawBuf {
-		pw.rawBuf = buf[:0]
-	}
+	putPaddingBuf(bufp, buf)
 	return err
 }
 
-// maxReusableRawBuf bounds the encoding buffer retained per Writer. Writes up
-// to this size are encoded without allocating; larger writes fall back to the
-// shared pooled encoder so one huge write does not pin memory for the session.
+// maxReusableRawBuf bounds the pooled encoding buffer size. Writes up to this
+// size reuse shared pooled buffers without allocating; larger writes fall back
+// to the FrameWriter encoder so huge bursts do not pin memory.
 const maxReusableRawBuf = 264 * 1024
 
-// writeFramesRawLocked encodes frames into the Writer's reusable buffer and
-// writes them in one call without padding. pw.mu must be held. The reusable
-// buffer keeps the common unpadded path allocation-free.
+// writeFramesRawLocked encodes frames into a pooled buffer and writes them in
+// one call without padding. pw.mu must be held.
 func (pw *Writer) writeFramesRawLocked(frames []*protocol.Frame) error {
 	total := wireLen(frames)
 	if total > maxReusableRawBuf {
-		// Rare huge write: use the shared pooled encoder instead of retaining a
-		// large per-writer buffer for the rest of the session.
 		return pw.fw.WriteFrames(frames)
 	}
-	if cap(pw.rawBuf) < total {
-		pw.rawBuf = make([]byte, 0, total)
-	}
-	buf := pw.rawBuf[:0]
+	bufp, buf := getPaddingBuf(total)
 	var header [protocol.FrameHeaderLen]byte
 	for _, f := range frames {
 		header[0] = byte(f.Command)
@@ -710,11 +744,9 @@ func (pw *Writer) writeFramesRawLocked(frames []*protocol.Frame) error {
 		buf = append(buf, header[:]...)
 		buf = append(buf, f.Data...)
 	}
-	if _, err := pw.w.Write(buf); err != nil {
-		return err
-	}
-	pw.rawBuf = buf[:0]
-	return nil
+	_, err := pw.w.Write(buf)
+	putPaddingBuf(bufp, buf)
+	return err
 }
 
 // prunesStreamsLocked removes the oldest stream state when the table is over

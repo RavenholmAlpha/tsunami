@@ -17,7 +17,7 @@ const (
 
 	minStreamWindow = 64 << 10
 	maxStreamWindow = 16 << 20
-	maxWriteBatch   = 256 << 10
+	maxWriteBatch   = 4 * AlignedRelayPayloadLen
 )
 
 type recvChunk struct {
@@ -210,19 +210,28 @@ func (s *Stream) Read(p []byte) (int, error) {
 			}
 			return 0, ErrStreamClosed
 		}
-		for total < len(p) && s.recvCount > 0 {
+		var popped [16]recvChunk
+		poppedCount := 0
+		want := len(p) - total
+		for poppedCount < len(popped) && want > 0 && s.recvCount > 0 {
 			chunk := s.popRecvLocked()
 			s.recvBytes -= len(chunk.data)
-			n := copy(p[total:], chunk.data)
-			if n < len(chunk.data) {
-				s.recvLeftChunk = recvChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
-			} else if chunk.poolBuf != nil {
-				putRecvPayloadBuf(chunk.poolBuf)
-			}
-			total += n
+			popped[poppedCount] = chunk
+			poppedCount++
+			want -= len(chunk.data)
 		}
-		if total > 0 {
+		if poppedCount > 0 || total > 0 {
 			s.recvMu.Unlock()
+			for i := 0; i < poppedCount; i++ {
+				chunk := popped[i]
+				n := copy(p[total:], chunk.data)
+				total += n
+				if n < len(chunk.data) {
+					s.recvLeftChunk = recvChunk{data: chunk.data[n:], poolBuf: chunk.poolBuf}
+				} else if chunk.poolBuf != nil {
+					putRecvPayloadBuf(chunk.poolBuf)
+				}
+			}
 			s.bytesRead.Add(int64(total))
 			s.maybeSendWindowUpdate(total)
 			return total, nil
@@ -293,11 +302,11 @@ func (s *Stream) maybeSendWindowUpdate(consumed int) {
 		if step > 0xFFFFFFFF {
 			step = 0xFFFFFFFF
 		}
-		var payload [4]byte
-		binary.BigEndian.PutUint32(payload[:], uint32(step))
-		if err := s.session.writeFrame(NewFrame(CmdWindowUpdate, s.id, payload[:])); err != nil {
-			return
-		}
+		s.session.enqueueControl(ctrlFrame{
+			cmd:      CmdWindowUpdate,
+			streamID: s.id,
+			winDelta: uint32(step),
+		})
 		delta -= step
 	}
 }
@@ -415,6 +424,17 @@ func (s *Stream) WritePreframedSingle(framed []byte, payloadLen int) error {
 	}
 
 	fc, grant := s.acquireSendWindow(payloadLen)
+	for fc && grant == 0 {
+		if s.closed.Load() {
+			return ErrStreamClosed
+		}
+		select {
+		case <-s.sendWinNotify:
+		case <-s.doneCh:
+			return ErrStreamClosed
+		}
+		_, grant = s.acquireSendWindow(payloadLen)
+	}
 	if fc && grant < payloadLen {
 		if grant > 0 {
 			s.addSendWindow(int64(grant))
@@ -433,12 +453,13 @@ func (s *Stream) WritePreframedSingle(framed []byte, payloadLen int) error {
 	return nil
 }
 
-// CopyToStream copies from src into dst using a pre-framed 7B+65535B buffer so
-// steady-state relay writes avoid an extra 64 KiB payload copy per frame.
+// CopyToStream copies from src into dst using a pre-framed 7B+65529B buffer so
+// steady-state relay writes avoid an extra 64 KiB payload copy and align cleanly
+// to 4×16 KiB TLS records without emitting a 6-byte trailing runt TLS record.
 func CopyToStream(dst *Stream, src io.Reader) (int64, error) {
 	bufp := PreframedRelayBufPool.Get().(*[]byte)
 	buf := *bufp
-	payloadBuf := buf[FrameHeaderLen : FrameHeaderLen+MaxFrameDataLen]
+	payloadBuf := buf[FrameHeaderLen : FrameHeaderLen+AlignedRelayPayloadLen]
 	var written int64
 	var err error
 	for {
@@ -475,17 +496,7 @@ func buildPSHFrames(streamID uint32, p []byte) []*Frame {
 	return frames
 }
 
-// Close closes the stream by sending cmdFIN.
-func (s *Stream) Close() error {
-	s.closeMu.Lock()
-	if s.closed.Load() {
-		s.closeMu.Unlock()
-		return nil
-	}
-	s.localClosed.Store(true)
-	s.closed.Store(true)
-	s.resolveOpen(ErrStreamClosed)
-
+func (s *Stream) drainRecvPool() {
 	s.recvMu.Lock()
 	s.recvEOF = true
 	for s.recvCount > 0 {
@@ -497,14 +508,26 @@ func (s *Stream) Close() error {
 	s.recvCount = 0
 	s.recvBytes = 0
 	s.recvMu.Unlock()
+}
 
+// Close closes the stream by sending cmdFIN.
+func (s *Stream) Close() error {
+	s.closeMu.Lock()
+	if s.closed.Load() {
+		s.closeMu.Unlock()
+		return nil
+	}
+	s.localClosed.Store(true)
+	s.closed.Store(true)
+	s.resolveOpen(ErrStreamClosed)
+	s.drainRecvPool()
 	s.closeReadBuf()
 	s.closeMu.Unlock()
 
-	// Send FIN and unregister outside closeMu so concurrent closeByRemote in
-	// Session.RunEventLoop never blocks on closeMu while network writes backpressure.
-	_ = s.session.writeFrame(NewFrame(CmdFIN, s.id, nil))
+	// Unregister stream slot immediately and queue FIN asynchronously so Close
+	// never blocks on outbound write backpressure.
 	s.session.removeStream(s.id)
+	s.session.enqueueControl(ctrlFrame{cmd: CmdFIN, streamID: s.id})
 
 	return nil
 }

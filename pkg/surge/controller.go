@@ -35,7 +35,7 @@ type Config struct {
 	// Mode is the Surge operating mode.
 	Mode Mode
 	// Threshold is the number of concurrent streams that triggers Layer 2 upgrade.
-	// Default: 8
+	// Default: 2
 	Threshold int
 	// MaxConnections is the maximum number of TLS connections in Layer 2.
 	// Default: 4
@@ -62,16 +62,17 @@ type Controller struct {
 
 	// State tracking
 	currentLayer atomic.Int32 // 1 or 2
+	expanding    atomic.Bool
 
 	// Cooldown tracking to prevent rapid layer oscillation
 	lastUpgrade   time.Time
 	lastDowngrade time.Time
 
 	// Monitoring
-	stopCh   chan struct{}
-	once     sync.Once
-	mu       sync.Mutex
-	expandMu sync.Mutex
+	stopCh       chan struct{}
+	once         sync.Once
+	mu           sync.Mutex
+	syncExpandMu sync.Mutex
 }
 
 // NewController creates a new Surge controller.
@@ -111,26 +112,33 @@ func normalizeConfig(config Config) Config {
 	return config
 }
 
+func (c *Controller) configSnapshot() Config {
+	c.mu.Lock()
+	cfg := c.config
+	c.mu.Unlock()
+	return cfg
+}
+
 // GetSession returns the best session for a new stream.
 // In Layer 1, returns the single session (multiplexed).
 // In Layer 2, returns the least-loaded session across the pool.
-// When the next stream would cross the threshold, it expands immediately so
-// the triggering stream can be placed on a fresh connection.
+// When the next stream would cross the threshold on a single session, it expands
+// immediately so the triggering stream lands on a fresh connection, while any
+// additional connections warm in parallel in the background.
 func (c *Controller) GetSession() (*protocol.Session, error) {
-	if c.config.Mode == ModeNone {
+	decision, maxConn := c.checkExpansionForNextStream()
+	switch decision {
+	case expandModeNone:
 		return c.pool.GetOrCreateSession()
-	}
-
-	switch c.checkExpansionForNextStream() {
 	case expandSync:
-		session, err := c.createExpansionSession()
+		session, err := c.createExpansionSession(maxConn)
 		if err == nil {
-			c.expandAsync()
+			c.expandAsync(maxConn)
 			return session, nil
 		}
 		log.Printf("tsunami surge: immediate expansion failed: %v", err)
 	case expandAsyncOnly:
-		c.expandAsync()
+		c.expandAsync(maxConn)
 	}
 
 	layer := c.currentLayer.Load()
@@ -198,11 +206,22 @@ const surgeCooldown = 30 * time.Second
 // evaluate checks stream counts and decides on layer transitions.
 // On upgrade to Layer 2, it proactively expands by creating additional sessions
 // (asynchronously) up to MaxConnections.
-// On downgrade to Layer 1, it closes idle sessions to reduce resource usage.
-// A 30-second cooldown prevents rapid oscillation between layers.
+// On downgrade to Layer 1, it closes idle sessions outside c.mu to avoid
+// blocking concurrent GetSession calls on network I/O.
 func (c *Controller) evaluate() {
+	var (
+		doExpand       bool
+		expandMaxConn  int
+		doDowngrade    bool
+		idleDowngradeD time.Duration
+	)
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	cfg := c.config
+	if cfg.Mode == ModeNone {
+		c.mu.Unlock()
+		return
+	}
 
 	totalStreams := c.pool.ActiveStreamCount()
 	sessionCount := c.pool.SessionCount()
@@ -210,42 +229,48 @@ func (c *Controller) evaluate() {
 	now := time.Now()
 
 	// --- Upgrade: Layer 1 → Layer 2 ---
-	if currentLayer == 1 && totalStreams > c.config.Threshold {
-		// Cooldown: skip if recently downgraded
-		if !c.lastDowngrade.IsZero() && now.Sub(c.lastDowngrade) < surgeCooldown {
-			return
+	if currentLayer == 1 && totalStreams > cfg.Threshold {
+		if c.lastDowngrade.IsZero() || now.Sub(c.lastDowngrade) >= surgeCooldown {
+			if sessionCount < cfg.MaxConnections {
+				log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d > threshold=%d)",
+					totalStreams, cfg.Threshold)
+				c.currentLayer.Store(2)
+				c.lastUpgrade = now
+				doExpand = true
+				expandMaxConn = cfg.MaxConnections
+			}
 		}
-		if sessionCount < c.config.MaxConnections {
-			log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d > threshold=%d)",
-				totalStreams, c.config.Threshold)
-			c.currentLayer.Store(2)
-			c.lastUpgrade = now
-
-			// Proactively expand: create sessions up to MaxConnections
-			c.expandAsync()
+	} else if currentLayer == 2 && sessionCount < cfg.MaxConnections && totalStreams > cfg.Threshold {
+		// --- Layer 2 active expansion: keep scaling if still under pressure ---
+		doExpand = true
+		expandMaxConn = cfg.MaxConnections
+	} else if currentLayer == 2 && totalStreams <= cfg.Threshold/4 {
+		// --- Downgrade: Layer 2 → Layer 1 ---
+		// Use threshold/4 (wider hysteresis) to prevent rapid oscillation.
+		if c.lastUpgrade.IsZero() || now.Sub(c.lastUpgrade) >= surgeCooldown {
+			doDowngrade = true
+			idleDowngradeD = cfg.IdleDowngradeTime
 		}
 	}
+	c.mu.Unlock()
 
-	// --- Layer 2 active expansion: keep scaling if still under pressure ---
-	if currentLayer == 2 && sessionCount < c.config.MaxConnections && totalStreams > c.config.Threshold {
-		c.expandAsync()
+	if doExpand {
+		c.expandAsync(expandMaxConn)
+		return
 	}
 
-	// --- Downgrade: Layer 2 → Layer 1 ---
-	// Use threshold/4 (wider hysteresis) to prevent rapid oscillation
-	if currentLayer == 2 && totalStreams <= c.config.Threshold/4 {
-		// Cooldown: skip if recently upgraded
-		if !c.lastUpgrade.IsZero() && now.Sub(c.lastUpgrade) < surgeCooldown {
-			return
-		}
-		// Close idle sessions (keep at least 1)
-		c.pool.CloseIdleSessions(c.config.IdleDowngradeTime, 1)
+	if doDowngrade {
+		// Close idle sessions (keep at least 1) outside c.mu.
+		c.pool.CloseIdleSessions(idleDowngradeD, 1)
 
-		// If we've reduced to a single session, downgrade to Layer 1
 		if c.pool.SessionCount() <= 1 {
-			log.Printf("tsunami surge: downgrading to Layer 1 (streams=%d)", totalStreams)
-			c.currentLayer.Store(1)
-			c.lastDowngrade = now
+			c.mu.Lock()
+			if c.currentLayer.Load() == 2 && c.pool.SessionCount() <= 1 {
+				log.Printf("tsunami surge: downgrading to Layer 1 (streams=%d)", c.pool.ActiveStreamCount())
+				c.currentLayer.Store(1)
+				c.lastDowngrade = time.Now()
+			}
+			c.mu.Unlock()
 		}
 	}
 }
@@ -254,29 +279,35 @@ type expandDecision uint8
 
 const (
 	expandNone expandDecision = iota
+	expandModeNone
 	expandAsyncOnly
 	expandSync
 )
 
-func (c *Controller) checkExpansionForNextStream() expandDecision {
+func (c *Controller) checkExpansionForNextStream() (expandDecision, int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.config.Mode == ModeNone {
+		return expandModeNone, 0
+	}
+
 	totalStreams := c.pool.ActiveStreamCount()
 	sessionCount := c.pool.SessionCount()
-	if sessionCount >= c.config.MaxConnections || sessionCount == 0 {
-		return expandNone
+	maxConn := c.config.MaxConnections
+	if sessionCount >= maxConn || sessionCount == 0 {
+		return expandNone, maxConn
 	}
 	// Pre-warm additional connections asynchronously as soon as the stream
 	// about to open reaches Threshold (zero blocking latency for caller).
 	if totalStreams+1 < c.config.Threshold {
-		return expandNone
+		return expandNone, maxConn
 	}
 
 	now := time.Now()
 	if c.currentLayer.Load() == 1 {
 		if !c.lastDowngrade.IsZero() && now.Sub(c.lastDowngrade) < surgeCooldown {
-			return expandNone
+			return expandNone, maxConn
 		}
 		log.Printf("tsunami surge: upgrading to Layer 2 (streams=%d threshold=%d)",
 			totalStreams, c.config.Threshold)
@@ -288,16 +319,16 @@ func (c *Controller) checkExpansionForNextStream() expandDecision {
 	// sessions exist or while pre-warming at Threshold-1, expand asynchronously
 	// so caller streams never stall on TLS/H2 handshakes.
 	if sessionCount == 1 && totalStreams >= c.config.Threshold {
-		return expandSync
+		return expandSync, maxConn
 	}
-	return expandAsyncOnly
+	return expandAsyncOnly, maxConn
 }
 
-func (c *Controller) createExpansionSession() (*protocol.Session, error) {
-	c.expandMu.Lock()
-	defer c.expandMu.Unlock()
+func (c *Controller) createExpansionSession(maxConn int) (*protocol.Session, error) {
+	c.syncExpandMu.Lock()
+	defer c.syncExpandMu.Unlock()
 
-	if c.pool.SessionCount() >= c.config.MaxConnections {
+	if c.pool.SessionCount() >= maxConn {
 		return c.pool.GetLeastLoadedSession()
 	}
 
@@ -306,20 +337,26 @@ func (c *Controller) createExpansionSession() (*protocol.Session, error) {
 		return nil, err
 	}
 	log.Printf("tsunami surge: expanded pool immediately (%d/%d connections)",
-		c.pool.SessionCount(), c.config.MaxConnections)
+		c.pool.SessionCount(), maxConn)
 	return session, nil
 }
 
-func (c *Controller) expandAsync() {
-	go c.expandPool(c.config.MaxConnections)
+func (c *Controller) expandAsync(maxConnections int) {
+	if maxConnections <= 0 {
+		maxConnections = c.configSnapshot().MaxConnections
+	}
+	if !c.expanding.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer c.expanding.Store(false)
+		c.expandPool(maxConnections)
+	}()
 }
 
 // expandPool asynchronously creates additional sessions in parallel up to maxConnections.
 func (c *Controller) expandPool(maxConnections int) {
-	c.expandMu.Lock()
-	defer c.expandMu.Unlock()
-
-	cur := c.pool.SessionCount()
+	cur := c.pool.SessionCount() + c.pool.DialingCount()
 	need := maxConnections - cur
 	if need <= 0 {
 		return
@@ -341,7 +378,7 @@ func (c *Controller) expandPool(maxConnections int) {
 				return
 			}
 			log.Printf("tsunami surge: expanded pool (%d/%d connections)",
-				c.pool.SessionCount(), c.config.MaxConnections)
+				c.pool.SessionCount(), maxConnections)
 		}()
 	}
 	wg.Wait()

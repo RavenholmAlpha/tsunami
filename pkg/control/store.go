@@ -1,7 +1,6 @@
 package control
 
 import (
-	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"sort"
@@ -21,6 +20,7 @@ type userStoreState struct {
 	updatedAt time.Time
 	entries   []authEntry
 	byID      map[string]*protocol.UserInfo
+	byHash    map[[protocol.AuthHashLen]byte]*protocol.UserInfo
 }
 
 // AuthResult describes an authentication decision.
@@ -88,6 +88,7 @@ func (s *UserStore) ApplySnapshot(snapshot *Snapshot) error {
 
 	entries := make([]authEntry, 0, len(nextByID))
 	seenHashes := make(map[[protocol.AuthHashLen]byte]string, len(nextByID))
+	byHash := make(map[[protocol.AuthHashLen]byte]*protocol.UserInfo, len(nextByID))
 	for key, user := range nextByID {
 		hash, err := user.AuthHash()
 		if err != nil {
@@ -97,9 +98,11 @@ func (s *UserStore) ApplySnapshot(snapshot *Snapshot) error {
 			return fmt.Errorf("control: duplicate auth hash for users %q and %q", prev, key)
 		}
 		seenHashes[hash] = key
+		cloned := user.Clone()
+		byHash[hash] = cloned
 		entries = append(entries, authEntry{
 			hash: hash,
-			user: user.Clone(),
+			user: cloned,
 		})
 	}
 
@@ -117,6 +120,7 @@ func (s *UserStore) ApplySnapshot(snapshot *Snapshot) error {
 		updatedAt: time.Now(),
 		entries:   entries,
 		byID:      nextByID,
+		byHash:    byHash,
 	})
 	return nil
 }
@@ -127,24 +131,18 @@ func (s *UserStore) Authenticate(hash [protocol.AuthHashLen]byte) *protocol.User
 	return result.User
 }
 
-// AuthenticateDetailed returns the matched user or a rejection reason.
+// AuthenticateDetailed returns the matched user or a rejection reason in O(1) time.
 func (s *UserStore) AuthenticateDetailed(hash [protocol.AuthHashLen]byte) AuthResult {
 	if s == nil {
 		return AuthResult{Reason: "nil store"}
 	}
 
 	state := s.current()
-	now := time.Now()
-	var matched *protocol.UserInfo
-	for _, entry := range state.entries {
-		if subtle.ConstantTimeCompare(hash[:], entry.hash[:]) == 1 {
-			matched = entry.user
-		}
-	}
-	if matched == nil {
+	matched, ok := state.byHash[hash]
+	if !ok || matched == nil {
 		return AuthResult{Reason: "not found"}
 	}
-	if ok, reason := matched.IsUsable(now); !ok {
+	if ok, reason := matched.IsUsable(time.Now()); !ok {
 		return AuthResult{Reason: reason}
 	}
 	return AuthResult{User: matched.Clone()}

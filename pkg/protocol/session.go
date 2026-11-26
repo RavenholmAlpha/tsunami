@@ -17,7 +17,6 @@ type Session struct {
 	seq     uint64
 	conn    io.ReadWriteCloser
 	writer  *FrameWriter
-	reader  *FrameReader
 	writeMu sync.Mutex // protects writer from concurrent writes
 
 	// Stream management
@@ -25,6 +24,7 @@ type Session struct {
 	streamMu           sync.RWMutex
 	openMu             sync.Mutex // preserves on-wire SYN ordering for concurrent OpenStream calls
 	nextID             atomic.Uint32
+	activeStreams      atomic.Int32
 	lastRemoteStreamID uint32 // accessed only by the session event loop
 	maxStreams         int    // 0 disables the limit
 
@@ -42,12 +42,15 @@ type Session struct {
 	localStreamWindow  int
 	remoteStreamWindow int
 
-	// Idle & write-stall tracking (atomic to avoid per-frame SetWriteDeadline syscalls)
+	// Write-side activity & stall tracking (cache-line separated from reader atomics).
 	idleSince    atomic.Int64 // stores UnixNano; 0 = not idle
 	lastActive   atomic.Int64 // stores UnixNano
-	lastRecv     atomic.Int64 // stores UnixNano; updated on any inbound frame
-	lastPong     atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
 	writingSince atomic.Int64 // stores UnixNano while blocked in conn.Write; 0 = idle
+	_            [40]byte
+
+	// Read-side activity tracking.
+	lastRecv atomic.Int64 // stores UnixNano; updated on any inbound frame
+	lastPong atomic.Int64 // stores UnixNano; updated on CmdHeartResponse
 
 	// Callbacks
 	onStreamOpen          func(s *Stream)         // Called when server receives a new stream
@@ -75,16 +78,33 @@ type Session struct {
 	highPriCond    *sync.Cond
 
 	// Contention-coalescing batch writer for steady-state unpadded bulk CmdPSH.
-	// Uncontended writes bypass this completely with zero extra copy or delay.
+	// Uses pooled 256 KiB buffers so idle sessions pin zero batch memory.
 	batchMu       sync.Mutex
 	batchBusy     bool
 	batchBusyFast atomic.Bool
+	batchBufp     *[]byte
 	batchBuf      []byte
-	batchAltBuf   []byte
 	batchWaiter   *writeBatchWaiter
+
+	// Non-blocking outbound control queue (CmdSYNACK, CmdWindowUpdate, CmdFIN,
+	// CmdHeartResponse) so RunEventLoop and Stream.Read never block on writeMu.
+	ctrlCh        chan ctrlFrame
+	ctrlStartOnce sync.Once
+
+	// Reusable scratch arrays for frame dispatch under writeMu (avoids per-call heap escapes).
+	ctrlFrames  [16]Frame
+	ctrlPtrs    [16]*Frame
+	ctrlWinBufs [16][4]byte
 
 	// Error channel
 	errCh chan error
+}
+
+type ctrlFrame struct {
+	cmd      Command
+	streamID uint32
+	winDelta uint32
+	data     []byte
 }
 
 type paddingCoalesceFuncs struct {
@@ -101,8 +121,17 @@ const (
 	sessionWriteDeadline   = 30 * time.Second
 	highPriPSHMaxBytes     = 2048
 	maxCoalesceBatchBytes  = 256 << 10
+	batchCoalescePoolCap   = maxCoalesceBatchBytes + 1024
 	maxCoalesceDrainRounds = 4
+	sessionReadBufSize     = 128 * 1024
 )
+
+var batchCoalesceBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, batchCoalescePoolCap)
+		return &buf
+	},
+}
 
 // DefaultMaxStreams bounds how many streams one session may carry at once.
 // It is deliberately far above real browsing concurrency but low enough that a
@@ -116,11 +145,11 @@ func NewSession(conn io.ReadWriteCloser, seq uint64) *Session {
 		seq:          seq,
 		conn:         conn,
 		writer:       NewFrameWriter(conn),
-		reader:       NewFrameReader(conn),
 		streams:      make(map[uint32]*Stream),
 		doneCh:       make(chan struct{}),
 		localVersion: CurrentVersion,
 		maxStreams:   DefaultMaxStreams,
+		ctrlCh:       make(chan ctrlFrame, 256),
 		errCh:        make(chan error, 1),
 	}
 	s.highPriCond = sync.NewCond(&s.highPriMu)
@@ -148,9 +177,7 @@ func (s *Session) MaxStreams() int {
 
 // streamCount returns the number of currently tracked streams.
 func (s *Session) streamCount() int {
-	s.streamMu.RLock()
-	defer s.streamMu.RUnlock()
-	return len(s.streams)
+	return int(s.activeStreams.Load())
 }
 
 // ReplaceConn swaps the underlying connection for a wrapped one (e.g., traffic shaping).
@@ -158,7 +185,6 @@ func (s *Session) streamCount() int {
 func (s *Session) ReplaceConn(conn io.ReadWriteCloser) {
 	s.conn = conn
 	s.writer = NewFrameWriter(conn)
-	s.reader = NewFrameReader(conn)
 }
 
 // Seq returns the session sequence number (monotonically increasing within a client).
@@ -209,12 +235,15 @@ func (s *Session) OpenStream() (*Stream, error) {
 	}
 	s.streams[id] = stream
 	count := len(s.streams)
+	s.activeStreams.Store(int32(count))
 	s.streamMu.Unlock()
 
 	s.notifyStreamCountChange(count)
 
-	// Send SYN
-	if err := s.writeFrame(NewFrame(CmdSYN, id, nil)); err != nil {
+	// Send SYN (stack ctrlFrame avoids heap-allocating a *Frame per OpenStream).
+	var syn [1]ctrlFrame
+	syn[0] = ctrlFrame{cmd: CmdSYN, streamID: id}
+	if err := s.writeControlBatch(syn[:]); err != nil {
 		s.openMu.Unlock()
 		stream.closeByRemote(err)
 		return nil, fmt.Errorf("tsunami: send SYN: %w", err)
@@ -270,6 +299,7 @@ func (s *Session) OpenStreamWithTarget(addrData []byte) (*Stream, error) {
 	}
 	s.streams[id] = stream
 	count := len(s.streams)
+	s.activeStreams.Store(int32(count))
 	s.streamMu.Unlock()
 
 	s.notifyStreamCountChange(count)
@@ -288,9 +318,7 @@ func (s *Session) OpenStreamWithTarget(addrData []byte) (*Stream, error) {
 
 // ActiveStreamCount returns the number of active streams.
 func (s *Session) ActiveStreamCount() int {
-	s.streamMu.RLock()
-	defer s.streamMu.RUnlock()
-	return len(s.streams)
+	return int(s.activeStreams.Load())
 }
 
 // IsIdle returns true if the session has no active streams.
@@ -358,10 +386,6 @@ func (s *Session) IsAlive(timeout time.Duration) bool {
 func (s *Session) lockWriteHighPri() {
 	s.highPriWaiters.Add(1)
 	s.writeMu.Lock()
-}
-
-func (s *Session) unlockWriteHighPri() {
-	s.writeMu.Unlock()
 	if s.highPriWaiters.Add(-1) == 0 && s.bulkWaiting.Load() > 0 {
 		s.highPriMu.Lock()
 		s.highPriCond.Broadcast()
@@ -369,7 +393,11 @@ func (s *Session) unlockWriteHighPri() {
 	}
 }
 
-func (s *Session) lockWriteBulk() {
+func (s *Session) unlockWriteHighPri() {
+	s.writeMu.Unlock()
+}
+
+func (s *Session) waitForHighPri() {
 	if s.highPriWaiters.Load() > 0 && !s.closed.Load() {
 		s.highPriMu.Lock()
 		s.bulkWaiting.Add(1)
@@ -379,11 +407,150 @@ func (s *Session) lockWriteBulk() {
 		s.bulkWaiting.Add(-1)
 		s.highPriMu.Unlock()
 	}
+}
+
+func (s *Session) lockWriteBulk() {
+	s.waitForHighPri()
 	s.writeMu.Lock()
 }
 
 func (s *Session) unlockWriteBulk() {
 	s.writeMu.Unlock()
+}
+
+func (s *Session) enqueueControl(cf ctrlFrame) {
+	if s.closed.Load() {
+		return
+	}
+	s.ctrlStartOnce.Do(func() {
+		go s.runControlWriter()
+	})
+	select {
+	case s.ctrlCh <- cf:
+	default:
+		go func(f ctrlFrame) {
+			var one [1]ctrlFrame
+			one[0] = f
+			_ = s.writeControlBatch(one[:])
+		}(cf)
+	}
+}
+
+func (s *Session) runControlWriter() {
+	var batch [16]ctrlFrame
+	for {
+		select {
+		case <-s.doneCh:
+			return
+		case cf := <-s.ctrlCh:
+			batch[0] = cf
+			n := 1
+			for n < len(batch) {
+				select {
+				case next := <-s.ctrlCh:
+					batch[n] = next
+					n++
+				default:
+					goto flush
+				}
+			}
+		flush:
+			_ = s.writeControlBatch(batch[:n])
+		}
+	}
+}
+
+func (s *Session) writeControlBatch(batch []ctrlFrame) error {
+	if len(batch) == 0 || s.closed.Load() {
+		return nil
+	}
+	s.lockWriteHighPri()
+	if s.closed.Load() {
+		s.unlockWriteHighPri()
+		return ErrSessionClosed
+	}
+	n := len(batch)
+	if n > len(s.ctrlFrames) {
+		n = len(s.ctrlFrames)
+	}
+	for i := 0; i < n; i++ {
+		cf := batch[i]
+		data := cf.data
+		if cf.cmd == CmdWindowUpdate {
+			binary.BigEndian.PutUint32(s.ctrlWinBufs[i][:], cf.winDelta)
+			data = s.ctrlWinBufs[i][:]
+		}
+		s.ctrlFrames[i] = Frame{
+			Command:  cf.cmd,
+			StreamID: cf.streamID,
+			Data:     data,
+		}
+		s.ctrlPtrs[i] = &s.ctrlFrames[i]
+	}
+	now := time.Now().UnixNano()
+	s.lastActive.Store(now)
+	s.writingSince.Store(now)
+	var err error
+	if s.paddingWriteFn != nil {
+		err = s.paddingWriteFn(s.ctrlPtrs[:n])
+	} else if n == 1 {
+		err = s.writer.WriteFrame(s.ctrlPtrs[0])
+	} else {
+		err = s.writer.WriteFrames(s.ctrlPtrs[:n])
+	}
+	for i := 0; i < n; i++ {
+		s.ctrlFrames[i].Data = nil
+		s.ctrlPtrs[i] = nil
+	}
+	s.writingSince.Store(0)
+	s.unlockWriteHighPri()
+	if err != nil && !s.closed.Load() {
+		go func() { _ = s.Close() }()
+	}
+	return err
+}
+
+// appendPendingControlLocked piggybacks already-queued control frames onto an
+// outbound steady-state bulk CmdPSH batch so control traffic avoids standalone
+// ctl-padded TLS records during active transfers while preserving full ctl
+// padding when the session is idle.
+func (s *Session) appendPendingControlLocked(buf []byte) []byte {
+	var hdr [FrameHeaderLen]byte
+	var win [4]byte
+	for i := 0; i < 32; i++ {
+		if cap(buf)-len(buf) < FrameHeaderLen+4 {
+			return buf
+		}
+		select {
+		case cf := <-s.ctrlCh:
+			dataLen := len(cf.data)
+			if cf.cmd == CmdWindowUpdate {
+				dataLen = 4
+			}
+			if len(buf)+FrameHeaderLen+dataLen > cap(buf) {
+				// Re-queue or send asynchronously if oversized error payload doesn't fit.
+				go func(f ctrlFrame) {
+					var one [1]ctrlFrame
+					one[0] = f
+					_ = s.writeControlBatch(one[:])
+				}(cf)
+				return buf
+			}
+			hdr[0] = byte(cf.cmd)
+			binary.BigEndian.PutUint32(hdr[1:5], cf.streamID)
+			binary.BigEndian.PutUint16(hdr[5:7], uint16(dataLen))
+			buf = append(buf, hdr[:]...)
+			if cf.cmd == CmdWindowUpdate {
+				binary.BigEndian.PutUint32(win[:], cf.winDelta)
+				buf = append(buf, win[:]...)
+			} else if dataLen > 0 {
+				buf = append(buf, cf.data...)
+			}
+		default:
+			return buf
+		}
+	}
+	return buf
 }
 
 func (s *Session) canSessionCoalesce() bool {
@@ -434,15 +601,9 @@ func (s *Session) tryEnqueueBulkPSH(streamID uint32, framed []byte, payload []by
 		s.batchMu.Unlock()
 		return false, nil
 	}
-	if s.batchBuf == nil {
-		initCap := 64 * 1024
-		if wireSize > initCap {
-			initCap = wireSize
-		}
-		if initCap > maxCoalesceBatchBytes {
-			initCap = maxCoalesceBatchBytes
-		}
-		s.batchBuf = make([]byte, 0, initCap)
+	if s.batchBufp == nil {
+		s.batchBufp = batchCoalesceBufPool.Get().(*[]byte)
+		s.batchBuf = (*s.batchBufp)[:0]
 	}
 	if framed != nil {
 		s.batchBuf = append(s.batchBuf, framed...)
@@ -472,12 +633,29 @@ func (s *Session) tryEnqueueBulkPSH(streamID uint32, framed []byte, payload []by
 	return true, waiter.err
 }
 
+func (s *Session) acquireBulkOrCoalesce(streamID uint32, framed []byte, payload []byte) (bool, error) {
+	if ok, err := s.tryEnqueueBulkPSH(streamID, framed, payload); ok {
+		return true, err
+	}
+	s.waitForHighPri()
+	if s.closed.Load() {
+		return true, ErrSessionClosed
+	}
+	if ok, err := s.tryEnqueueBulkPSH(streamID, framed, payload); ok {
+		return true, err
+	}
+	if s.writeMu.TryLock() {
+		return false, nil
+	}
+	if ok, err := s.tryEnqueueBulkPSH(streamID, framed, payload); ok {
+		return true, err
+	}
+	s.writeMu.Lock()
+	return false, nil
+}
+
 func (s *Session) markBatchBusy() {
 	s.batchMu.Lock()
-	if s.batchBuf == nil && s.batchAltBuf != nil {
-		s.batchBuf = s.batchAltBuf[:0]
-		s.batchAltBuf = nil
-	}
 	s.batchBusy = true
 	s.batchBusyFast.Store(true)
 	s.batchMu.Unlock()
@@ -489,11 +667,22 @@ func (s *Session) drainCoalescedBatches(prevErr error) {
 		if len(s.batchBuf) == 0 {
 			s.batchBusy = false
 			s.batchBusyFast.Store(false)
+			if s.batchBufp != nil {
+				if cap(s.batchBuf) == batchCoalescePoolCap {
+					*s.batchBufp = s.batchBuf[:0]
+					batchCoalesceBufPool.Put(s.batchBufp)
+				}
+				s.batchBufp = nil
+				s.batchBuf = nil
+			}
 			s.batchMu.Unlock()
 			return
 		}
+		toFlushBufp := s.batchBufp
 		toFlush := s.batchBuf
 		waiter := s.batchWaiter
+		s.batchBufp = nil
+		s.batchBuf = nil
 		s.batchWaiter = nil
 
 		stopAfterThis := prevErr != nil ||
@@ -503,14 +692,6 @@ func (s *Session) drainCoalescedBatches(prevErr error) {
 		if stopAfterThis {
 			s.batchBusy = false
 			s.batchBusyFast.Store(false)
-			s.batchBuf = nil
-		} else {
-			if s.batchAltBuf != nil {
-				s.batchBuf = s.batchAltBuf[:0]
-				s.batchAltBuf = nil
-			} else {
-				s.batchBuf = nil
-			}
 		}
 		s.batchMu.Unlock()
 
@@ -520,6 +701,7 @@ func (s *Session) drainCoalescedBatches(prevErr error) {
 		} else if s.closed.Load() {
 			flushErr = ErrSessionClosed
 		} else {
+			toFlush = s.appendPendingControlLocked(toFlush)
 			now := time.Now().UnixNano()
 			s.lastActive.Store(now)
 			s.writingSince.Store(now)
@@ -536,12 +718,9 @@ func (s *Session) drainCoalescedBatches(prevErr error) {
 		waiter.err = flushErr
 		close(waiter.done)
 
-		if cap(toFlush) <= maxCoalesceBatchBytes+FrameHeaderLen {
-			s.batchMu.Lock()
-			if s.batchAltBuf == nil {
-				s.batchAltBuf = toFlush[:0]
-			}
-			s.batchMu.Unlock()
+		if toFlushBufp != nil && cap(toFlush) == batchCoalescePoolCap {
+			*toFlushBufp = toFlush[:0]
+			batchCoalesceBufPool.Put(toFlushBufp)
 		}
 
 		if stopAfterThis {
@@ -569,11 +748,17 @@ func (s *Session) writeFrame(f *Frame) error {
 		return ErrSessionClosed
 	}
 	now := time.Now().UnixNano()
-	s.lastActive.Store(now)
+	// Idle keepalive CmdWaste frames must not reset lastActive, otherwise a
+	// blackholed TCP socket would keep postponing real CmdHeartRequest probes.
+	if f.Command != CmdWaste {
+		s.lastActive.Store(now)
+	}
 	s.writingSince.Store(now)
 	var err error
 	if s.paddingWriteFn != nil {
-		err = s.paddingWriteFn([]*Frame{f})
+		s.ctrlPtrs[0] = f
+		err = s.paddingWriteFn(s.ctrlPtrs[:1])
+		s.ctrlPtrs[0] = nil
 	} else {
 		err = s.writer.WriteFrame(f)
 	}
@@ -662,11 +847,9 @@ func (s *Session) writePSHData(streamID uint32, data []byte) error {
 		return err
 	}
 
-	if ok, err := s.tryEnqueueBulkPSH(streamID, nil, data); ok {
+	if coalesced, err := s.acquireBulkOrCoalesce(streamID, nil, data); coalesced {
 		return err
 	}
-
-	s.lockWriteBulk()
 	if s.closed.Load() {
 		s.unlockWriteBulk()
 		return ErrSessionClosed
@@ -717,11 +900,9 @@ func (s *Session) writePSHPreframed(streamID uint32, framed []byte, payloadLen i
 		return err
 	}
 
-	if ok, err := s.tryEnqueueBulkPSH(streamID, framed, nil); ok {
+	if coalesced, err := s.acquireBulkOrCoalesce(streamID, framed, nil); coalesced {
 		return err
 	}
-
-	s.lockWriteBulk()
 	if s.closed.Load() {
 		s.unlockWriteBulk()
 		return ErrSessionClosed
@@ -761,7 +942,12 @@ func (s *Session) writePSHPreframedLocked(streamID uint32, framed []byte, payloa
 		return s.paddingPSHWriteFn(streamID, framed[FrameHeaderLen:])
 	}
 	if s.paddingWriteFn != nil {
-		return s.paddingWriteFn([]*Frame{NewFrame(CmdPSH, streamID, framed[FrameHeaderLen:])})
+		s.ctrlFrames[0] = Frame{Command: CmdPSH, StreamID: streamID, Data: framed[FrameHeaderLen:]}
+		s.ctrlPtrs[0] = &s.ctrlFrames[0]
+		err := s.paddingWriteFn(s.ctrlPtrs[:1])
+		s.ctrlFrames[0].Data = nil
+		s.ctrlPtrs[0] = nil
+		return err
 	}
 	_, err := s.writer.w.Write(framed)
 	return err
@@ -783,15 +969,18 @@ func (s *Session) writeSYNWithTarget(streamID uint32, addrData []byte) error {
 	if s.paddingSYNTargetWriteFn != nil {
 		err = s.paddingSYNTargetWriteFn(streamID, addrData)
 	} else {
-		frames := []*Frame{
-			NewFrame(CmdSYN, streamID, nil),
-			NewFrame(CmdPSH, streamID, addrData),
-		}
+		s.ctrlFrames[0] = Frame{Command: CmdSYN, StreamID: streamID}
+		s.ctrlFrames[1] = Frame{Command: CmdPSH, StreamID: streamID, Data: addrData}
+		s.ctrlPtrs[0] = &s.ctrlFrames[0]
+		s.ctrlPtrs[1] = &s.ctrlFrames[1]
 		if s.paddingWriteFn != nil {
-			err = s.paddingWriteFn(frames)
+			err = s.paddingWriteFn(s.ctrlPtrs[:2])
 		} else {
-			err = s.writer.WriteFrames(frames)
+			err = s.writer.WriteFrames(s.ctrlPtrs[:2])
 		}
+		s.ctrlFrames[1].Data = nil
+		s.ctrlPtrs[0] = nil
+		s.ctrlPtrs[1] = nil
 	}
 	s.writingSince.Store(0)
 	s.unlockWriteHighPri()
@@ -802,6 +991,14 @@ func (s *Session) writeSYNWithTarget(streamID uint32, addrData []byte) error {
 }
 
 func (s *Session) writeRawPSHLocked(streamID uint32, data []byte) error {
+	if FrameHeaderLen+len(data) <= len(s.writer.smallBuf) {
+		s.writer.smallBuf[0] = byte(CmdPSH)
+		binary.BigEndian.PutUint32(s.writer.smallBuf[1:5], streamID)
+		binary.BigEndian.PutUint16(s.writer.smallBuf[5:7], uint16(len(data)))
+		copy(s.writer.smallBuf[FrameHeaderLen:], data)
+		_, err := s.writer.w.Write(s.writer.smallBuf[:FrameHeaderLen+len(data)])
+		return err
+	}
 	if len(data) <= MaxFrameDataLen {
 		poolBufp := frameBufPool.Get().(*[]byte)
 		buf := (*poolBufp)[:FrameHeaderLen+len(data)]
@@ -849,6 +1046,7 @@ func (s *Session) removeStream(id uint32) {
 	s.streamMu.Lock()
 	delete(s.streams, id)
 	count := len(s.streams)
+	s.activeStreams.Store(int32(count))
 	s.streamMu.Unlock()
 
 	s.notifyStreamCountChange(count)
@@ -970,7 +1168,7 @@ func (s *Session) RunEventLoop() error {
 	go s.runWriteWatchdog(stopWatch)
 	defer close(stopWatch)
 
-	reader := NewBufferedFrameReader(s.conn, 32*1024)
+	reader := NewBufferedFrameReader(s.conn, sessionReadBufSize)
 	for {
 		if s.closed.Load() {
 			return nil
@@ -1032,10 +1230,12 @@ func (s *Session) handleFramePooled(f *Frame, poolBuf *[]byte) error {
 			return ErrInvalidFrame
 		}
 		if f.StreamID == 0 || f.StreamID <= s.lastRemoteStreamID || s.getStream(f.StreamID) != nil {
-			return s.writeFrame(NewFrame(CmdSYNACK, f.StreamID, []byte("invalid stream id")))
+			s.enqueueControl(ctrlFrame{cmd: CmdSYNACK, streamID: f.StreamID, data: []byte("invalid stream id")})
+			return nil
 		}
 		if limit := s.MaxStreams(); limit > 0 && s.streamCount() >= limit {
-			return s.writeFrame(NewFrame(CmdSYNACK, f.StreamID, []byte("too many streams")))
+			s.enqueueControl(ctrlFrame{cmd: CmdSYNACK, streamID: f.StreamID, data: []byte("too many streams")})
+			return nil
 		}
 
 		// Server-side: new stream opened by client.
@@ -1046,16 +1246,16 @@ func (s *Session) handleFramePooled(f *Frame, poolBuf *[]byte) error {
 		}
 		s.streams[f.StreamID] = stream
 		count := len(s.streams)
+		s.activeStreams.Store(int32(count))
 		s.streamMu.Unlock()
 		s.lastRemoteStreamID = f.StreamID
 		s.notifyStreamCountChange(count)
-		if err := s.writeFrame(NewFrame(CmdSYNACK, f.StreamID, nil)); err != nil {
-			stream.closeByRemote(err)
-			return err
-		}
 		if s.onStreamOpen != nil {
 			go s.onStreamOpen(stream)
 		}
+		// Queue SYNACK asynchronously so RunEventLoop never stalls on outbound
+		// write backpressure or deadlocks with the peer's event loop.
+		s.enqueueControl(ctrlFrame{cmd: CmdSYNACK, streamID: f.StreamID})
 
 	case CmdSYNACK:
 		// Client-side: stream confirmed by server
@@ -1081,9 +1281,7 @@ func (s *Session) handleFramePooled(f *Frame, poolBuf *[]byte) error {
 			if errors.Is(err, ErrStreamRecvOverflow) {
 				log.Printf("tsunami: stream %d receive buffer overflow; closing stream", f.StreamID)
 				stream.closeByRemote(ErrStreamRecvOverflow)
-				go func(id uint32) {
-					_ = s.writeFrame(NewFrame(CmdFIN, id, nil))
-				}(f.StreamID)
+				s.enqueueControl(ctrlFrame{cmd: CmdFIN, streamID: f.StreamID})
 			}
 			return nil
 		}
@@ -1106,11 +1304,12 @@ func (s *Session) handleFramePooled(f *Frame, poolBuf *[]byte) error {
 		}
 
 	case CmdHeartRequest:
-		return s.writeFrame(NewFrame(CmdHeartResponse, 0, nil))
+		s.enqueueControl(ctrlFrame{cmd: CmdHeartResponse})
+		return nil
 
 	case CmdHeartResponse:
-		// Received pong — update last active and pong timestamp
-		s.lastPong.Store(time.Now().UnixNano())
+		// Received pong — reuse the timestamp already captured on frame arrival.
+		s.lastPong.Store(s.lastRecv.Load())
 		return nil
 
 	case CmdAlert:
@@ -1183,14 +1382,16 @@ func (s *Session) Close() error {
 		s.highPriMu.Unlock()
 		close(s.doneCh)
 
-		// Close all streams
+		// Close all streams and return any queued pooled receive buffers.
 		s.streamMu.Lock()
 		for _, stream := range s.streams {
 			stream.closed.Store(true)
 			stream.resolveOpen(ErrSessionClosed)
+			stream.drainRecvPool()
 			stream.closeReadBuf()
 		}
 		s.streams = make(map[uint32]*Stream)
+		s.activeStreams.Store(0)
 		s.streamMu.Unlock()
 
 		if s.writingSince.Load() != 0 {

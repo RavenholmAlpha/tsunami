@@ -272,12 +272,14 @@ func (s *Server) startFronting() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
+		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	if err := http2.ConfigureServer(httpSrv, &http2.Server{
 		MaxConcurrentStreams:         256,
-		MaxReadFrameSize:             256 << 10,
+		MaxReadFrameSize:             512 << 10,
 		MaxUploadBufferPerConnection: 32 << 20,
 		MaxUploadBufferPerStream:     16 << 20,
+		WriteByteTimeout:             30 * time.Second,
 	}); err != nil {
 		ln.Close()
 		return fmt.Errorf("tsunami fronting: configure http2: %w", err)
@@ -1248,6 +1250,9 @@ func (s *Server) Close() error {
 	}
 	if s.splitSessions != nil {
 		s.splitSessions.CloseAll()
+	}
+	if s.nonceCache != nil {
+		_ = s.nonceCache.Close()
 	}
 	if err := s.closeConnections(); err != nil {
 		errs = append(errs, err)

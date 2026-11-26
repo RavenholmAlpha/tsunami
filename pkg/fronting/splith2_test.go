@@ -423,6 +423,57 @@ func TestReadSplitUplinkBodyAndClientRingWrap(t *testing.T) {
 	}
 }
 
+func TestWebSocketLargeWriteChunkingAndDirectRead(t *testing.T) {
+	cRaw, sRaw := net.Pipe()
+	defer cRaw.Close()
+	defer sRaw.Close()
+
+	clientWS := NewWebSocketConn(cRaw, nil, true)
+	serverWS := NewWebSocketConn(sRaw, nil, false)
+
+	// 200 KiB exceeds wsMaxWriteFramePayload (64 KiB) and exercises multi-frame
+	// chunking, single-pass xorCopyMaskBytes, and direct-into-p zero-copy RX.
+	const total = 200 * 1024
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i*29 + i>>7)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, total)
+		if _, err := io.ReadFull(serverWS, buf); err != nil {
+			errCh <- err
+			return
+		}
+		if _, err := serverWS.Write(buf); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := clientWS.Write(want)
+		writeErrCh <- err
+	}()
+
+	got := make([]byte, total)
+	if _, err := io.ReadFull(clientWS, got); err != nil {
+		t.Fatalf("client ReadFull: %v", err)
+	}
+	if err := <-writeErrCh; err != nil {
+		t.Fatalf("client Write: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("server echo: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("WebSocket 200 KiB chunked echo payload mismatch")
+	}
+}
+
 func strconvParseUint(s string) (uint64, error) {
 	if s == "" {
 		return 0, errors.New("empty")

@@ -29,7 +29,7 @@ type dnsInflightCall struct {
 }
 
 type targetDNSCache struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	entries  map[string]cachedDNSResult
 	inflight map[string]*dnsInflightCall
 }
@@ -41,6 +41,13 @@ var globalTargetDNSCache = &targetDNSCache{
 
 func (c *targetDNSCache) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	nowNs := time.Now().UnixNano()
+	c.mu.RLock()
+	if cached, ok := c.entries[host]; ok && nowNs < cached.expireAtNs {
+		c.mu.RUnlock()
+		return cached.addrs, nil
+	}
+	c.mu.RUnlock()
+
 	c.mu.Lock()
 	if cached, ok := c.entries[host]; ok {
 		if nowNs < cached.expireAtNs {
@@ -248,21 +255,24 @@ const (
 // an internal address inside net.Dial.
 func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error) {
 	if s.config.AllowAll {
-		if host, port, err := splitTarget(target); err == nil {
-			if addresses, rErr := resolveTargetIPs(ctx, host); rErr == nil {
-				if len(addresses) == 1 {
-					dialer := &net.Dialer{Timeout: targetDialTimeout, KeepAlive: 30 * time.Second}
-					return dialer.DialContext(ctx, "tcp", net.JoinHostPort(addresses[0].String(), port))
-				}
-				return dialHappyEyeballs(ctx, interleaveAddresses(addresses), port, happyEyeballsDelay, targetDialTimeout)
+		host, port, err := splitTarget(target)
+		if err != nil {
+			dialer := &net.Dialer{
+				Timeout:       targetDialTimeout,
+				KeepAlive:     30 * time.Second,
+				FallbackDelay: happyEyeballsDelay,
 			}
+			return dialer.DialContext(ctx, "tcp", target)
 		}
-		dialer := &net.Dialer{
-			Timeout:       targetDialTimeout,
-			KeepAlive:     30 * time.Second,
-			FallbackDelay: happyEyeballsDelay,
+		addresses, err := resolveTargetIPs(ctx, host)
+		if err != nil {
+			return nil, err
 		}
-		return dialer.DialContext(ctx, "tcp", target)
+		if len(addresses) == 1 {
+			dialer := &net.Dialer{Timeout: targetDialTimeout, KeepAlive: 30 * time.Second}
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(addresses[0].String(), port))
+		}
+		return dialHappyEyeballs(ctx, interleaveAddresses(addresses), port, happyEyeballsDelay, targetDialTimeout)
 	}
 	host, port, err := splitTarget(target)
 	if err != nil {
@@ -284,29 +294,31 @@ func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error
 	return dialHappyEyeballs(ctx, interleaveAddresses(addresses), port, happyEyeballsDelay, targetDialTimeout)
 }
 
+// interleaveAddresses alternates IPv4 and IPv6 candidates starting with IPv4
+// when both families are available, avoiding 250ms Happy Eyeballs stalls on
+// IPv4-only VPS/NAT servers whose upstream DNS still returns AAAA records.
 func interleaveAddresses(addrs []netip.Addr) []netip.Addr {
 	if len(addrs) <= 1 {
 		return addrs
 	}
-	var primary, fallback []netip.Addr
-	firstIsV6 := addrs[0].Is6()
+	var v4, v6 []netip.Addr
 	for _, addr := range addrs {
-		if addr.Is6() == firstIsV6 {
-			primary = append(primary, addr)
+		if addr.Is4() {
+			v4 = append(v4, addr)
 		} else {
-			fallback = append(fallback, addr)
+			v6 = append(v6, addr)
 		}
 	}
-	if len(fallback) == 0 {
+	if len(v4) == 0 || len(v6) == 0 {
 		return addrs
 	}
 	out := make([]netip.Addr, 0, len(addrs))
-	for i := 0; i < len(primary) || i < len(fallback); i++ {
-		if i < len(primary) {
-			out = append(out, primary[i])
+	for i := 0; i < len(v4) || i < len(v6); i++ {
+		if i < len(v4) {
+			out = append(out, v4[i])
 		}
-		if i < len(fallback) {
-			out = append(out, fallback[i])
+		if i < len(v6) {
+			out = append(out, v6[i])
 		}
 	}
 	return out
@@ -349,15 +361,17 @@ func dialHappyEyeballs(ctx context.Context, addrs []netip.Addr, port string, sta
 		case res := <-results:
 			if res.err == nil {
 				cancel()
-				// Drain already-started attempts in the background so any late connection is closed.
-				go func(remaining int) {
-					for i := 0; i < remaining; i++ {
-						r := <-results
-						if r.conn != nil {
-							_ = r.conn.Close()
+				if remaining := started - failures - 1; remaining > 0 {
+					// Drain already-started attempts in the background so any late connection is closed.
+					go func(rem int) {
+						for i := 0; i < rem; i++ {
+							r := <-results
+							if r.conn != nil {
+								_ = r.conn.Close()
+							}
 						}
-					}
-				}(started - failures - 1)
+					}(remaining)
+				}
 				return res.conn, nil
 			}
 			failures++
@@ -379,14 +393,16 @@ func dialHappyEyeballs(ctx context.Context, addrs []netip.Addr, port string, sta
 				}
 			}
 		case <-dialCtx.Done():
-			go func(remaining int) {
-				for i := 0; i < remaining; i++ {
-					r := <-results
-					if r.conn != nil {
-						_ = r.conn.Close()
+			if remaining := started - failures; remaining > 0 {
+				go func(rem int) {
+					for i := 0; i < rem; i++ {
+						r := <-results
+						if r.conn != nil {
+							_ = r.conn.Close()
+						}
 					}
-				}
-			}(started - failures)
+				}(remaining)
+			}
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -396,15 +412,14 @@ func dialHappyEyeballs(ctx context.Context, addrs []netip.Addr, port string, sta
 	return nil, lastErr
 }
 
-// resolveUDPTarget resolves and validates a UoT target once, returning an
-// address that can be passed directly to WriteToUDP. allowAll bypasses the
-// private-address policy.
+// resolveUDPTarget resolves and validates a UoT target once, using the shared
+// DNS cache even when allowAll is set to avoid uncached OS DNS lookups.
 func resolveUDPTarget(ctx context.Context, target string, allowAll bool) (*net.UDPAddr, error) {
-	if allowAll {
-		return net.ResolveUDPAddr("udp", target)
-	}
 	host, portText, err := splitTarget(target)
 	if err != nil {
+		if allowAll {
+			return net.ResolveUDPAddr("udp", target)
+		}
 		return nil, err
 	}
 	port, err := strconv.Atoi(portText)
@@ -415,10 +430,13 @@ func resolveUDPTarget(ctx context.Context, target string, allowAll bool) (*net.U
 	if err != nil {
 		return nil, err
 	}
-	for _, addr := range addresses {
-		if isPrivateAddr(addr) {
-			return nil, errBlockedTarget
+	if !allowAll {
+		for _, addr := range addresses {
+			if isPrivateAddr(addr) {
+				return nil, errBlockedTarget
+			}
 		}
 	}
-	return &net.UDPAddr{IP: net.IP(addresses[0].AsSlice()), Port: port}, nil
+	ordered := interleaveAddresses(addresses)
+	return &net.UDPAddr{IP: net.IP(ordered[0].AsSlice()), Port: port}, nil
 }

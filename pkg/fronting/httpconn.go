@@ -57,8 +57,14 @@ func (c *HTTPServerConn) Write(p []byte) (int, error) {
 
 	c.writing.Store(true)
 	n, err := c.writer.Write(p)
-	if n > 0 && c.flusher != nil {
-		c.flusher.Flush()
+	if n > 0 {
+		if c.rc != nil {
+			if fErr := c.rc.Flush(); err == nil && fErr != nil && !errors.Is(fErr, http.ErrNotSupported) {
+				err = fErr
+			}
+		} else if c.flusher != nil {
+			c.flusher.Flush()
+		}
 	}
 	c.writing.Store(false)
 	return n, err
@@ -471,21 +477,22 @@ func addrString(s string) net.Addr {
 }
 
 type bufferedPipe struct {
-	mu          sync.Mutex
-	buf         []byte
-	head        int
-	size        int
-	maxBytes    int
-	rClosed     bool
-	rErr        error
-	wClosed     bool
-	wErr        error
-	readNotify  chan struct{}
-	spaceNotify chan struct{}
-	wClosedCh   chan struct{}
-	rClosedCh   chan struct{}
-	wCloseOnce  sync.Once
-	rCloseOnce  sync.Once
+	mu           sync.Mutex
+	buf          []byte
+	head         int
+	size         int
+	maxBytes     int
+	spaceWaiters int
+	rClosed      bool
+	rErr         error
+	wClosed      bool
+	wErr         error
+	readNotify   chan struct{}
+	spaceNotify  chan struct{}
+	wClosedCh    chan struct{}
+	rClosedCh    chan struct{}
+	wCloseOnce   sync.Once
+	rCloseOnce   sync.Once
 }
 
 // BufferedPipeReader reads from an in-memory bounded ring pipe.
@@ -525,6 +532,7 @@ func (r *BufferedPipeReader) Read(dst []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		}
 		if p.size > 0 {
+			wasFull := p.size >= p.maxBytes
 			n := len(dst)
 			if n > p.size {
 				n = p.size
@@ -542,11 +550,14 @@ func (r *BufferedPipeReader) Read(dst []byte) (int, error) {
 			if p.size == 0 {
 				p.head = 0
 			}
+			notifySpace := wasFull || p.spaceWaiters > 0
 			p.mu.Unlock()
 
-			select {
-			case p.spaceNotify <- struct{}{}:
-			default:
+			if notifySpace {
+				select {
+				case p.spaceNotify <- struct{}{}:
+				default:
+				}
 			}
 			return n, nil
 		}
@@ -625,16 +636,27 @@ func (w *BufferedPipeWriter) Write(src []byte) (int, error) {
 		}
 		avail := p.maxBytes - p.size
 		if avail <= 0 {
+			p.spaceWaiters++
 			p.mu.Unlock()
 			select {
 			case <-p.spaceNotify:
+				p.mu.Lock()
+				p.spaceWaiters--
+				p.mu.Unlock()
 				continue
 			case <-p.rClosedCh:
+				p.mu.Lock()
+				p.spaceWaiters--
+				p.mu.Unlock()
 				continue
 			case <-p.wClosedCh:
+				p.mu.Lock()
+				p.spaceWaiters--
+				p.mu.Unlock()
 				return off, io.ErrClosedPipe
 			}
 		}
+		wasEmpty := p.size == 0
 		chunk := len(src) - off
 		if chunk > avail {
 			chunk = avail
@@ -678,9 +700,11 @@ func (w *BufferedPipeWriter) Write(src []byte) (int, error) {
 		off += chunk
 		p.mu.Unlock()
 
-		select {
-		case p.readNotify <- struct{}{}:
-		default:
+		if wasEmpty {
+			select {
+			case p.readNotify <- struct{}{}:
+			default:
+			}
 		}
 	}
 	return off, nil

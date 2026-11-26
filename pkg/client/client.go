@@ -246,14 +246,14 @@ func (c *Client) dialFrontedSession() (*protocol.Session, error) {
 
 func (c *Client) newFrontingH2ClientConn(tlsConn net.Conn) (*http2.ClientConn, func(), error) {
 	t1 := &http.Transport{
-		TLSClientConfig:    c.config.TLS.BuildClientTLSConfig(),
 		DisableCompression: true,
 		HTTP2: &http.HTTP2Config{
 			MaxReceiveBufferPerStream:     16 << 20, // 16 MiB downlink stream window (4x Go default)
 			MaxReceiveBufferPerConnection: 32 << 20, // 32 MiB conn window (browser-scale vs Go 1 GiB)
-			MaxReadFrameSize:              256 << 10,
+			MaxReadFrameSize:              512 << 10,
 			SendPingTimeout:               time.Duration(padding.RandomInRange(25000, 45000)) * time.Millisecond,
 			PingTimeout:                   15 * time.Second,
+			WriteByteTimeout:              30 * time.Second,
 		},
 	}
 	h2Transport, err := http2.ConfigureTransports(t1)

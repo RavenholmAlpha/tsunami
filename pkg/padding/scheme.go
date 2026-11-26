@@ -83,7 +83,9 @@ type Scheme struct {
 	// Keepalive configuration for idle-period background waste.
 	Keepalive *KeepaliveConfig
 	// Raw stores the original text for MD5 computation.
-	Raw string
+	Raw    string
+	md5Raw string
+	md5Hex string
 }
 
 // Segment represents a single segment in a packet's padding strategy.
@@ -261,6 +263,9 @@ func Parse(text string) (*Scheme, error) {
 		}
 	}
 
+	h := md5.Sum([]byte(s.Raw))
+	s.md5Raw = s.Raw
+	s.md5Hex = fmt.Sprintf("%x", h)
 	return s, nil
 }
 
@@ -339,6 +344,9 @@ func parseRange(s string) ([2]int, error) {
 
 // MD5 returns the lowercase hex MD5 digest of the scheme's raw text.
 func (s *Scheme) MD5() string {
+	if s.md5Hex != "" && s.md5Raw == s.Raw {
+		return s.md5Hex
+	}
 	h := md5.Sum([]byte(s.Raw))
 	return fmt.Sprintf("%x", h)
 }

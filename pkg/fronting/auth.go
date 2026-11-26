@@ -26,121 +26,301 @@ const (
 	// uplink POST requests.
 	HeaderStreamSeq = "X-Stream-Seq"
 
-	// defaultNonceCacheMaxEntries bounds the replay cache. Only requests with
-	// a valid signature are inserted, so the cache normally grows with the
-	// (small) rate of new authenticated tunnels; the cap is a safety net
-	// against a client that holds the fronting secret and floods requests.
-	defaultNonceCacheMaxEntries = 1 << 17
+	// defaultNonceCacheMaxEntries bounds the replay cache across all shards.
+	// Only requests with a valid signature are inserted, so the cap is a safety
+	// net against a client holding the fronting secret flooding requests.
+	defaultNonceCacheMaxEntries = 1 << 18
+	nonceCacheShards            = 64
 )
 
-type nonceRecord struct {
+// nonceBinRecord is pointer-free so Go's GC marks the ring slice and shard maps
+// noscan, eliminating GC pause overhead even with hundreds of thousands of cached nonces.
+type nonceBinRecord struct {
+	key        [16]byte
+	insertedAt int64
+}
+
+type nonceShard struct {
+	mu       sync.Mutex
+	entries  map[[16]byte]int64
+	ring     []nonceBinRecord
+	ringHead int
+	ringLen  int
+	_        [8]byte // pad to 64-byte cache line on 64-bit platforms
+}
+
+type nonceStrRecord struct {
 	key        string
-	insertedAt time.Time
+	insertedAt int64
+}
+
+type nonceStrShard struct {
+	mu       sync.Mutex
+	entries  map[string]int64
+	ring     []nonceStrRecord
+	ringHead int
+	ringLen  int
 }
 
 // NonceCache tracks recently seen nonces to prevent replay attacks in O(1) amortized time.
+// Standard 32-hex (128-bit) nonces are stored in 64 pointer-free shards for zero-GC-scan
+// lock-striped concurrency; non-standard nonce formats use a bounded fallback shard.
 type NonceCache struct {
-	mu         sync.Mutex
-	entries    map[string]time.Time
-	ring       []nonceRecord
-	ringHead   int
-	ringLen    int
+	shards     [nonceCacheShards]nonceShard
+	fallback   nonceStrShard
 	ttl        time.Duration
 	maxEntries int
+	stopCh     chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewNonceCache creates a nonce cache with the given TTL and starts a
 // background goroutine to evict expired entries.
 func NewNonceCache(ttl time.Duration) *NonceCache {
 	nc := &NonceCache{
-		entries:    make(map[string]time.Time),
 		ttl:        ttl,
 		maxEntries: defaultNonceCacheMaxEntries,
+		stopCh:     make(chan struct{}),
 	}
 	go nc.evictLoop()
 	return nc
 }
 
+// Close stops the background eviction goroutine cleanly.
+func (nc *NonceCache) Close() error {
+	if nc == nil {
+		return nil
+	}
+	nc.stopOnce.Do(func() {
+		if nc.stopCh != nil {
+			close(nc.stopCh)
+		}
+	})
+	return nil
+}
+
+// Len returns the current number of cached nonces across all shards.
+func (nc *NonceCache) Len() int {
+	if nc == nil {
+		return 0
+	}
+	total := 0
+	for i := range nc.shards {
+		sh := &nc.shards[i]
+		sh.mu.Lock()
+		total += len(sh.entries)
+		sh.mu.Unlock()
+	}
+	nc.fallback.mu.Lock()
+	total += len(nc.fallback.entries)
+	nc.fallback.mu.Unlock()
+	return total
+}
+
+func (nc *NonceCache) shardMaxEntries() int {
+	if nc.maxEntries <= 0 {
+		return 0
+	}
+	m := nc.maxEntries / nonceCacheShards
+	if m < 1 {
+		m = 1
+	}
+	return m
+}
+
 // Add records a nonce. Returns false if the nonce was already seen (replay).
 func (nc *NonceCache) Add(nonce string) bool {
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
-	now := time.Now()
-	nc.pruneLocked(now)
-	if exp, exists := nc.entries[nonce]; exists {
-		if !exp.Before(now.Add(-nc.ttl)) {
-			return false
-		}
-		delete(nc.entries, nonce)
+	nowNano := time.Now().UnixNano()
+	cutoff := nowNano - nc.ttl.Nanoseconds()
+
+	var raw [16]byte
+	if len(nonce) == 32 && decodeHex16(nonce, &raw) {
+		sh := &nc.shards[raw[0]&(nonceCacheShards-1)]
+		maxPerShard := nc.shardMaxEntries()
+		sh.mu.Lock()
+		ok := sh.addLocked(raw, nowNano, cutoff, maxPerShard)
+		sh.mu.Unlock()
+		return ok
 	}
-	if nc.maxEntries > 0 {
-		for len(nc.entries) >= nc.maxEntries {
-			if !nc.popOldestLocked() {
-				for k := range nc.entries {
-					delete(nc.entries, k)
+
+	nc.fallback.mu.Lock()
+	ok := nc.fallback.addLocked(nonce, nowNano, cutoff, nc.maxEntries)
+	nc.fallback.mu.Unlock()
+	return ok
+}
+
+func (sh *nonceShard) addLocked(key [16]byte, nowNano, cutoff int64, maxEntries int) bool {
+	sh.pruneLocked(cutoff)
+	if sh.entries != nil {
+		if exp, exists := sh.entries[key]; exists {
+			if exp >= cutoff {
+				return false
+			}
+			delete(sh.entries, key)
+		}
+	} else {
+		sh.entries = make(map[[16]byte]int64, 64)
+	}
+	if maxEntries > 0 {
+		for len(sh.entries) >= maxEntries {
+			if !sh.popOldestLocked() {
+				for k := range sh.entries {
+					delete(sh.entries, k)
 					break
 				}
 			}
 		}
 	}
-	nc.entries[nonce] = now
-	nc.pushRingLocked(nonce, now)
+	sh.entries[key] = nowNano
+	sh.pushRingLocked(key, nowNano, maxEntries)
 	return true
 }
 
-func (nc *NonceCache) pushRingLocked(nonce string, now time.Time) {
-	if nc.ringLen == len(nc.ring) {
-		newCap := len(nc.ring) * 2
+func (sh *nonceShard) pushRingLocked(key [16]byte, nowNano int64, maxEntries int) {
+	if sh.ringLen == len(sh.ring) {
+		newCap := len(sh.ring) * 2
 		if newCap < 64 {
 			newCap = 64
 		}
-		if nc.maxEntries > 0 && newCap > nc.maxEntries {
-			newCap = nc.maxEntries
+		if maxEntries > 0 && newCap > maxEntries {
+			newCap = maxEntries
 		}
-		if newCap <= len(nc.ring) {
-			newCap = len(nc.ring) + 1
+		if newCap <= len(sh.ring) {
+			newCap = len(sh.ring) + 1
 		}
-		newRing := make([]nonceRecord, newCap)
-		for i := 0; i < nc.ringLen; i++ {
-			newRing[i] = nc.ring[(nc.ringHead+i)%len(nc.ring)]
+		newRing := make([]nonceBinRecord, newCap)
+		if sh.ringLen > 0 {
+			first := len(sh.ring) - sh.ringHead
+			if first > sh.ringLen {
+				first = sh.ringLen
+			}
+			copy(newRing, sh.ring[sh.ringHead:sh.ringHead+first])
+			if first < sh.ringLen {
+				copy(newRing[first:], sh.ring[:sh.ringLen-first])
+			}
 		}
-		nc.ring = newRing
-		nc.ringHead = 0
+		sh.ring = newRing
+		sh.ringHead = 0
 	}
-	tail := (nc.ringHead + nc.ringLen) % len(nc.ring)
-	nc.ring[tail] = nonceRecord{key: nonce, insertedAt: now}
-	nc.ringLen++
+	tail := (sh.ringHead + sh.ringLen) % len(sh.ring)
+	sh.ring[tail] = nonceBinRecord{key: key, insertedAt: nowNano}
+	sh.ringLen++
 }
 
-func (nc *NonceCache) popOldestLocked() bool {
-	if nc.ringLen == 0 {
+func (sh *nonceShard) popOldestLocked() bool {
+	if sh.ringLen == 0 {
 		return false
 	}
-	rec := nc.ring[nc.ringHead]
-	nc.ring[nc.ringHead] = nonceRecord{}
-	nc.ringHead = (nc.ringHead + 1) % len(nc.ring)
-	nc.ringLen--
-	if exp, ok := nc.entries[rec.key]; ok && exp.Equal(rec.insertedAt) {
-		delete(nc.entries, rec.key)
+	rec := sh.ring[sh.ringHead]
+	sh.ringHead = (sh.ringHead + 1) % len(sh.ring)
+	sh.ringLen--
+	if exp, ok := sh.entries[rec.key]; ok && exp == rec.insertedAt {
+		delete(sh.entries, rec.key)
 	}
 	return true
 }
 
-// pruneLocked removes expired entries from the head of the FIFO ring in O(1) amortized time.
-// nc.mu must be held.
-func (nc *NonceCache) pruneLocked(now time.Time) {
-	cutoff := now.Add(-nc.ttl)
-	for nc.ringLen > 0 {
-		head := nc.ring[nc.ringHead]
-		if !head.insertedAt.Before(cutoff) {
+func (sh *nonceShard) pruneLocked(cutoff int64) {
+	for sh.ringLen > 0 {
+		head := sh.ring[sh.ringHead]
+		if head.insertedAt >= cutoff {
 			break
 		}
-		nc.popOldestLocked()
+		sh.popOldestLocked()
 	}
-	if nc.ringLen == 0 && len(nc.entries) > 0 {
-		for k, t := range nc.entries {
-			if t.Before(cutoff) {
-				delete(nc.entries, k)
+	if sh.ringLen == 0 && len(sh.entries) > 0 {
+		for k, t := range sh.entries {
+			if t < cutoff {
+				delete(sh.entries, k)
+			}
+		}
+	}
+}
+
+func (sh *nonceStrShard) addLocked(key string, nowNano, cutoff int64, maxEntries int) bool {
+	sh.pruneLocked(cutoff)
+	if sh.entries != nil {
+		if exp, exists := sh.entries[key]; exists {
+			if exp >= cutoff {
+				return false
+			}
+			delete(sh.entries, key)
+		}
+	} else {
+		sh.entries = make(map[string]int64, 16)
+	}
+	if maxEntries > 0 {
+		for len(sh.entries) >= maxEntries {
+			if !sh.popOldestLocked() {
+				for k := range sh.entries {
+					delete(sh.entries, k)
+					break
+				}
+			}
+		}
+	}
+	sh.entries[key] = nowNano
+	sh.pushRingLocked(key, nowNano, maxEntries)
+	return true
+}
+
+func (sh *nonceStrShard) pushRingLocked(key string, nowNano int64, maxEntries int) {
+	if sh.ringLen == len(sh.ring) {
+		newCap := len(sh.ring) * 2
+		if newCap < 16 {
+			newCap = 16
+		}
+		if maxEntries > 0 && newCap > maxEntries {
+			newCap = maxEntries
+		}
+		if newCap <= len(sh.ring) {
+			newCap = len(sh.ring) + 1
+		}
+		newRing := make([]nonceStrRecord, newCap)
+		if sh.ringLen > 0 {
+			first := len(sh.ring) - sh.ringHead
+			if first > sh.ringLen {
+				first = sh.ringLen
+			}
+			copy(newRing, sh.ring[sh.ringHead:sh.ringHead+first])
+			if first < sh.ringLen {
+				copy(newRing[first:], sh.ring[:sh.ringLen-first])
+			}
+		}
+		sh.ring = newRing
+		sh.ringHead = 0
+	}
+	tail := (sh.ringHead + sh.ringLen) % len(sh.ring)
+	sh.ring[tail] = nonceStrRecord{key: key, insertedAt: nowNano}
+	sh.ringLen++
+}
+
+func (sh *nonceStrShard) popOldestLocked() bool {
+	if sh.ringLen == 0 {
+		return false
+	}
+	rec := sh.ring[sh.ringHead]
+	sh.ring[sh.ringHead] = nonceStrRecord{}
+	sh.ringHead = (sh.ringHead + 1) % len(sh.ring)
+	sh.ringLen--
+	if exp, ok := sh.entries[rec.key]; ok && exp == rec.insertedAt {
+		delete(sh.entries, rec.key)
+	}
+	return true
+}
+
+func (sh *nonceStrShard) pruneLocked(cutoff int64) {
+	for sh.ringLen > 0 {
+		head := sh.ring[sh.ringHead]
+		if head.insertedAt >= cutoff {
+			break
+		}
+		sh.popOldestLocked()
+	}
+	if sh.ringLen == 0 && len(sh.entries) > 0 {
+		for k, t := range sh.entries {
+			if t < cutoff {
+				delete(sh.entries, k)
 			}
 		}
 	}
@@ -149,33 +329,56 @@ func (nc *NonceCache) pruneLocked(now time.Time) {
 func (nc *NonceCache) evictLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		nc.mu.Lock()
-		nc.pruneLocked(time.Now())
-		nc.mu.Unlock()
+	for {
+		select {
+		case <-nc.stopCh:
+			return
+		case <-ticker.C:
+			cutoff := time.Now().UnixNano() - nc.ttl.Nanoseconds()
+			for i := range nc.shards {
+				sh := &nc.shards[i]
+				sh.mu.Lock()
+				if sh.ringLen > 0 || len(sh.entries) > 0 {
+					sh.pruneLocked(cutoff)
+				}
+				sh.mu.Unlock()
+			}
+			nc.fallback.mu.Lock()
+			if nc.fallback.ringLen > 0 || len(nc.fallback.entries) > 0 {
+				nc.fallback.pruneLocked(cutoff)
+			}
+			nc.fallback.mu.Unlock()
+		}
 	}
 }
 
 // StripAuthHeaders removes fronting-only request metadata before a decoy proxy
 // forwards unauthenticated traffic to a normal origin.
 func StripAuthHeaders(h http.Header) {
-	h.Del(headerVersion)
-	h.Del(headerDate)
-	h.Del(headerNonce)
-	h.Del(headerAuth)
-	h.Del(HeaderSessionID)
-	h.Del(HeaderStreamSeq)
+	delete(h, headerVersion)
+	delete(h, headerDate)
+	delete(h, headerNonce)
+	delete(h, headerAuth)
+	delete(h, HeaderSessionID)
+	delete(h, HeaderStreamSeq)
 }
 
 var staticAuthVersionSlice = []string{authVersion}
 
-// SignRequest adds HTTP-layer authentication headers. When HeaderSessionID or
-// HeaderStreamSeq are set on req, they are bound into the HMAC signature.
-func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
-	var rawNonce [16]byte
-	if _, err := rand.Read(rawNonce[:]); err != nil {
-		return fmt.Errorf("fronting: nonce: %w", err)
+func firstHeader(h http.Header, canonicalKey string) string {
+	if h == nil {
+		return ""
 	}
+	if v := h[canonicalKey]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+// SignRequestWithRawNonce adds HTTP-layer authentication headers using a
+// caller-supplied 128-bit cryptographic nonce. When HeaderSessionID or
+// HeaderStreamSeq are set on req, they are bound into the HMAC signature.
+func SignRequestWithRawNonce(req *http.Request, key [32]byte, now time.Time, rawNonce [16]byte) {
 	var nonceHex [32]byte
 	hex.Encode(nonceHex[:], rawNonce[:])
 	nonce := string(nonceHex[:])
@@ -183,8 +386,8 @@ func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
 	var tsBuf [24]byte
 	ts := string(strconv.AppendInt(tsBuf[:0], now.Unix(), 10))
 
-	sid := req.Header.Get(HeaderSessionID)
-	seq := req.Header.Get(HeaderStreamSeq)
+	sid := firstHeader(req.Header, HeaderSessionID)
+	seq := firstHeader(req.Header, HeaderStreamSeq)
 
 	req.Header[headerVersion] = staticAuthVersionSlice
 	req.Header[headerDate] = []string{ts}
@@ -195,6 +398,16 @@ func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
 	copy(authBuf[:], sigPrefix)
 	hex.Encode(authBuf[len(sigPrefix):], sum[:])
 	req.Header[headerAuth] = []string{string(authBuf[:])}
+}
+
+// SignRequest adds HTTP-layer authentication headers. When HeaderSessionID or
+// HeaderStreamSeq are set on req, they are bound into the HMAC signature.
+func SignRequest(req *http.Request, key [32]byte, now time.Time) error {
+	var rawNonce [16]byte
+	if _, err := rand.Read(rawNonce[:]); err != nil {
+		return fmt.Errorf("fronting: nonce: %w", err)
+	}
+	SignRequestWithRawNonce(req, key, now, rawNonce)
 	return nil
 }
 
@@ -204,12 +417,12 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 	if len(keys) == 0 {
 		return false
 	}
-	if req.Header.Get(headerVersion) != authVersion {
+	if firstHeader(req.Header, headerVersion) != authVersion {
 		return false
 	}
-	ts := req.Header.Get(headerDate)
-	nonce := req.Header.Get(headerNonce)
-	authHeader := req.Header.Get(headerAuth)
+	ts := firstHeader(req.Header, headerDate)
+	nonce := firstHeader(req.Header, headerNonce)
+	authHeader := firstHeader(req.Header, headerAuth)
 	if ts == "" || nonce == "" || authHeader == "" {
 		return false
 	}
@@ -237,8 +450,8 @@ func VerifyRequest(req *http.Request, keys [][32]byte, now time.Time, skew time.
 		return false
 	}
 
-	sid := req.Header.Get(HeaderSessionID)
-	seq := req.Header.Get(HeaderStreamSeq)
+	sid := firstHeader(req.Header, HeaderSessionID)
+	seq := firstHeader(req.Header, HeaderStreamSeq)
 	if sid != "" {
 		if len(sid) < 16 || len(sid) > 64 || len(sid)%2 != 0 || !isHexString(sid) {
 			return false
@@ -352,6 +565,21 @@ func isHexString(s string) bool {
 		if _, ok := decodeHexNibble(s[i]); !ok {
 			return false
 		}
+	}
+	return true
+}
+
+func decodeHex16(s string, dst *[16]byte) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < 16; i++ {
+		hi, ok1 := decodeHexNibble(s[i*2])
+		lo, ok2 := decodeHexNibble(s[i*2+1])
+		if !ok1 || !ok2 {
+			return false
+		}
+		dst[i] = (hi << 4) | lo
 	}
 	return true
 }

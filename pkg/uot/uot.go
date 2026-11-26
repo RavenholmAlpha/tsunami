@@ -29,6 +29,7 @@ const (
 	resolveCacheTTL        = 30 * time.Second
 	maxResolveCacheEntries = 256
 	uotUDPSocketBufBytes   = 4 << 20
+	uotStreamReadBufBytes  = 64 * 1024
 )
 
 // UDPPacket represents a single UDP packet in the UoT stream.
@@ -50,12 +51,15 @@ type Relay struct {
 	udpConn   *net.UDPConn
 	closeOnce sync.Once
 
-	// NAT mapping: remote AddrPort -> last seen UnixNano
-	natTable     map[netip.AddrPort]int64
-	resolveCache map[string]cachedUDPAddr
-	natTimeout   time.Duration
-	mu           sync.Mutex
-	resolve      func(string) (*net.UDPAddr, error) // resolves and validates the destination
+	// NAT mapping: remote AddrPort -> last seen UnixNano (shared across streamToUDP & udpToStream)
+	natTable   map[netip.AddrPort]int64
+	natTimeout time.Duration
+	mu         sync.Mutex
+
+	// Per-relay resolve caches owned exclusively by the streamToUDP goroutine.
+	resolveCache   map[string]cachedUDPAddr
+	ipResolveCache map[netip.AddrPort]cachedUDPAddr
+	resolve        func(string) (*net.UDPAddr, error) // resolves and validates the destination
 }
 
 // NewRelay creates a new UoT relay for the given stream. resolve resolves a
@@ -63,11 +67,12 @@ type Relay struct {
 // any destination.
 func NewRelay(stream io.ReadWriteCloser, resolve func(string) (*net.UDPAddr, error)) *Relay {
 	return &Relay{
-		stream:       stream,
-		natTable:     make(map[netip.AddrPort]int64),
-		resolveCache: make(map[string]cachedUDPAddr),
-		natTimeout:   120 * time.Second,
-		resolve:      resolve,
+		stream:         stream,
+		natTable:       make(map[netip.AddrPort]int64),
+		resolveCache:   make(map[string]cachedUDPAddr),
+		ipResolveCache: make(map[netip.AddrPort]cachedUDPAddr),
+		natTimeout:     120 * time.Second,
+		resolve:        resolve,
 	}
 }
 
@@ -114,21 +119,39 @@ func (r *Relay) Run() error {
 	return nil
 }
 
-func (r *Relay) resolveCached(target string, now time.Time) (netip.AddrPort, bool) {
+func (r *Relay) natRefreshStepNs() int64 {
+	step := r.natTimeout / 4
+	if step > time.Second {
+		step = time.Second
+	}
+	if step <= 0 {
+		return 0
+	}
+	return step.Nanoseconds()
+}
+
+func (r *Relay) touchNAT(ap netip.AddrPort, nowNs int64, lastAP *netip.AddrPort, lastTouchNs *int64, refreshStepNs int64) {
+	if ap == *lastAP && refreshStepNs > 0 && nowNs-*lastTouchNs < refreshStepNs {
+		return
+	}
+	r.mu.Lock()
+	r.natTable[ap] = nowNs
+	r.mu.Unlock()
+	*lastAP = ap
+	*lastTouchNs = nowNs
+}
+
+func (r *Relay) resolveDomainCached(target string, now time.Time) (netip.AddrPort, bool) {
 	if r.resolve == nil {
 		return netip.AddrPort{}, false
 	}
 
-	r.mu.Lock()
 	if cached, ok := r.resolveCache[target]; ok {
 		if now.Before(cached.expireAt) {
-			r.natTable[cached.addrPort] = now.UnixNano()
-			r.mu.Unlock()
 			return cached.addrPort, true
 		}
 		delete(r.resolveCache, target)
 	}
-	r.mu.Unlock()
 
 	udpAddr, err := r.resolve(target)
 	if err != nil || udpAddr == nil {
@@ -140,7 +163,6 @@ func (r *Relay) resolveCached(target string, now time.Time) (netip.AddrPort, boo
 	}
 	ap := netip.AddrPortFrom(addr.Unmap(), uint16(udpAddr.Port))
 
-	r.mu.Lock()
 	if len(r.resolveCache) >= maxResolveCacheEntries {
 		for k, v := range r.resolveCache {
 			if !now.Before(v.expireAt) {
@@ -155,55 +177,172 @@ func (r *Relay) resolveCached(target string, now time.Time) (netip.AddrPort, boo
 		}
 	}
 	r.resolveCache[target] = cachedUDPAddr{addrPort: ap, expireAt: now.Add(resolveCacheTTL)}
-	r.natTable[ap] = now.UnixNano()
-	r.mu.Unlock()
 	return ap, true
 }
 
-// streamToUDP reads UoT packets from the stream and sends them as UDP.
-func (r *Relay) streamToUDP() {
+func (r *Relay) resolveIPCached(rawAP netip.AddrPort, now time.Time) (netip.AddrPort, bool) {
+	if r.resolve == nil {
+		return netip.AddrPort{}, false
+	}
+
+	if cached, ok := r.ipResolveCache[rawAP]; ok {
+		if now.Before(cached.expireAt) {
+			return cached.addrPort, true
+		}
+		delete(r.ipResolveCache, rawAP)
+	}
+
+	// Format address string only once on cache miss to invoke the policy resolver.
+	udpAddr, err := r.resolve(rawAP.String())
+	if err != nil || udpAddr == nil {
+		return netip.AddrPort{}, false
+	}
+	addr, ok := netip.AddrFromSlice(udpAddr.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	ap := netip.AddrPortFrom(addr.Unmap(), uint16(udpAddr.Port))
+
+	if len(r.ipResolveCache) >= maxResolveCacheEntries {
+		for k, v := range r.ipResolveCache {
+			if !now.Before(v.expireAt) {
+				delete(r.ipResolveCache, k)
+			}
+		}
+		if len(r.ipResolveCache) >= maxResolveCacheEntries {
+			for k := range r.ipResolveCache {
+				delete(r.ipResolveCache, k)
+				break
+			}
+		}
+	}
+	r.ipResolveCache[rawAP] = cachedUDPAddr{addrPort: ap, expireAt: now.Add(resolveCacheTTL)}
+	return ap, true
+}
+
+// readUoTPacket decodes one UoT packet directly from br into payloadBuf.
+// IPv4/IPv6 destinations are decoded straight into netip.AddrPort with zero
+// string allocations.
+func readUoTPacket(br *bufio.Reader, payloadBuf []byte, domainScratch *[258]byte) (ap netip.AddrPort, domainTarget string, isIP bool, data []byte, err error) {
+	atyp, err := br.ReadByte()
+	if err != nil {
+		return netip.AddrPort{}, "", false, nil, err
+	}
+
+	var dataLen int
+	switch atyp {
+	case protocol.AtypIPv4:
+		var hdr [8]byte // 4B IPv4 + 2B port + 2B length
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return netip.AddrPort{}, "", false, nil, err
+		}
+		ip := netip.AddrFrom4([4]byte(hdr[:4]))
+		port := binary.BigEndian.Uint16(hdr[4:6])
+		dataLen = int(binary.BigEndian.Uint16(hdr[6:8]))
+		ap = netip.AddrPortFrom(ip, port)
+		isIP = true
+
+	case protocol.AtypIPv6:
+		var hdr [20]byte // 16B IPv6 + 2B port + 2B length
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return netip.AddrPort{}, "", false, nil, err
+		}
+		ip := netip.AddrFrom16([16]byte(hdr[:16])).Unmap()
+		port := binary.BigEndian.Uint16(hdr[16:18])
+		dataLen = int(binary.BigEndian.Uint16(hdr[18:20]))
+		ap = netip.AddrPortFrom(ip, port)
+		isIP = true
+
+	case protocol.AtypDomain:
+		domainLenByte, err := br.ReadByte()
+		if err != nil {
+			return netip.AddrPort{}, "", false, nil, err
+		}
+		domainLen := int(domainLenByte)
+		// Read domain + 2B port + 2B length in one call.
+		if _, err := io.ReadFull(br, domainScratch[:domainLen+4]); err != nil {
+			return netip.AddrPort{}, "", false, nil, err
+		}
+		port := binary.BigEndian.Uint16(domainScratch[domainLen : domainLen+2])
+		dataLen = int(binary.BigEndian.Uint16(domainScratch[domainLen+2 : domainLen+4]))
+		var out [272]byte
+		b := append(out[:0], domainScratch[:domainLen]...)
+		b = append(b, ':')
+		b = strconv.AppendUint(b, uint64(port), 10)
+		domainTarget = string(b)
+
+	default:
+		return netip.AddrPort{}, "", false, nil, fmt.Errorf("uot: unknown ATYP: 0x%02x", atyp)
+	}
+
+	data = payloadBuf[:dataLen]
+	if _, err := io.ReadFull(br, data); err != nil {
+		return netip.AddrPort{}, "", false, nil, err
+	}
+	return ap, domainTarget, isIP, data, nil
+}
+
+// hasCompleteBufferedUoTPacket checks via Peek whether br already holds a
+// complete UoT packet in memory so batch sendmmsg never blocks waiting for a 2nd packet.
+func hasCompleteBufferedUoTPacket(br *bufio.Reader) bool {
+	avail := br.Buffered()
+	if avail < 1+4+2+2 {
+		return false
+	}
+	peeked, err := br.Peek(avail)
+	if err != nil || len(peeked) < 1+4+2+2 {
+		return false
+	}
+	var hdrLen int
+	switch peeked[0] {
+	case protocol.AtypIPv4:
+		hdrLen = 1 + 4 + 2 + 2
+	case protocol.AtypIPv6:
+		hdrLen = 1 + 16 + 2 + 2
+	case protocol.AtypDomain:
+		hdrLen = 1 + 1 + int(peeked[1]) + 2 + 2
+	default:
+		return false
+	}
+	if len(peeked) < hdrLen {
+		return false
+	}
+	dataLen := int(binary.BigEndian.Uint16(peeked[hdrLen-2 : hdrLen]))
+	return len(peeked) >= hdrLen+dataLen
+}
+
+// streamToUDPSingle reads UoT packets from the stream and sends them as UDP
+// using a 64 KiB buffered reader and zero-string IP resolution cache.
+func (r *Relay) streamToUDPSingle() {
 	defer r.cleanupNAT()
 
-	// Use a compact 4 KiB reader instead of 64 KiB: protocol.Stream already
-	// buffers frames in memory, while 4 KiB coalesces small tests/pipes cleanly.
-	br := bufio.NewReaderSize(r.stream, 4*1024)
+	br := bufio.NewReaderSize(r.stream, uotStreamReadBufBytes)
 	payloadBuf := make([]byte, 65535)
 	var domainScratch [258]byte
+	var lastAP netip.AddrPort
+	var lastTouchNs int64
+	refreshStepNs := r.natRefreshStepNs()
 
 	for {
-		// Read ATYP
-		atyp, err := br.ReadByte()
+		rawAP, domainTarget, isIP, data, err := readUoTPacket(br, payloadBuf, &domainScratch)
 		if err != nil {
 			return
 		}
-
-		// Decode address
-		target, err := readSocksAddrScratch(br, atyp, &domainScratch)
-		if err != nil {
-			return
-		}
-
-		// Read data length
-		var lenBuf [2]byte
-		if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
-			return
-		}
-		dataLen := int(binary.BigEndian.Uint16(lenBuf[:]))
-
-		// Read data into reusable buffer
-		data := payloadBuf[:dataLen]
-		if _, err := io.ReadFull(br, data); err != nil {
-			return
-		}
-
 		if r.resolve == nil {
 			continue
 		}
 		now := time.Now()
-		ap, ok := r.resolveCached(target, now)
+		var ap netip.AddrPort
+		var ok bool
+		if isIP {
+			ap, ok = r.resolveIPCached(rawAP, now)
+		} else {
+			ap, ok = r.resolveDomainCached(domainTarget, now)
+		}
 		if !ok {
 			continue
 		}
+		r.touchNAT(ap, now.UnixNano(), &lastAP, &lastTouchNs, refreshStepNs)
 		_, _ = r.udpConn.WriteToUDPAddrPort(data, ap)
 	}
 }
@@ -218,7 +357,12 @@ func (r *Relay) udpToStreamSingle() {
 	if deadlineStep > time.Second {
 		deadlineStep = time.Second
 	}
+	sweepStepNs := (30 * time.Second).Nanoseconds()
+	if half := (r.natTimeout / 2).Nanoseconds(); half > 0 && half < sweepStepNs {
+		sweepStepNs = half
+	}
 	var lastDeadlineSet time.Time
+	lastSweepNs := time.Now().UnixNano()
 	timeoutNs := r.natTimeout.Nanoseconds()
 
 	for {
@@ -234,13 +378,21 @@ func (r *Relay) udpToStreamSingle() {
 		}
 		ap := netip.AddrPortFrom(remoteAP.Addr().Unmap(), remoteAP.Port())
 
-		// Check NAT table (with expiry)
+		// Check NAT table (with expiry and periodic sweep)
 		nowNs := time.Now().UnixNano()
 		r.mu.Lock()
 		lastSeenNs, exists := r.natTable[ap]
 		if exists && nowNs-lastSeenNs > timeoutNs {
 			delete(r.natTable, ap)
 			exists = false
+		}
+		if nowNs-lastSweepNs >= sweepStepNs {
+			lastSweepNs = nowNs
+			for k, v := range r.natTable {
+				if nowNs-v > timeoutNs {
+					delete(r.natTable, k)
+				}
+			}
 		}
 		r.mu.Unlock()
 		if !exists {
@@ -272,71 +424,28 @@ func (r *Relay) udpToStreamSingle() {
 	}
 }
 
-func readSocksAddrScratch(r io.Reader, atyp byte, domainScratch *[258]byte) (string, error) {
-	switch atyp {
-	case protocol.AtypIPv4:
-		var buf [6]byte
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return "", err
-		}
-		ip := netip.AddrFrom4([4]byte(buf[:4]))
-		port := binary.BigEndian.Uint16(buf[4:6])
-		var out [32]byte
-		b := ip.AppendTo(out[:0])
-		b = append(b, ':')
-		b = strconv.AppendUint(b, uint64(port), 10)
-		return string(b), nil
-
-	case protocol.AtypDomain:
-		var lenBuf [1]byte
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			return "", err
-		}
-		domainLen := int(lenBuf[0])
-		if _, err := io.ReadFull(r, domainScratch[:domainLen+2]); err != nil {
-			return "", err
-		}
-		port := binary.BigEndian.Uint16(domainScratch[domainLen : domainLen+2])
-		var out [272]byte
-		b := append(out[:0], domainScratch[:domainLen]...)
-		b = append(b, ':')
-		b = strconv.AppendUint(b, uint64(port), 10)
-		return string(b), nil
-
-	case protocol.AtypIPv6:
-		var buf [18]byte
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return "", err
-		}
-		ip := netip.AddrFrom16([16]byte(buf[:16]))
-		port := binary.BigEndian.Uint16(buf[16:18])
-		var out [64]byte
-		b := append(out[:0], '[')
-		b = ip.AppendTo(b)
-		b = append(b, ']', ':')
-		b = strconv.AppendUint(b, uint64(port), 10)
-		return string(b), nil
-
-	default:
-		return "", fmt.Errorf("uot: unknown ATYP: 0x%02x", atyp)
-	}
-}
-
-// cleanupNAT removes all expired entries from the NAT table and resolve cache.
+// cleanupNAT removes all expired entries from the NAT table and resolve caches.
 func (r *Relay) cleanupNAT() {
-	r.mu.Lock()
 	now := time.Now()
 	nowNs := now.UnixNano()
 	timeoutNs := r.natTimeout.Nanoseconds()
+
+	r.mu.Lock()
 	for k, v := range r.natTable {
 		if nowNs-v > timeoutNs {
 			delete(r.natTable, k)
 		}
 	}
+	r.mu.Unlock()
+
 	for k, v := range r.resolveCache {
 		if !now.Before(v.expireAt) {
 			delete(r.resolveCache, k)
 		}
 	}
-	r.mu.Unlock()
+	for k, v := range r.ipResolveCache {
+		if !now.Before(v.expireAt) {
+			delete(r.ipResolveCache, k)
+		}
+	}
 }

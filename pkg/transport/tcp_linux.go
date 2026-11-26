@@ -14,9 +14,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const defaultTCPNotSentLowat = 32 * 1024
+const defaultTCPNotSentLowat = 128 * 1024
 
-var bbrWarnOnce sync.Once
+var (
+	bbrWarnOnce    sync.Once
+	sysctlCacheMu  sync.Mutex
+	sysctlIntCache = make(map[string]int)
+)
 
 func applyTCPBuffers(conn *net.TCPConn, cfg *TCPConfig) error {
 	rawConn, err := conn.SyscallConn()
@@ -66,11 +70,25 @@ func setLinuxSocketBuffer(fd int, opt int, forceOpt int, size int, maxPath strin
 }
 
 func readLinuxSysctlInt(path string) (int, error) {
+	sysctlCacheMu.Lock()
+	if v, ok := sysctlIntCache[path]; ok {
+		sysctlCacheMu.Unlock()
+		return v, nil
+	}
+	sysctlCacheMu.Unlock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
+	v, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, err
+	}
+	sysctlCacheMu.Lock()
+	sysctlIntCache[path] = v
+	sysctlCacheMu.Unlock()
+	return v, nil
 }
 
 // applyLinuxTCPOptions applies Linux-specific TCP tuning: BBR congestion control.

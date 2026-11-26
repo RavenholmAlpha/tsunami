@@ -74,11 +74,17 @@ var writeCoalesceBufPool = sync.Pool{
 	},
 }
 
+// AlignedRelayPayloadLen is the maximum single-frame payload whose wire length
+// (FrameHeaderLen + AlignedRelayPayloadLen = 65536 = 4 * 16384) aligns cleanly
+// to TLS 1.2/1.3 16 KiB records without emitting a 6-byte trailing runt record.
+const AlignedRelayPayloadLen = 4*16384 - FrameHeaderLen
+
 const (
-	recvPoolSmallCap  = 4 * 1024
-	recvPoolMediumCap = 16 * 1024
-	recvPoolLargeCap  = MaxFrameDataLen
-	maxCoalescePool   = 512 * 1024
+	recvPoolSmallCap    = 4 * 1024
+	recvPoolMediumCap   = 16 * 1024
+	recvPoolMidLargeCap = 32 * 1024
+	recvPoolLargeCap    = MaxFrameDataLen
+	maxCoalescePool     = 512 * 1024
 )
 
 var (
@@ -91,6 +97,12 @@ var (
 	recvPoolMedium = sync.Pool{
 		New: func() any {
 			buf := make([]byte, recvPoolMediumCap)
+			return &buf
+		},
+	}
+	recvPoolMidLarge = sync.Pool{
+		New: func() any {
+			buf := make([]byte, recvPoolMidLargeCap)
 			return &buf
 		},
 	}
@@ -109,6 +121,8 @@ func getRecvPayloadBuf(n int) (*[]byte, []byte) {
 		bufp = recvPoolSmall.Get().(*[]byte)
 	case n <= recvPoolMediumCap:
 		bufp = recvPoolMedium.Get().(*[]byte)
+	case n <= recvPoolMidLargeCap:
+		bufp = recvPoolMidLarge.Get().(*[]byte)
 	default:
 		bufp = recvPoolLarge.Get().(*[]byte)
 	}
@@ -126,6 +140,9 @@ func putRecvPayloadBuf(bufp *[]byte) {
 	case recvPoolMediumCap:
 		*bufp = (*bufp)[:recvPoolMediumCap]
 		recvPoolMedium.Put(bufp)
+	case recvPoolMidLargeCap:
+		*bufp = (*bufp)[:recvPoolMidLargeCap]
+		recvPoolMidLarge.Put(bufp)
 	case recvPoolLargeCap:
 		*bufp = (*bufp)[:recvPoolLargeCap]
 		recvPoolLarge.Put(bufp)
@@ -214,7 +231,8 @@ func NewWasteFrame(size int) *Frame {
 
 // FrameWriter provides buffered frame writing with optional padding support.
 type FrameWriter struct {
-	w io.Writer
+	w        io.Writer
+	smallBuf [256]byte
 }
 
 // NewFrameWriter creates a new FrameWriter.
@@ -224,6 +242,23 @@ func NewFrameWriter(w io.Writer) *FrameWriter {
 
 // WriteFrame encodes and writes a single frame.
 func (fw *FrameWriter) WriteFrame(f *Frame) error {
+	if f == nil {
+		return ErrInvalidFrame
+	}
+	dataLen := len(f.Data)
+	if dataLen > MaxFrameDataLen {
+		return ErrFrameTooLarge
+	}
+	if FrameHeaderLen+dataLen <= len(fw.smallBuf) {
+		fw.smallBuf[0] = byte(f.Command)
+		binary.BigEndian.PutUint32(fw.smallBuf[1:5], f.StreamID)
+		binary.BigEndian.PutUint16(fw.smallBuf[5:7], uint16(dataLen))
+		if dataLen > 0 {
+			copy(fw.smallBuf[FrameHeaderLen:], f.Data)
+		}
+		_, err := fw.w.Write(fw.smallBuf[:FrameHeaderLen+dataLen])
+		return err
+	}
 	return EncodeFrame(fw.w, f)
 }
 
@@ -238,6 +273,23 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 			return ErrFrameTooLarge
 		}
 		totalLen += FrameHeaderLen + len(f.Data)
+	}
+	if totalLen == 0 {
+		return nil
+	}
+	if totalLen <= len(fw.smallBuf) {
+		off := 0
+		for _, f := range frames {
+			fw.smallBuf[off] = byte(f.Command)
+			binary.BigEndian.PutUint32(fw.smallBuf[off+1:off+5], f.StreamID)
+			binary.BigEndian.PutUint16(fw.smallBuf[off+5:off+7], uint16(len(f.Data)))
+			off += FrameHeaderLen
+			if len(f.Data) > 0 {
+				off += copy(fw.smallBuf[off:], f.Data)
+			}
+		}
+		_, err := fw.w.Write(fw.smallBuf[:off])
+		return err
 	}
 
 	bufp := writeCoalesceBufPool.Get().(*[]byte)
@@ -268,10 +320,11 @@ func (fw *FrameWriter) WriteFrames(frames []*Frame) error {
 
 // FrameReader provides frame reading from a connection.
 type FrameReader struct {
-	r       io.Reader
-	waste   []byte
-	scratch Frame
-	ctrlBuf [64]byte
+	r         io.Reader
+	waste     []byte
+	scratch   Frame
+	headerBuf [FrameHeaderLen]byte
+	ctrlBuf   [64]byte
 }
 
 // NewFrameReader creates a new FrameReader.
@@ -294,14 +347,13 @@ func (fr *FrameReader) ReadFrame() (*Frame, error) {
 }
 
 func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
-	var header [FrameHeaderLen]byte
-	if _, err := io.ReadFull(fr.r, header[:]); err != nil {
+	if _, err := io.ReadFull(fr.r, fr.headerBuf[:]); err != nil {
 		return nil, nil, fmt.Errorf("tsunami: read frame header: %w", err)
 	}
 
-	cmd := Command(header[0])
-	streamID := binary.BigEndian.Uint32(header[1:5])
-	dataLen := int(binary.BigEndian.Uint16(header[5:7]))
+	cmd := Command(fr.headerBuf[0])
+	streamID := binary.BigEndian.Uint32(fr.headerBuf[1:5])
+	dataLen := int(binary.BigEndian.Uint16(fr.headerBuf[5:7]))
 
 	if dataLen == 0 {
 		fr.scratch = Frame{Command: cmd, StreamID: streamID}
@@ -309,11 +361,19 @@ func (fr *FrameReader) readFramePooled() (*Frame, *[]byte, error) {
 	}
 
 	if cmd == CmdWaste {
-		if cap(fr.waste) < dataLen {
-			fr.waste = make([]byte, dataLen)
+		if len(fr.waste) == 0 {
+			fr.waste = make([]byte, 4096)
 		}
-		if _, err := io.ReadFull(fr.r, fr.waste[:dataLen]); err != nil {
-			return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+		rem := dataLen
+		for rem > 0 {
+			chunk := rem
+			if chunk > len(fr.waste) {
+				chunk = len(fr.waste)
+			}
+			if _, err := io.ReadFull(fr.r, fr.waste[:chunk]); err != nil {
+				return nil, nil, fmt.Errorf("tsunami: read frame data: %w", err)
+			}
+			rem -= chunk
 		}
 		fr.scratch = Frame{Command: CmdWaste}
 		return &fr.scratch, nil, nil

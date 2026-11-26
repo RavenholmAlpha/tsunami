@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	websocketGUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	wsPooledFrameBufCap = 72 * 1024
-	wsReadBufSize       = 32 * 1024
+	websocketGUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	wsMaxWriteFramePayload = 64 * 1024
+	wsPooledFrameBufCap    = 72 * 1024
+	wsReadBufSize          = 32 * 1024
 )
 
 var wsWriteBufPool = sync.Pool{
@@ -70,7 +71,16 @@ func UpgradeServer(w http.ResponseWriter, r *http.Request, serverHeader string) 
 		return nil, err
 	}
 
-	return NewWebSocketConn(conn, brw.Reader, false), nil
+	// Replace net/http's 4 KiB hijack bufio.Reader with a 32 KiB reader so server
+	// WebSocket reads coalesce TLS records instead of issuing 8x tiny reads.
+	var reader *bufio.Reader
+	if buffered := brw.Reader.Buffered(); buffered > 0 {
+		reader = bufio.NewReaderSize(io.MultiReader(io.LimitReader(brw.Reader, int64(buffered)), conn), wsReadBufSize)
+	} else {
+		reader = bufio.NewReaderSize(conn, wsReadBufSize)
+	}
+
+	return NewWebSocketConn(conn, reader, false), nil
 }
 
 // ClientWebSocketHandshake performs a WebSocket client handshake on conn using
@@ -162,25 +172,38 @@ func NewWebSocketConn(conn net.Conn, reader *bufio.Reader, maskWrites bool) *Web
 }
 
 func (c *WebSocketConn) Read(p []byte) (int, error) {
-	for len(c.readBuf) == 0 {
-		payload, err := c.readFrame()
-		if err != nil {
-			return 0, err
-		}
-		c.readBuf = payload
+	if len(c.readBuf) > 0 {
+		n := copy(p, c.readBuf)
+		c.readBuf = c.readBuf[n:]
+		return n, nil
 	}
-	n := copy(p, c.readBuf)
-	c.readBuf = c.readBuf[n:]
-	return n, nil
+	return c.readFrameInto(p)
 }
 
 func (c *WebSocketConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if err := c.writeFrame(0x2, p); err != nil {
-		return 0, err
+	// Keep each binary frame <= 64 KiB so it always fits wsWriteBufPool on TX,
+	// avoids giant heap allocations when TSUNAMI coalesces multi-stream batches,
+	// and matches browser WebSocket frame sizes.
+	if len(p) <= wsMaxWriteFramePayload {
+		if err := c.writeFrame(0x2, p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
 	}
-	return len(p), nil
+	written := 0
+	for written < len(p) {
+		end := written + wsMaxWriteFramePayload
+		if end > len(p) {
+			end = len(p)
+		}
+		if err := c.writeFrame(0x2, p[written:end]); err != nil {
+			return written, err
+		}
+		written = end
+	}
+	return written, nil
 }
 
 func (c *WebSocketConn) Close() error {
@@ -198,15 +221,15 @@ func (c *WebSocketConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-func (c *WebSocketConn) readFrame() ([]byte, error) {
+func (c *WebSocketConn) readFrameInto(p []byte) (int, error) {
 	for {
 		b1, err := c.reader.ReadByte()
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		b2, err := c.reader.ReadByte()
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		opcode := b1 & 0x0f
@@ -216,26 +239,40 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 		case 126:
 			var ext [2]byte
 			if _, err := io.ReadFull(c.reader, ext[:]); err != nil {
-				return nil, err
+				return 0, err
 			}
 			length = uint64(binary.BigEndian.Uint16(ext[:]))
 		case 127:
 			var ext [8]byte
 			if _, err := io.ReadFull(c.reader, ext[:]); err != nil {
-				return nil, err
+				return 0, err
 			}
 			length = binary.BigEndian.Uint64(ext[:])
 		}
 		if length > 16*1024*1024 {
-			return nil, fmt.Errorf("fronting: websocket frame too large")
+			return 0, fmt.Errorf("fronting: websocket frame too large")
 		}
 
 		var mask [4]byte
 		if masked {
 			if _, err := io.ReadFull(c.reader, mask[:]); err != nil {
-				return nil, err
+				return 0, err
 			}
 		}
+
+		// Zero-copy RX fast path: read and unmask data frames directly into caller's p
+		// whenever the entire frame fits, avoiding readScratch allocation and a 2nd copy.
+		if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2) && length > 0 && length <= uint64(len(p)) {
+			dst := p[:length]
+			if _, err := io.ReadFull(c.reader, dst); err != nil {
+				return 0, err
+			}
+			if masked {
+				xorMaskBytes(dst, mask)
+			}
+			return int(length), nil
+		}
+
 		var payload []byte
 		if length <= wsPooledFrameBufCap {
 			if cap(c.readScratch) < int(length) {
@@ -246,7 +283,7 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 			payload = make([]byte, length)
 		}
 		if _, err := io.ReadFull(c.reader, payload); err != nil {
-			return nil, err
+			return 0, err
 		}
 		if masked {
 			xorMaskBytes(payload, mask)
@@ -254,9 +291,14 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 
 		switch opcode {
 		case 0x0, 0x1, 0x2:
-			return payload, nil
+			if len(payload) == 0 {
+				continue
+			}
+			n := copy(p, payload)
+			c.readBuf = payload[n:]
+			return n, nil
 		case 0x8:
-			return nil, io.EOF
+			return 0, io.EOF
 		case 0x9:
 			c.writeMu.Lock()
 			_ = c.writeFrame(0xA, payload)
@@ -264,7 +306,7 @@ func (c *WebSocketConn) readFrame() ([]byte, error) {
 		case 0xA:
 			continue
 		default:
-			return nil, fmt.Errorf("fronting: unsupported websocket opcode 0x%x", opcode)
+			return 0, fmt.Errorf("fronting: unsupported websocket opcode 0x%x", opcode)
 		}
 	}
 }
@@ -311,9 +353,10 @@ func (c *WebSocketConn) writeFrame(opcode byte, payload []byte) error {
 	}
 	copy(frame, header)
 	body := frame[len(header):]
-	copy(body, payload)
 	if c.maskWrites {
-		xorMaskBytes(body, mask)
+		xorCopyMaskBytes(body, payload, mask)
+	} else {
+		copy(body, payload)
 	}
 	_, err := c.conn.Write(frame)
 	if bufp != nil {
@@ -327,14 +370,49 @@ func xorMaskBytes(b []byte, mask [4]byte) {
 	if len(b) >= 8 {
 		m32 := binary.LittleEndian.Uint32(mask[:])
 		m64 := uint64(m32) | uint64(m32)<<32
+		for len(b) >= 32 {
+			binary.LittleEndian.PutUint64(b[0:8], binary.LittleEndian.Uint64(b[0:8])^m64)
+			binary.LittleEndian.PutUint64(b[8:16], binary.LittleEndian.Uint64(b[8:16])^m64)
+			binary.LittleEndian.PutUint64(b[16:24], binary.LittleEndian.Uint64(b[16:24])^m64)
+			binary.LittleEndian.PutUint64(b[24:32], binary.LittleEndian.Uint64(b[24:32])^m64)
+			b = b[32:]
+		}
 		for len(b) >= 8 {
-			v := binary.LittleEndian.Uint64(b[:8]) ^ m64
-			binary.LittleEndian.PutUint64(b[:8], v)
+			binary.LittleEndian.PutUint64(b[:8], binary.LittleEndian.Uint64(b[:8])^m64)
 			b = b[8:]
 		}
 	}
 	for i := range b {
 		b[i] ^= mask[i&3]
+	}
+}
+
+// xorCopyMaskBytes copies src into dst while applying the 4-byte WebSocket mask
+// in a single pass, halving memory bandwidth on client TX frames.
+func xorCopyMaskBytes(dst, src []byte, mask [4]byte) {
+	n := len(src)
+	if n == 0 {
+		return
+	}
+	_ = dst[n-1]
+	i := 0
+	if n >= 8 {
+		m32 := binary.LittleEndian.Uint32(mask[:])
+		m64 := uint64(m32) | uint64(m32)<<32
+		for i+32 <= n {
+			binary.LittleEndian.PutUint64(dst[i:i+8], binary.LittleEndian.Uint64(src[i:i+8])^m64)
+			binary.LittleEndian.PutUint64(dst[i+8:i+16], binary.LittleEndian.Uint64(src[i+8:i+16])^m64)
+			binary.LittleEndian.PutUint64(dst[i+16:i+24], binary.LittleEndian.Uint64(src[i+16:i+24])^m64)
+			binary.LittleEndian.PutUint64(dst[i+24:i+32], binary.LittleEndian.Uint64(src[i+24:i+32])^m64)
+			i += 32
+		}
+		for i+8 <= n {
+			binary.LittleEndian.PutUint64(dst[i:i+8], binary.LittleEndian.Uint64(src[i:i+8])^m64)
+			i += 8
+		}
+	}
+	for ; i < n; i++ {
+		dst[i] = src[i] ^ mask[i&3]
 	}
 }
 

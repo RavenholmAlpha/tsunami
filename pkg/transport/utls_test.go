@@ -176,14 +176,15 @@ func TestTLSSessionTicketResumptionAcrossFingerprints(t *testing.T) {
 		name      string
 		fp        string
 		alpn      []string
-		wantCheck bool // std tls.Client deterministically resumes on 2nd conn
+		wantCheck bool
 	}{
 		{name: "none_std_tls13", fp: FingerprintNone, alpn: nil, wantCheck: true},
-		{name: "chrome_default", fp: FingerprintChrome, alpn: nil},
-		{name: "chrome_alpn_h2", fp: FingerprintChrome, alpn: []string{"h2"}},
-		{name: "firefox_default", fp: FingerprintFirefox, alpn: nil},
-		{name: "firefox_alpn_http1", fp: FingerprintFirefox, alpn: []string{"http/1.1"}},
-		{name: "safari_default", fp: FingerprintSafari, alpn: nil},
+		{name: "chrome_default", fp: FingerprintChrome, alpn: nil, wantCheck: true},
+		{name: "chrome_alpn_h2", fp: FingerprintChrome, alpn: []string{"h2"}, wantCheck: true},
+		{name: "chrome_alpn_http1", fp: FingerprintChrome, alpn: []string{"http/1.1"}, wantCheck: true},
+		{name: "firefox_default", fp: FingerprintFirefox, alpn: nil, wantCheck: true},
+		{name: "firefox_alpn_http1", fp: FingerprintFirefox, alpn: []string{"http/1.1"}, wantCheck: true},
+		{name: "safari_default", fp: FingerprintSafari, alpn: nil, wantCheck: true},
 		{name: "random_default", fp: FingerprintRandom, alpn: nil},
 	}
 

@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const defaultTCPNotSentLowat = 32 * 1024
+const defaultTCPNotSentLowat = 128 * 1024
 
 func applyTCPBuffers(conn *net.TCPConn, cfg *TCPConfig) error {
 	if rawConn, err := conn.SyscallConn(); err == nil {

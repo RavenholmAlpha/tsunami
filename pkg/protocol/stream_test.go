@@ -117,6 +117,41 @@ func TestStreamReadDrainsBufferedDataBeforeEOF(t *testing.T) {
 	}
 }
 
+func TestStreamReadReturnsLeftoverWithoutBlocking(t *testing.T) {
+	stream := newStream(1, NewSession(&testReadWriteCloser{}, 1))
+	payload := bytes.Repeat([]byte("A"), 100)
+	if err := stream.deliverData(payload); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+
+	first := make([]byte, 40)
+	n, err := stream.Read(first)
+	if err != nil || n != 40 {
+		t.Fatalf("first Read = (%d, %v), want (40, nil)", n, err)
+	}
+
+	// Second Read must return the 60 leftover bytes immediately even though
+	// recvQueue is empty and the stream is still open.
+	done := make(chan int, 1)
+	go func() {
+		rest := make([]byte, 100)
+		rn, rerr := stream.Read(rest)
+		if rerr != nil {
+			done <- -1
+			return
+		}
+		done <- rn
+	}()
+	select {
+	case rn := <-done:
+		if rn != 60 {
+			t.Fatalf("second Read = %d, want 60", rn)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second Read blocked instead of returning buffered leftover bytes")
+	}
+}
+
 func TestStreamFlowControlBackpressureAndResume(t *testing.T) {
 	const win = 4096
 	clientSess, _, serverStreams := startSessionPair(t, win, win)

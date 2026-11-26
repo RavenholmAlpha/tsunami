@@ -41,12 +41,16 @@ func (p TrafficPolicy) WrapReader(r io.Reader, user *protocol.UserInfo, directio
 	if r == nil || (p.Limiter == nil && p.Usage == nil) {
 		return r
 	}
-	return &trafficReader{
+	tr := &trafficReader{
 		reader:    r,
 		policy:    p,
 		user:      user,
 		direction: direction,
 	}
+	if tracker, ok := p.Usage.(*UsageTracker); ok && tracker != nil && user != nil {
+		tr.counter = tracker.counterFor(user)
+	}
+	return tr
 }
 
 // WrapReadWriteCloser wraps a stream where reads are user uploads and writes
@@ -55,11 +59,15 @@ func (p TrafficPolicy) WrapReadWriteCloser(rwc io.ReadWriteCloser, user *protoco
 	if rwc == nil || (p.Limiter == nil && p.Usage == nil) {
 		return rwc
 	}
-	return &trafficReadWriteCloser{
+	trw := &trafficReadWriteCloser{
 		rwc:    rwc,
 		policy: p,
 		user:   user,
 	}
+	if tracker, ok := p.Usage.(*UsageTracker); ok && tracker != nil && user != nil {
+		trw.counter = tracker.counterFor(user)
+	}
+	return trw
 }
 
 type trafficReader struct {
@@ -67,6 +75,7 @@ type trafficReader struct {
 	policy    TrafficPolicy
 	user      *protocol.UserInfo
 	direction Direction
+	counter   *usageCounter
 }
 
 func (r *trafficReader) Read(p []byte) (int, error) {
@@ -75,15 +84,25 @@ func (r *trafficReader) Read(p []byte) (int, error) {
 		if waitErr := r.policy.wait(r.user, r.direction, n); waitErr != nil {
 			return n, waitErr
 		}
-		r.policy.record(r.user, r.direction, n)
+		if r.counter != nil {
+			switch r.direction {
+			case DirectionUpload:
+				r.counter.uploadBytes.Add(int64(n))
+			case DirectionDownload:
+				r.counter.downloadBytes.Add(int64(n))
+			}
+		} else {
+			r.policy.record(r.user, r.direction, n)
+		}
 	}
 	return n, err
 }
 
 type trafficReadWriteCloser struct {
-	rwc    io.ReadWriteCloser
-	policy TrafficPolicy
-	user   *protocol.UserInfo
+	rwc     io.ReadWriteCloser
+	policy  TrafficPolicy
+	user    *protocol.UserInfo
+	counter *usageCounter
 }
 
 func (rw *trafficReadWriteCloser) Read(p []byte) (int, error) {
@@ -92,7 +111,11 @@ func (rw *trafficReadWriteCloser) Read(p []byte) (int, error) {
 		if waitErr := rw.policy.wait(rw.user, DirectionUpload, n); waitErr != nil {
 			return n, waitErr
 		}
-		rw.policy.record(rw.user, DirectionUpload, n)
+		if rw.counter != nil {
+			rw.counter.uploadBytes.Add(int64(n))
+		} else {
+			rw.policy.record(rw.user, DirectionUpload, n)
+		}
 	}
 	return n, err
 }
@@ -105,7 +128,11 @@ func (rw *trafficReadWriteCloser) Write(p []byte) (int, error) {
 	}
 	n, err := rw.rwc.Write(p)
 	if n > 0 {
-		rw.policy.record(rw.user, DirectionDownload, n)
+		if rw.counter != nil {
+			rw.counter.downloadBytes.Add(int64(n))
+		} else {
+			rw.policy.record(rw.user, DirectionDownload, n)
+		}
 	}
 	return n, err
 }
@@ -156,26 +183,14 @@ func NewUsageTracker() *UsageTracker {
 	return &UsageTracker{deltas: make(map[string]*usageCounter)}
 }
 
-// Record records usage for one user.
-func (t *UsageTracker) Record(user *protocol.UserInfo, direction Direction, n int) {
-	if t == nil || user == nil || n <= 0 {
-		return
-	}
-
+func (t *UsageTracker) counterFor(user *protocol.UserInfo) *usageCounter {
 	key := user.Identity()
 	t.mu.RLock()
 	counter := t.deltas[key]
-	if counter != nil {
-		switch direction {
-		case DirectionUpload:
-			counter.uploadBytes.Add(int64(n))
-		case DirectionDownload:
-			counter.downloadBytes.Add(int64(n))
-		}
-		t.mu.RUnlock()
-		return
-	}
 	t.mu.RUnlock()
+	if counter != nil {
+		return counter
+	}
 
 	t.mu.Lock()
 	counter = t.deltas[key]
@@ -183,13 +198,22 @@ func (t *UsageTracker) Record(user *protocol.UserInfo, direction Direction, n in
 		counter = &usageCounter{userID: key}
 		t.deltas[key] = counter
 	}
+	t.mu.Unlock()
+	return counter
+}
+
+// Record records usage for one user.
+func (t *UsageTracker) Record(user *protocol.UserInfo, direction Direction, n int) {
+	if t == nil || user == nil || n <= 0 {
+		return
+	}
+	counter := t.counterFor(user)
 	switch direction {
 	case DirectionUpload:
 		counter.uploadBytes.Add(int64(n))
 	case DirectionDownload:
 		counter.downloadBytes.Add(int64(n))
 	}
-	t.mu.Unlock()
 }
 
 // Snapshot returns current deltas without resetting them.
@@ -202,15 +226,33 @@ func (t *UsageTracker) Snapshot() []UsageDelta {
 	return cloneUsageDeltas(t.deltas)
 }
 
-// SnapshotAndReset returns current deltas and clears the tracker.
+// SnapshotAndReset atomically drains each user's counters in place without
+// invalidating cached per-stream counter pointers.
 func (t *UsageTracker) SnapshotAndReset() []UsageDelta {
 	if t == nil {
 		return nil
 	}
-	t.mu.Lock()
-	deltas := cloneUsageDeltas(t.deltas)
-	t.deltas = make(map[string]*usageCounter)
-	t.mu.Unlock()
+	t.mu.RLock()
+	deltas := make([]UsageDelta, 0, len(t.deltas))
+	for _, counter := range t.deltas {
+		if counter == nil {
+			continue
+		}
+		up := counter.uploadBytes.Swap(0)
+		down := counter.downloadBytes.Swap(0)
+		if up == 0 && down == 0 {
+			continue
+		}
+		deltas = append(deltas, UsageDelta{
+			UserID:        counter.userID,
+			UploadBytes:   up,
+			DownloadBytes: down,
+		})
+	}
+	t.mu.RUnlock()
+	sort.Slice(deltas, func(i, j int) bool {
+		return deltas[i].UserID < deltas[j].UserID
+	})
 	return deltas
 }
 
@@ -243,10 +285,15 @@ func cloneUsageDeltas(source map[string]*usageCounter) []UsageDelta {
 		if counter == nil {
 			continue
 		}
+		up := counter.uploadBytes.Load()
+		down := counter.downloadBytes.Load()
+		if up == 0 && down == 0 {
+			continue
+		}
 		deltas = append(deltas, UsageDelta{
 			UserID:        counter.userID,
-			UploadBytes:   counter.uploadBytes.Load(),
-			DownloadBytes: counter.downloadBytes.Load(),
+			UploadBytes:   up,
+			DownloadBytes: down,
 		})
 	}
 	sort.Slice(deltas, func(i, j int) bool {

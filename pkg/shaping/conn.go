@@ -21,7 +21,7 @@ const (
 	maxBodyLen     = 0xFFFF
 
 	defaultWriteTimeout = 5 * time.Second
-	maxCoalesceWrite    = 32 * 1024
+	maxCoalesceWrite    = 128 * 1024
 )
 
 var errInvalidFrame = errors.New("shaping: invalid frame")
@@ -120,19 +120,23 @@ type Conn struct {
 	cfg         Config
 
 	// Write side
-	writeMu     sync.Mutex
-	writeCond   *sync.Cond
-	writeRing   byteRing
-	writeNotify chan struct{}
-	writeDone   chan struct{}
-	closedFlag  bool
-	burstBuf    []byte
+	writeMu          sync.Mutex
+	writeCond        *sync.Cond
+	writeWaiters     int
+	writeRing        byteRing
+	writeNotify      chan struct{}
+	writeDone        chan struct{}
+	closedFlag       bool
+	burstBuf         []byte
+	deadlineArmed    bool
+	deadlineRefresh  time.Time
 
 	// Read side
 	readMu    sync.Mutex
 	readBuf   []byte
 	readOff   int
 	readFrame []byte
+	readHdr   [outerHeaderLen]byte
 
 	closeOnce sync.Once
 	closeErr  error
@@ -146,7 +150,7 @@ func Wrap(conn net.Conn, cfg Config) *Conn {
 
 	c := &Conn{
 		inner:       conn,
-		innerReader: bufio.NewReaderSize(conn, 32*1024),
+		innerReader: bufio.NewReaderSize(conn, 64*1024),
 		cfg:         cfg,
 		writeRing:   newByteRing(initCap),
 		writeNotify: make(chan struct{}, 1),
@@ -177,7 +181,7 @@ func normalizeConfig(cfg Config) Config {
 
 	payloadCap := cfg.FrameSize - dataHeaderLen
 	if cfg.MaxBufferSize <= 0 {
-		cfg.MaxBufferSize = 4 << 20
+		cfg.MaxBufferSize = 256 << 10
 	}
 	if cfg.MaxBufferSize < payloadCap {
 		cfg.MaxBufferSize = payloadCap
@@ -238,18 +242,25 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 	off := 0
 	for off < len(b) {
-		for c.writeRing.len >= c.cfg.MaxBufferSize && !c.closedFlag {
-			c.notifyWriter()
-			c.writeCond.Wait()
+		if c.writeRing.len >= c.cfg.MaxBufferSize && !c.closedFlag {
+			c.writeWaiters++
+			for c.writeRing.len >= c.cfg.MaxBufferSize && !c.closedFlag {
+				c.notifyWriter()
+				c.writeCond.Wait()
+			}
+			c.writeWaiters--
 		}
 		if c.closedFlag {
 			c.writeMu.Unlock()
 			return off, io.ErrClosedPipe
 		}
 
+		wasEmpty := c.writeRing.len == 0
 		written := c.writeRing.write(b[off:], c.cfg.MaxBufferSize)
 		off += written
-		c.notifyWriter()
+		if wasEmpty && written > 0 {
+			c.notifyWriter()
+		}
 	}
 	c.writeMu.Unlock()
 
@@ -263,29 +274,55 @@ func (c *Conn) notifyWriter() {
 	}
 }
 
-// Read returns de-shaped data (dummy chaff frames stripped).
+// Read returns de-shaped data (dummy chaff frames stripped), draining all
+// already-buffered shaping frames in one call to minimize lock/copy overhead.
 func (c *Conn) Read(b []byte) (int, error) {
-	for {
-		c.readMu.Lock()
-		if c.readOff < len(c.readBuf) {
-			n := copy(b, c.readBuf[c.readOff:])
-			c.readOff += n
-			if c.readOff == len(c.readBuf) {
-				c.readBuf = c.readBuf[:0]
-				c.readOff = 0
-			}
-			c.readMu.Unlock()
-			return n, nil
-		}
-		c.readMu.Unlock()
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 
-		var hdr [outerHeaderLen]byte
-		if _, err := io.ReadFull(c.innerReader, hdr[:]); err != nil {
+	total := 0
+	if c.readOff < len(c.readBuf) {
+		n := copy(b, c.readBuf[c.readOff:])
+		c.readOff += n
+		if c.readOff == len(c.readBuf) {
+			c.readBuf = c.readBuf[:0]
+			c.readOff = 0
+		}
+		total += n
+		if total == len(b) {
+			return total, nil
+		}
+	}
+
+	for total < len(b) {
+		if total > 0 {
+			// Non-blocking batch drain: only read another shaping frame if its
+			// complete header + body are already buffered in c.innerReader.
+			if c.innerReader.Buffered() < outerHeaderLen {
+				return total, nil
+			}
+			peekHdr, pErr := c.innerReader.Peek(outerHeaderLen)
+			if pErr != nil {
+				return total, nil
+			}
+			nextBodyLen := int(binary.BigEndian.Uint16(peekHdr[1:3]))
+			if c.innerReader.Buffered() < outerHeaderLen+nextBodyLen {
+				return total, nil
+			}
+		}
+
+		if _, err := io.ReadFull(c.innerReader, c.readHdr[:]); err != nil {
+			if total > 0 {
+				return total, nil
+			}
 			return 0, err
 		}
 
-		frameType := hdr[0]
-		bodyLen := int(binary.BigEndian.Uint16(hdr[1:3]))
+		frameType := c.readHdr[0]
+		bodyLen := int(binary.BigEndian.Uint16(c.readHdr[1:3]))
 
 		if cap(c.readFrame) < bodyLen {
 			c.readFrame = make([]byte, bodyLen)
@@ -293,6 +330,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 		payload := c.readFrame[:bodyLen]
 		if bodyLen > 0 {
 			if _, err := io.ReadFull(c.innerReader, payload); err != nil {
+				if total > 0 {
+					return total, nil
+				}
 				return 0, err
 			}
 		}
@@ -302,10 +342,16 @@ func (c *Conn) Read(b []byte) (int, error) {
 			continue
 		case frameTypeData:
 			if bodyLen < dataLenField {
+				if total > 0 {
+					return total, nil
+				}
 				return 0, errInvalidFrame
 			}
 			dataLen := int(binary.BigEndian.Uint16(payload[:dataLenField]))
 			if dataLen > bodyLen-dataLenField {
+				if total > 0 {
+					return total, nil
+				}
 				return 0, errInvalidFrame
 			}
 			if dataLen == 0 {
@@ -313,18 +359,22 @@ func (c *Conn) Read(b []byte) (int, error) {
 			}
 
 			data := payload[dataLenField : dataLenField+dataLen]
-			n := copy(b, data)
+			n := copy(b[total:], data)
+			total += n
 			if n < len(data) {
-				c.readMu.Lock()
 				c.readOff = 0
 				c.readBuf = append(c.readBuf[:0], data[n:]...)
-				c.readMu.Unlock()
+				return total, nil
 			}
-			return n, nil
 		default:
+			if total > 0 {
+				return total, nil
+			}
 			return 0, errInvalidFrame
 		}
 	}
+
+	return total, nil
 }
 
 func (c *Conn) writeLoop() {
@@ -342,6 +392,12 @@ func (c *Conn) writeLoop() {
 
 	resetChaff := func() {
 		if chaffTimer != nil {
+			if !chaffTimer.Stop() {
+				select {
+				case <-chaffTimer.C:
+				default:
+				}
+			}
 			chaffTimer.Reset(randDuration(c.cfg.IdleChaffMinInterval, c.cfg.IdleChaffMaxInterval))
 		}
 	}
@@ -353,13 +409,14 @@ func (c *Conn) writeLoop() {
 		}
 	}()
 
+	wasActive := false
 	for {
-		if c.hasBufferedData() {
-			hasMore, ok := c.sendDataBurst(payloadCap)
-			if !ok {
-				return
-			}
-			resetChaff()
+		hasMore, wrote, ok := c.sendDataBurst(payloadCap)
+		if !ok {
+			return
+		}
+		if wrote {
+			wasActive = true
 			if hasMore {
 				if paceTimer == nil {
 					paceTimer = time.NewTimer(c.cfg.Interval)
@@ -371,8 +428,22 @@ func (c *Conn) writeLoop() {
 					return
 				case <-paceTimer.C:
 				}
+				continue
 			}
-			continue
+			// Check once more in case data arrived during inner.Write.
+			if c.hasBufferedData() {
+				continue
+			}
+		}
+
+		// Transitioning to idle: clear cached write deadline and re-arm chaff timer once.
+		if c.deadlineArmed {
+			_ = c.inner.SetWriteDeadline(time.Time{})
+			c.deadlineArmed = false
+		}
+		if wasActive {
+			resetChaff()
+			wasActive = false
 		}
 
 		select {
@@ -398,12 +469,12 @@ func (c *Conn) hasBufferedData() bool {
 	return n > 0
 }
 
-func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, ok bool) {
+func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, wrote bool, ok bool) {
 	c.writeMu.Lock()
 	buffered := c.writeRing.len
 	if buffered == 0 {
 		c.writeMu.Unlock()
-		return false, true
+		return false, false, true
 	}
 
 	slots := (buffered + payloadCap - 1) / payloadCap
@@ -411,6 +482,10 @@ func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, ok bool) {
 		slots = c.cfg.BurstSlots
 	}
 
+	maxBurstCap := c.cfg.BurstSlots * c.cfg.FrameSize
+	if cap(c.burstBuf) < maxBurstCap {
+		c.burstBuf = make([]byte, 0, maxBurstCap)
+	}
 	c.burstBuf = c.burstBuf[:0]
 	for i := 0; i < slots; i++ {
 		n := c.writeRing.len
@@ -430,7 +505,7 @@ func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, ok bool) {
 
 		start := len(c.burstBuf)
 		if cap(c.burstBuf) < start+totalLen {
-			grown := make([]byte, start+totalLen, max(start+totalLen, min(c.cfg.BurstSlots*c.cfg.FrameSize, maxCoalesceWrite)))
+			grown := make([]byte, start+totalLen, max(start+totalLen, maxBurstCap))
 			copy(grown, c.burstBuf)
 			c.burstBuf = grown
 		}
@@ -446,21 +521,29 @@ func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, ok bool) {
 		}
 	}
 	hasMore = c.writeRing.len > 0
-	c.writeCond.Broadcast()
+	if c.writeWaiters > 0 {
+		c.writeCond.Broadcast()
+	}
 	c.writeMu.Unlock()
 
 	timeout := c.cfg.Interval * time.Duration(slots+1)
 	if timeout < defaultWriteTimeout {
 		timeout = defaultWriteTimeout
 	}
-	_ = c.inner.SetWriteDeadline(time.Now().Add(timeout))
+	now := time.Now()
+	if !c.deadlineArmed || now.After(c.deadlineRefresh) {
+		_ = c.inner.SetWriteDeadline(now.Add(timeout + time.Second))
+		c.deadlineArmed = true
+		c.deadlineRefresh = now.Add(time.Second)
+	}
 
 	buf := c.burstBuf
 	for len(buf) > 0 {
 		select {
 		case <-c.closed:
 			_ = c.inner.SetWriteDeadline(time.Time{})
-			return false, false
+			c.deadlineArmed = false
+			return false, true, false
 		default:
 		}
 		chunk := len(buf)
@@ -469,14 +552,14 @@ func (c *Conn) sendDataBurst(payloadCap int) (hasMore bool, ok bool) {
 		}
 		if _, err := c.inner.Write(buf[:chunk]); err != nil {
 			_ = c.inner.SetWriteDeadline(time.Time{})
+			c.deadlineArmed = false
 			c.failClose()
-			return false, false
+			return false, true, false
 		}
 		buf = buf[chunk:]
 	}
 
-	_ = c.inner.SetWriteDeadline(time.Time{})
-	return hasMore || c.hasBufferedData(), true
+	return hasMore, true, true
 }
 
 func (c *Conn) sendIdleChaff() bool {

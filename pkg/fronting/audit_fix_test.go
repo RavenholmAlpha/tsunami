@@ -27,10 +27,7 @@ func TestVerifyRequestDoesNotCacheInvalidSignatures(t *testing.T) {
 	if VerifyRequest(req, [][32]byte{key}, now, ClockSkew, cache) {
 		t.Fatal("bogus signature verified")
 	}
-	cache.mu.Lock()
-	invalidEntries := len(cache.entries)
-	cache.mu.Unlock()
-	if invalidEntries != 0 {
+	if invalidEntries := cache.Len(); invalidEntries != 0 {
 		t.Fatalf("invalid signature populated the replay cache: %d entries", invalidEntries)
 	}
 
@@ -45,24 +42,41 @@ func TestVerifyRequestDoesNotCacheInvalidSignatures(t *testing.T) {
 	if !VerifyRequest(valid, [][32]byte{key}, now, ClockSkew, cache) {
 		t.Fatal("valid signature rejected")
 	}
-	cache.mu.Lock()
-	validEntries := len(cache.entries)
-	cache.mu.Unlock()
-	if validEntries != 1 {
+	if validEntries := cache.Len(); validEntries != 1 {
 		t.Fatalf("valid request should cache exactly one nonce, got %d", validEntries)
 	}
 }
 
 func TestNonceCacheIsBounded(t *testing.T) {
 	cache := NewNonceCache(5 * time.Minute)
+	defer cache.Close()
 	cache.maxEntries = 64
 	for i := 0; i < 1000; i++ {
 		cache.Add(fmt.Sprintf("nonce-%032d", i))
 	}
-	cache.mu.Lock()
-	size := len(cache.entries)
-	cache.mu.Unlock()
-	if size > cache.maxEntries {
-		t.Fatalf("nonce cache grew to %d entries, limit %d", size, cache.maxEntries)
+	if size := cache.Len(); size > cache.maxEntries {
+		t.Fatalf("nonce cache fallback grew to %d entries, limit %d", size, cache.maxEntries)
+	}
+
+	// Also verify the 64-shard pointer-free 32-hex path enforces bounds and replay detection.
+	hexCache := NewNonceCache(5 * time.Minute)
+	defer hexCache.Close()
+	hexCache.maxEntries = 128 // 2 per shard across 64 shards
+	for i := 0; i < 1000; i++ {
+		n := fmt.Sprintf("%032x", i)
+		if !hexCache.Add(n) {
+			t.Fatalf("fresh hex nonce %s unexpectedly rejected", n)
+		}
+	}
+	if size := hexCache.Len(); size > hexCache.maxEntries {
+		t.Fatalf("sharded hex nonce cache grew to %d entries, limit %d", size, hexCache.maxEntries)
+	}
+	// Most recent nonce must be rejected as replay (both lower and upper hex case).
+	last := fmt.Sprintf("%032x", 999)
+	if hexCache.Add(last) {
+		t.Fatalf("replay of %s unexpectedly accepted", last)
+	}
+	if hexCache.Add(fmt.Sprintf("%032X", 999)) {
+		t.Fatalf("uppercase replay of %s unexpectedly accepted", last)
 	}
 }

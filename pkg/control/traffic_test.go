@@ -113,3 +113,40 @@ func TestUsageTrackerAndUserLimiterConcurrent(t *testing.T) {
 		t.Fatalf("u2 delta = %+v", deltas[1])
 	}
 }
+
+func TestUsageTrackerCachedCounterSurvivesSnapshotAndReset(t *testing.T) {
+	tracker := NewUsageTracker()
+	user := &protocol.UserInfo{ID: "u-stream"}
+	policy := TrafficPolicy{Usage: tracker}
+
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	reader := policy.WrapReader(pr, user, DirectionUpload)
+
+	go func() {
+		_, _ = pw.Write([]byte("chunk1"))
+		_, _ = pw.Write([]byte("chunk22"))
+		_ = pw.Close()
+	}()
+
+	buf := make([]byte, 6)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatalf("read chunk1: %v", err)
+	}
+	first := tracker.SnapshotAndReset()
+	if len(first) != 1 || first[0].UploadBytes != 6 {
+		t.Fatalf("first reset = %+v, want 6 upload bytes", first)
+	}
+	if rem := tracker.Snapshot(); len(rem) != 0 {
+		t.Fatalf("expected empty snapshot right after reset, got %+v", rem)
+	}
+
+	buf2 := make([]byte, 7)
+	if _, err := io.ReadFull(reader, buf2); err != nil {
+		t.Fatalf("read chunk2: %v", err)
+	}
+	second := tracker.Snapshot()
+	if len(second) != 1 || second[0].UploadBytes != 7 {
+		t.Fatalf("second snapshot = %+v, want 7 upload bytes (cached counter must survive reset)", second)
+	}
+}
