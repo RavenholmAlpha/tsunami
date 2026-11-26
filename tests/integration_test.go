@@ -166,14 +166,8 @@ func handleTestConn(conn net.Conn, auth *protocol.Authenticator) {
 func handleTestStream(stream *protocol.Stream) {
 	defer stream.Close()
 
-	// Read target address
-	addrBuf := make([]byte, 512)
-	n, err := stream.Read(addrBuf)
-	if err != nil {
-		return
-	}
-
-	target, err := decodeSocksAddrTest(addrBuf[:n])
+	// Read exact SOCKS target address so coalesced payload bytes remain in stream.
+	target, err := protocol.ReadSocksAddr(stream)
 	if err != nil {
 		return
 	}
@@ -203,39 +197,6 @@ func handleTestStream(stream *protocol.Stream) {
 	}()
 
 	wg.Wait()
-}
-
-func decodeSocksAddrTest(data []byte) (string, error) {
-	if len(data) < 2 {
-		return "", fmt.Errorf("too short")
-	}
-	atyp := data[0]
-	switch atyp {
-	case protocol.AtypIPv4:
-		if len(data) < 7 {
-			return "", fmt.Errorf("too short")
-		}
-		ip := net.IP(data[1:5])
-		port := int(data[5])<<8 | int(data[6])
-		return fmt.Sprintf("%s:%d", ip.String(), port), nil
-	case protocol.AtypDomain:
-		dlen := int(data[1])
-		if len(data) < 2+dlen+2 {
-			return "", fmt.Errorf("too short")
-		}
-		domain := string(data[2 : 2+dlen])
-		port := int(data[2+dlen])<<8 | int(data[2+dlen+1])
-		return fmt.Sprintf("%s:%d", domain, port), nil
-	case protocol.AtypIPv6:
-		if len(data) < 19 {
-			return "", fmt.Errorf("too short")
-		}
-		ip := net.IP(data[1:17])
-		port := int(data[17])<<8 | int(data[18])
-		return fmt.Sprintf("[%s]:%d", ip.String(), port), nil
-	default:
-		return "", fmt.Errorf("unknown atyp: 0x%02x", atyp)
-	}
 }
 
 // --- Integration Tests ---
